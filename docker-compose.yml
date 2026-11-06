@@ -1,0 +1,55 @@
+services:
+  zus-db:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: zus-db
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-zus}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-zus_olympus_pass}
+      - POSTGRES_DB=${POSTGRES_DB:-zus_telemetry}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - zus-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zus} -d ${POSTGRES_DB:-zus_telemetry}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  zus-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zus-api
+    restart: always
+    depends_on:
+      zus-db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - APP_NAME=ZüsAPI
+      - APP_ENV=${APP_ENV:-production}
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - DATA_DIR=/app/data
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-zus}:${POSTGRES_PASSWORD:-zus_olympus_pass}@zus-db:5432/${POSTGRES_DB:-zus_telemetry}
+      - PIRATE_WEATHER_API_KEY=${PIRATE_WEATHER_API_KEY:-}
+      - TOMORROW_IO_API_KEY=${TOMORROW_IO_API_KEY:-}
+    volumes:
+      - zus-api-data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/v1/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  zus-postgres-data:
+    driver: local
+  zus-api-data:
+    driver: local
