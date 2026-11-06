@@ -76,7 +76,8 @@ class WeatherProviderService:
             "minutely_15": "precipitation,weather_code",
             "hourly": (
                 "temperature_2m,apparent_temperature,precipitation_probability,precipitation,"
-                "weather_code,wind_speed_10m,visibility"
+                "weather_code,wind_speed_10m,wind_gusts_10m,uv_index,dew_point_2m,"
+                "cloud_cover,visibility,pressure_msl"
             ),
             "daily": (
                 "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,"
@@ -323,16 +324,24 @@ class WeatherProviderService:
             p_arr = hourly_raw.get(f"precipitation_probability_{suffix}") or hourly_raw.get("precipitation_probability") or []
             pr_arr = hourly_raw.get(f"precipitation_{suffix}") or hourly_raw.get("precipitation") or []
             w_arr = hourly_raw.get(f"wind_speed_10m_{suffix}") or hourly_raw.get("wind_speed_10m") or []
+            wg_arr = hourly_raw.get(f"wind_gusts_10m_{suffix}") or hourly_raw.get("wind_gusts_10m") or []
+            uv_arr = hourly_raw.get(f"uv_index_{suffix}") or hourly_raw.get("uv_index") or []
+            dp_arr = hourly_raw.get(f"dew_point_2m_{suffix}") or hourly_raw.get("dew_point_2m") or []
+            cc_arr = hourly_raw.get(f"cloud_cover_{suffix}") or hourly_raw.get("cloud_cover") or []
+            vis_arr = hourly_raw.get(f"visibility_{suffix}") or hourly_raw.get("visibility") or []
+            pr_msl_arr = hourly_raw.get(f"pressure_msl_{suffix}") or hourly_raw.get("pressure_msl") or []
             c_arr = hourly_raw.get(f"weather_code_{suffix}") or hourly_raw.get("weather_code") or []
 
             stream: List[Dict[str, Any]] = []
-            for offset in range(25):
+            max_offsets = max(25, len(times_list) - start_idx)
+            for offset in range(max_offsets):
                 idx = start_idx + offset
                 if idx >= len(t_arr):
                     break
                 temp_val = t_arr[idx]
                 if temp_val is None:
                     continue
+                w_val = float(w_arr[idx]) if idx < len(w_arr) and w_arr[idx] is not None else 0.0
                 stream.append(
                     {
                         "time": now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=offset),
@@ -340,7 +349,13 @@ class WeatherProviderService:
                         "feels_c": float(fl_arr[idx]) if idx < len(fl_arr) and fl_arr[idx] is not None else float(temp_val),
                         "precip_prob": int(p_arr[idx]) if idx < len(p_arr) and p_arr[idx] is not None else 0,
                         "precip_mm": float(pr_arr[idx]) if idx < len(pr_arr) and pr_arr[idx] is not None else 0.0,
-                        "wind_kmh": float(w_arr[idx]) if idx < len(w_arr) and w_arr[idx] is not None else 0.0,
+                        "wind_kmh": w_val,
+                        "gust_kmh": float(wg_arr[idx]) if idx < len(wg_arr) and wg_arr[idx] is not None else round(w_val * 1.3, 1),
+                        "uv_index": float(uv_arr[idx]) if idx < len(uv_arr) and uv_arr[idx] is not None else None,
+                        "dew_c": float(dp_arr[idx]) if idx < len(dp_arr) and dp_arr[idx] is not None else float(temp_val) - 4.0,
+                        "cloud_pct": int(cc_arr[idx]) if idx < len(cc_arr) and cc_arr[idx] is not None else 0,
+                        "vis_km": round(float(vis_arr[idx]) / 1000.0, 2) if idx < len(vis_arr) and vis_arr[idx] is not None else None,
+                        "press_hpa": float(pr_msl_arr[idx]) if idx < len(pr_msl_arr) and pr_msl_arr[idx] is not None else 1013.25,
                         "wmo_code": int(c_arr[idx]) if idx < len(c_arr) and c_arr[idx] is not None else 0,
                     }
                 )
@@ -430,16 +445,35 @@ class WeatherProviderService:
         # 6. Compute Bias-Corrected Multi-Model Hourly Blend + Oracle Consensus Score
         hourly_models: List[HourlyForecastModel] = []
         hourly_spreads: List[float] = []
+        total_hourly_horizon = max(24, min(240, len(times_list) - start_idx))
 
-        for h_offset in range(24):
+        for h_offset in range(total_hourly_horizon):
             blended_t = 0.0
             blended_fl = 0.0
             blended_p = 0.0
             blended_pr_mm = 0.0
             blended_wind = 0.0
+            blended_gust = 0.0
+            blended_uv = 0.0
+            uv_w_total = 0.0
+            blended_dew = 0.0
+            blended_cloud = 0.0
+            blended_vis = 0.0
+            vis_w_total = 0.0
+            blended_press = 0.0
             total_w = 0.0
             wet_w = 0.0
             hour_temps: List[float] = []
+            hour_feels: List[float] = []
+            hour_pops: List[int] = []
+            hour_pr_mms: List[float] = []
+            hour_winds: List[float] = []
+            hour_gusts: List[float] = []
+            hour_uvs: List[float] = []
+            hour_dews: List[float] = []
+            hour_clouds: List[int] = []
+            hour_vis: List[float] = []
+            hour_press: List[float] = []
             top_code = 0
             top_w = -1.0
             top_wet_code = 0
@@ -455,13 +489,47 @@ class WeatherProviderService:
                     bias = float(w_info["bias_temp_c"])
                     bias_corrected_t = pt["temp_c"] - bias
                     bias_corrected_fl = pt.get("feels_c", pt["temp_c"]) - bias
+                    bias_corrected_dew = pt.get("dew_c", pt["temp_c"] - 4.0) - bias
+                    pop_val = int(pt["precip_prob"])
+                    pr_mm_val = float(pt.get("precip_mm", 0.0))
+                    w_val = float(pt.get("wind_kmh", 0.0))
+                    g_val = float(pt.get("gust_kmh", round(w_val * 1.3, 1)))
+                    c_val = int(pt.get("cloud_pct", 0))
+                    p_val = float(pt.get("press_hpa", 1013.25))
+
                     blended_t += bias_corrected_t * w
                     blended_fl += bias_corrected_fl * w
-                    blended_p += pt["precip_prob"] * w
-                    blended_pr_mm += pt.get("precip_mm", 0.0) * w
-                    blended_wind += pt.get("wind_kmh", 0.0) * w
+                    blended_p += pop_val * w
+                    blended_pr_mm += pr_mm_val * w
+                    blended_wind += w_val * w
+                    blended_gust += g_val * w
+                    blended_dew += bias_corrected_dew * w
+                    blended_cloud += c_val * w
+                    blended_press += p_val * w
                     total_w += w
+
                     hour_temps.append(bias_corrected_t)
+                    hour_feels.append(bias_corrected_fl)
+                    hour_pops.append(pop_val)
+                    hour_pr_mms.append(pr_mm_val)
+                    hour_winds.append(w_val)
+                    hour_gusts.append(g_val)
+                    hour_dews.append(bias_corrected_dew)
+                    hour_clouds.append(c_val)
+                    hour_press.append(p_val)
+
+                    if pt.get("uv_index") is not None:
+                        uv_v = float(pt["uv_index"])
+                        blended_uv += uv_v * w
+                        uv_w_total += w
+                        hour_uvs.append(uv_v)
+
+                    if pt.get("vis_km") is not None:
+                        vis_v = float(pt["vis_km"])
+                        blended_vis += vis_v * w
+                        vis_w_total += w
+                        hour_vis.append(vis_v)
+
                     code = int(pt["wmo_code"])
                     if w > top_w:
                         top_w = w
@@ -480,8 +548,16 @@ class WeatherProviderService:
                 final_h_precip = int(round(blended_p / total_w))
                 final_h_pr_mm = round(blended_pr_mm / total_w, 2)
                 final_h_wind = round(blended_wind / total_w, 1)
+                final_h_gust = round(blended_gust / total_w, 1)
+                final_h_dew = round(blended_dew / total_w, 1)
+                final_h_cloud = int(round(blended_cloud / total_w))
+                final_h_press = round(blended_press / total_w, 1)
             else:
                 final_h_temp, final_h_feels, final_h_precip, final_h_pr_mm, final_h_wind = 0.0, 0.0, 0, 0.0, 0.0
+                final_h_gust, final_h_dew, final_h_cloud, final_h_press = 0.0, 0.0, 0, 1013.2
+
+            final_h_uv = round(blended_uv / uv_w_total, 2) if uv_w_total > 0 else 0.0
+            final_h_vis = round(blended_vis / vis_w_total, 2) if vis_w_total > 0 else 16.0
 
             # If high-res models indicate precipitation (wet_w >= 0.32 or precip prob >= 40%), use the wet WMO code
             if top_wet_code >= 51 and (wet_w >= 0.32 or final_h_precip >= 40 or final_h_pr_mm >= 0.1):
@@ -507,12 +583,40 @@ class WeatherProviderService:
                 HourlyForecastModel(
                     time=dt,
                     temperature=final_h_temp,
+                    tempMin=round(min(hour_temps), 1) if hour_temps else final_h_temp,
+                    tempMax=round(max(hour_temps), 1) if hour_temps else final_h_temp,
                     feelsLike=final_h_feels,
+                    feelsMin=round(min(hour_feels), 1) if hour_feels else final_h_feels,
+                    feelsMax=round(max(hour_feels), 1) if hour_feels else final_h_feels,
                     condition=WeatherCondition.from_wmo_code(top_code),
                     wmoCode=top_code,
                     precipitationChance=max(0, min(100, final_h_precip)),
+                    precipProbMin=max(0, min(hour_pops)) if hour_pops else final_h_precip,
+                    precipProbMax=min(100, max(hour_pops)) if hour_pops else final_h_precip,
                     precipMm=final_h_pr_mm,
+                    precipMmMin=round(min(hour_pr_mms), 2) if hour_pr_mms else final_h_pr_mm,
+                    precipMmMax=round(max(hour_pr_mms), 2) if hour_pr_mms else final_h_pr_mm,
                     windSpeed=final_h_wind,
+                    windMin=round(min(hour_winds), 1) if hour_winds else final_h_wind,
+                    windMax=round(max(hour_winds), 1) if hour_winds else final_h_wind,
+                    windGusts=final_h_gust,
+                    gustMin=round(min(hour_gusts), 1) if hour_gusts else final_h_gust,
+                    gustMax=round(max(hour_gusts), 1) if hour_gusts else final_h_gust,
+                    uvIndex=final_h_uv,
+                    uvMin=round(min(hour_uvs), 2) if hour_uvs else final_h_uv,
+                    uvMax=round(max(hour_uvs), 2) if hour_uvs else final_h_uv,
+                    dewPoint=final_h_dew,
+                    dewMin=round(min(hour_dews), 1) if hour_dews else final_h_dew,
+                    dewMax=round(max(hour_dews), 1) if hour_dews else final_h_dew,
+                    cloudCover=final_h_cloud,
+                    cloudMin=max(0, min(hour_clouds)) if hour_clouds else final_h_cloud,
+                    cloudMax=min(100, max(hour_clouds)) if hour_clouds else final_h_cloud,
+                    visibilityKm=final_h_vis,
+                    visMin=round(min(hour_vis), 2) if hour_vis else final_h_vis,
+                    visMax=round(max(hour_vis), 2) if hour_vis else final_h_vis,
+                    pressure=final_h_press,
+                    pressMin=round(min(hour_press), 1) if hour_press else final_h_press,
+                    pressMax=round(max(hour_press), 1) if hour_press else final_h_press,
                 )
             )
 

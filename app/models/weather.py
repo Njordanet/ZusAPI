@@ -171,12 +171,40 @@ class HourlyForecastModel(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     time: datetime
     temperature: float
+    tempMin: Optional[float] = None
+    tempMax: Optional[float] = None
     feelsLike: Optional[float] = None
+    feelsMin: Optional[float] = None
+    feelsMax: Optional[float] = None
     condition: WeatherCondition
     wmoCode: int = 0
     precipitationChance: int
+    precipProbMin: Optional[int] = None
+    precipProbMax: Optional[int] = None
     precipMm: float = 0.0
+    precipMmMin: Optional[float] = None
+    precipMmMax: Optional[float] = None
     windSpeed: float = 0.0
+    windMin: Optional[float] = None
+    windMax: Optional[float] = None
+    windGusts: Optional[float] = None
+    gustMin: Optional[float] = None
+    gustMax: Optional[float] = None
+    uvIndex: Optional[float] = None
+    uvMin: Optional[float] = None
+    uvMax: Optional[float] = None
+    dewPoint: Optional[float] = None
+    dewMin: Optional[float] = None
+    dewMax: Optional[float] = None
+    cloudCover: Optional[int] = None
+    cloudMin: Optional[int] = None
+    cloudMax: Optional[int] = None
+    visibilityKm: Optional[float] = None
+    visMin: Optional[float] = None
+    visMax: Optional[float] = None
+    pressure: Optional[float] = None
+    pressMin: Optional[float] = None
+    pressMax: Optional[float] = None
 
 
 class DailyForecastModel(BaseModel):
