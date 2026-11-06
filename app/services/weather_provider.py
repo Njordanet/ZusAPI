@@ -747,15 +747,27 @@ class WeatherProviderService:
         raw_dewp = (
             station_composite["dewpoint_c"]
             if (station_composite and station_composite.get("dewpoint_c") is not None)
-            else float(current_raw.get("dew_point_2m") or current_raw.get("dew_point_2m_best_match") or (final_current_temp - 5.0))
+            else (
+                current_raw["dew_point_2m"]
+                if current_raw.get("dew_point_2m") is not None
+                else (
+                    current_raw["dew_point_2m_best_match"]
+                    if current_raw.get("dew_point_2m_best_match") is not None
+                    else (hourly_models[0].dewPoint if hourly_models else (final_current_temp - 5.0))
+                )
+            )
         )
         dewpoint_c = round(float(raw_dewp), 1)
         comfort_label = classify_dewpoint_comfort(dewpoint_c)
 
         wmo_now = int(
             current_raw.get("weather_code")
-            or current_raw.get("weather_code_best_match")
-            or (hourly_models[0].wmoCode if hourly_models else 0)
+            if current_raw.get("weather_code") is not None
+            else (
+                current_raw.get("weather_code_best_match")
+                if current_raw.get("weather_code_best_match") is not None
+                else (hourly_models[0].wmoCode if hourly_models else 0)
+            )
         )
 
         # Ground-truth hierarchy for current sky condition:
@@ -785,8 +797,7 @@ class WeatherProviderService:
             current_condition = WeatherCondition.from_wmo_code(wmo_now)
             observed_wmo = wmo_now
 
-        uv_arr = daily_raw.get("uv_index_max") or daily_raw.get("uv_index_max_best_match") or [5.0]
-        uv_max = float(uv_arr[0]) if uv_arr and uv_arr[0] is not None else 5.0
+        current_uv = float(hourly_models[0].uvIndex) if hourly_models else 0.0
 
         temp_max_today = daily_models[0].maxTemperature if daily_models else final_current_temp
         temp_min_today = daily_models[0].minTemperature if daily_models else final_current_temp
@@ -831,9 +842,13 @@ class WeatherProviderService:
         )
 
         cloud_cover_pct = int(
-            current_raw.get("cloud_cover")
-            or current_raw.get("cloud_cover_best_match")
-            or (95 if observed_wmo >= 3 else 25)
+            current_raw["cloud_cover"]
+            if current_raw.get("cloud_cover") is not None
+            else (
+                current_raw["cloud_cover_best_match"]
+                if current_raw.get("cloud_cover_best_match") is not None
+                else (hourly_models[0].cloudCover if hourly_models else (95 if observed_wmo >= 3 else 25))
+            )
         )
         curr_precip_mmhr = float(
             max(
@@ -843,14 +858,20 @@ class WeatherProviderService:
             )
         )
 
+        raw_feels = (
+            current_raw["apparent_temperature"]
+            if current_raw.get("apparent_temperature") is not None
+            else (
+                current_raw["apparent_temperature_best_match"]
+                if current_raw.get("apparent_temperature_best_match") is not None
+                else (hourly_models[0].feelsLike if hourly_models and hourly_models[0].feelsLike is not None else final_current_temp)
+            )
+        )
+
         current_model = WeatherDataModel(
             cityName=city_name,
             temperature=final_current_temp,
-            feelsLike=float(
-                current_raw.get("apparent_temperature")
-                or current_raw.get("apparent_temperature_best_match")
-                or (hourly_models[0].feelsLike if hourly_models and hourly_models[0].feelsLike is not None else final_current_temp)
-            ),
+            feelsLike=float(raw_feels),
             condition=current_condition,
             tempMin=min(temp_min_today, final_current_temp),
             tempMax=max(temp_max_today, final_current_temp),
@@ -862,7 +883,7 @@ class WeatherProviderService:
             ),
             windSpeed=wind_speed_kmh,
             windDirection=wind_dir_deg,
-            uvIndex=round(uv_max, 1),
+            uvIndex=round(current_uv, 1),
             airPressure=round(float(msl_pressure), 1),
             visibility=visibility_km,
             timestamp=now,
