@@ -38,16 +38,16 @@ def _build_zus_palette() -> Tuple[List[int], bytes]:
 
     # Key color control stops: (index, R, G, B, Alpha)
     stops = [
-        (78, 56, 189, 248, 0),      # 6.5 dBZ: transparent edge
-        (84, 56, 189, 248, 95),     # 9.5 dBZ: soft cyan mist
-        (96, 14, 165, 233, 145),    # 15.5 dBZ: light rain sky blue
-        (112, 37, 99, 235, 185),    # 23.5 dBZ: moderate electric blue
-        (124, 52, 211, 153, 205),   # 29.5 dBZ: intense emerald-cyan transition
-        (134, 250, 204, 21, 222),   # 34.5 dBZ: Züs Storm Gold (#FACC15)
-        (146, 245, 158, 11, 235),   # 40.5 dBZ: deep amber gold
-        (158, 239, 68, 68, 242),    # 46.5 dBZ: crimson storm core
-        (172, 217, 70, 239, 248),   # 53.5 dBZ: electric violet hail core
-        (195, 240, 171, 252, 252),  # 65.0 dBZ: white-hot magenta
+        (82, 56, 189, 248, 0),      # 8.5 dBZ: crisp outer echo boundary
+        (86, 56, 189, 248, 135),    # 10.5 dBZ: crisp cyan mist
+        (96, 14, 165, 233, 185),    # 15.5 dBZ: light rain sky blue
+        (112, 37, 99, 235, 218),    # 23.5 dBZ: moderate electric blue
+        (124, 52, 211, 153, 234),   # 29.5 dBZ: intense emerald-cyan transition
+        (134, 250, 204, 21, 246),   # 34.5 dBZ: Züs Storm Gold (#FACC15)
+        (146, 245, 158, 11, 252),   # 40.5 dBZ: deep amber gold
+        (158, 239, 68, 68, 255),    # 46.5 dBZ: crimson storm core
+        (172, 217, 70, 239, 255),   # 53.5 dBZ: electric violet hail core
+        (195, 240, 171, 252, 255),  # 65.0 dBZ: white-hot magenta
         (255, 255, 255, 255, 255),
     ]
 
@@ -1240,33 +1240,17 @@ class DopplerRadarService:
         if int(tile.max()) < 90:
             return EMPTY_TILE_PNG
 
-        # At higher zoom levels (z >= 6), apply a clean 3x3 Gaussian smoothing pass
-        # without cross-dilation so contiguous precipitation bands look liquid-smooth
+        # Preserve crisp native 1km reflectivity gradients without Gaussian blur;
+        # only filter out isolated single-pixel noise specks (nbr_sum < 2)
         if z >= 6:
             padded = np.pad(tile, 1, mode="edge")
-            active_nbrs = (padded >= 90).astype(np.uint8)
+            active_nbrs = (padded >= 88).astype(np.uint8)
             nbr_sum = (
                 active_nbrs[:-2, :-2] + active_nbrs[:-2, 1:-1] + active_nbrs[:-2, 2:]
                 + active_nbrs[1:-1, :-2] + active_nbrs[1:-1, 1:-1] + active_nbrs[1:-1, 2:]
                 + active_nbrs[2:, :-2] + active_nbrs[2:, 1:-1] + active_nbrs[2:, 2:]
             )
-            avg = (
-                padded[:-2, :-2].astype(np.uint16)
-                + padded[:-2, 1:-1].astype(np.uint16) * 2
-                + padded[:-2, 2:].astype(np.uint16)
-                + padded[1:-1, :-2].astype(np.uint16) * 2
-                + padded[1:-1, 1:-1].astype(np.uint16) * 4
-                + padded[1:-1, 2:].astype(np.uint16) * 2
-                + padded[2:, :-2].astype(np.uint16)
-                + padded[2:, 1:-1].astype(np.uint16) * 2
-                + padded[2:, 2:].astype(np.uint16)
-            ) // 16
-            tile = np.where(
-                nbr_sum >= 4,
-                np.maximum(avg.astype(np.uint8), (tile * 0.94).astype(np.uint8)),
-                0,
-            )
-            tile[tile < 86] = 0
+            tile = np.where((tile >= 86) & (nbr_sum >= 2), tile, 0)
 
         img = Image.fromarray(tile, mode="P")
         img.putpalette(ZUS_PALETTE_RGB)
@@ -1584,7 +1568,7 @@ class DopplerRadarService:
                     label=f.label,
                     offsetMinutes=f.offset_minutes,
                     isFuture=f.is_future,
-                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=7",
+                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=8",
                 )
             )
 
