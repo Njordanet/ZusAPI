@@ -1,11 +1,13 @@
+import asyncio
 import math
-import httpx
 import statistics
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional, Dict, Any
 from app.config import settings
 from app.models.weather import HyperlocalStationReading, WeatherCondition
 from app.services.db import db_manager
+from app.services.http_client import http_pool
 
 
 def parse_metar_visib_km(visib_val: Any) -> Optional[float]:
@@ -110,8 +112,202 @@ class HyperlocalStationService:
     """
     Ingests nearby official METARs, NWS Mesonet stations, and CWOP/APRS citizen
     weather stations, runs elevation lapse-rate normalization and Spatial Buddy Check QC,
-    persists to PostGIS, and produces a hyperlocal ground-truth reading.
+    persists to PostGIS in a single batch transaction, and produces a hyperlocal ground-truth reading.
     """
+
+    def __init__(self):
+        self._station_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._max_cache_entries = 256
+        self._station_cache_ttl = 300.0  # 5 minutes
+        self._nws_points_cache: OrderedDict[str, str] = OrderedDict()
+        self._inflight_locks: Dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _sector_key(lat: float, lon: float) -> str:
+        # 0.05 deg (~5.5 km) spatial sector key for station observation reuse
+        s_lat = round(lat * 20.0) / 20.0
+        s_lon = round(lon * 20.0) / 20.0
+        return f"{s_lat:.2f}:{s_lon:.2f}"
+
+    @staticmethod
+    def _compute_composite_and_readings(
+        candidates: List[Dict[str, Any]],
+        lat: float,
+        lon: float,
+        target_elev_m: float,
+    ) -> Tuple[List[HyperlocalStationReading], Optional[Dict[str, Any]]]:
+        if not candidates:
+            return [], None
+
+        # Recompute exact distance & target elevation adjustment for the caller's coordinates
+        recomputed: List[Dict[str, Any]] = []
+        for orig in candidates:
+            c = dict(orig)
+            c["dist_km"] = round(haversine_km(lat, lon, c["lat"], c["lon"]), 2)
+            c["adj_temp_c"] = elevation_adjust_temp(c["raw_temp_c"], c["elev_m"], target_elev_m)
+            recomputed.append(c)
+
+        recomputed.sort(key=lambda x: x["dist_km"])
+        recomputed = recomputed[:8]
+
+        verified_readings: List[HyperlocalStationReading] = []
+        valid_for_blend: List[Dict[str, Any]] = []
+
+        for c in recomputed:
+            qc_passed = bool(c.get("qc_passed", True))
+            reading = HyperlocalStationReading(
+                stationId=c["station_id"],
+                stationName=c["name"],
+                network=c["network"],
+                distanceKm=c["dist_km"],
+                elevationMeters=round(c["elev_m"], 1),
+                rawTempCelsius=c["raw_temp_c"],
+                elevationAdjustedTempCelsius=c["adj_temp_c"],
+                humidity=c["humidity"],
+                windSpeedKmh=c["wind_kmh"],
+                windGustKmh=c.get("gust_kmh"),
+                pressureHpa=c.get("pressure_hpa"),
+                visibilityKm=c.get("visibility_km"),
+                presentWeather=c.get("wx_string"),
+                qcPassed=qc_passed,
+                zScore=float(c.get("qc_zscore") or 0.0),
+                reliabilityScore=c.get("reliability_score"),
+                residualBiasCelsius=c.get("residual_bias_c"),
+            )
+            verified_readings.append(reading)
+            if qc_passed:
+                valid_for_blend.append(c)
+
+        if not valid_for_blend:
+            valid_for_blend = recomputed[:1]
+
+        # Inverse Distance, Elevation & Recursive Reliability Weighting (IDERW)
+        total_w = 0.0
+        blended_temp = 0.0
+        blended_dewp = 0.0
+        dewp_w = 0.0
+        blended_press = 0.0
+        press_w = 0.0
+
+        for c in valid_for_blend:
+            elev_diff_km = abs(c["elev_m"] - target_elev_m) / 1000.0
+            rel_w = max(0.2, float(c.get("reliability_score") or 1.0))
+            net_prior = 1.0 if "METAR" in str(c.get("network", "")) else 0.78
+            w = (rel_w * net_prior) / (((c["dist_km"] + 1.5) ** 2) * (1.0 + elev_diff_km * 2.0))
+            bias_adj = float(c.get("residual_bias_c") or 0.0) * (0.25 if "METAR" in str(c.get("network", "")) else 0.55)
+            blended_temp += (c["adj_temp_c"] - bias_adj) * w
+            total_w += w
+            if c["dewpoint_c"] is not None:
+                blended_dewp += c["dewpoint_c"] * w
+                dewp_w += w
+            if c.get("pressure_hpa") is not None:
+                blended_press += c["pressure_hpa"] * w
+                press_w += w
+
+        closest = valid_for_blend[0]
+        active_wx_station = next(
+            (
+                c
+                for c in valid_for_blend
+                if c.get("wx_condition") is not None and c["dist_km"] <= 25.0
+            ),
+            None,
+        )
+
+        composite = {
+            "temperature_c": round(blended_temp / total_w, 2) if total_w > 0 else closest["adj_temp_c"],
+            "dewpoint_c": round(blended_dewp / dewp_w, 2) if dewp_w > 0 else closest["dewpoint_c"],
+            "pressure_hpa": round(blended_press / press_w, 1) if press_w > 0 else closest.get("pressure_hpa"),
+            "humidity": closest["humidity"],
+            "wind_kmh": closest["wind_kmh"],
+            "gust_kmh": closest.get("gust_kmh"),
+            "wind_dir": closest.get("wind_dir"),
+            "visibility_km": closest.get("visibility_km"),
+            "closest_station_id": closest["station_id"],
+            "closest_station_name": f"{closest['station_id']} ({closest['name']})",
+            "closest_distance_km": closest["dist_km"],
+            "wx_string": active_wx_station["wx_string"] if active_wx_station else closest.get("wx_string"),
+            "wx_condition": active_wx_station["wx_condition"] if active_wx_station else None,
+            "wx_wmo": active_wx_station["wx_wmo"] if active_wx_station else None,
+            "precip_mmhr": active_wx_station["precip_mmhr"] if active_wx_station else 0.0,
+            "wx_station_dist_km": active_wx_station["dist_km"] if active_wx_station else None,
+        }
+        return verified_readings, composite
+
+    async def _fetch_single_nws_station_obs(
+        self,
+        feat: Dict[str, Any],
+        lat: float,
+        lon: float,
+        target_elev_m: float,
+    ) -> Optional[Dict[str, Any]]:
+        props = feat.get("properties", {})
+        st_id = props.get("stationIdentifier")
+        if not st_id:
+            return None
+        client = http_pool.get_client()
+        try:
+            obs_resp = await client.get(
+                f"{settings.nws_base_url}/stations/{st_id}/observations/latest",
+                timeout=4.5,
+            )
+            if obs_resp.status_code != 200:
+                return None
+            obs_props = obs_resp.json().get("properties", {})
+            t_val = obs_props.get("temperature", {}).get("value")
+            coords = feat.get("geometry", {}).get("coordinates", [lon, lat])
+            if t_val is None or len(coords) < 2:
+                return None
+
+            s_lon, s_lat = float(coords[0]), float(coords[1])
+            elev_m = float(props.get("elevation", {}).get("value") or target_elev_m)
+            dist_km = haversine_km(lat, lon, s_lat, s_lon)
+            raw_temp_c = round(float(t_val), 2)
+            adj_temp_c = elevation_adjust_temp(raw_temp_c, elev_m, target_elev_m)
+            dewp_val = obs_props.get("dewpoint", {}).get("value")
+            rh_val = obs_props.get("relativeHumidity", {}).get("value")
+            wspd_val = obs_props.get("windSpeed", {}).get("value")
+            wgst_val = obs_props.get("windGust", {}).get("value")
+            wdir_val = obs_props.get("windDirection", {}).get("value")
+            slp_pa = obs_props.get("seaLevelPressure", {}).get("value")
+            vis_m = obs_props.get("visibility", {}).get("value")
+            raw_metar = obs_props.get("rawMessage") or ""
+            text_desc = (obs_props.get("textDescription") or "").lower()
+            wx_str_nws = None
+            if "rain" in text_desc or " -ra" in raw_metar.lower():
+                wx_str_nws = "-RA" if "light" in text_desc else "RA"
+            elif "drizzle" in text_desc:
+                wx_str_nws = "-DZ"
+            elif "snow" in text_desc:
+                wx_str_nws = "-SN"
+            elif "thunder" in text_desc:
+                wx_str_nws = "TSRA"
+            wx_cond, wx_wmo, wx_mmhr = parse_metar_wx(wx_str_nws, None)
+
+            return {
+                "station_id": st_id,
+                "name": props.get("name", st_id),
+                "network": "CWOP_MESONET" if len(st_id) > 4 else "NWS_METAR",
+                "lat": s_lat,
+                "lon": s_lon,
+                "dist_km": round(dist_km, 2),
+                "elev_m": elev_m,
+                "raw_temp_c": raw_temp_c,
+                "adj_temp_c": adj_temp_c,
+                "dewpoint_c": round(float(dewp_val), 2) if dewp_val is not None else None,
+                "humidity": int(round(float(rh_val))) if rh_val is not None else None,
+                "wind_kmh": round(float(wspd_val), 1) if wspd_val is not None else None,
+                "gust_kmh": round(float(wgst_val), 1) if wgst_val is not None else None,
+                "wind_dir": int(wdir_val) if wdir_val is not None else 0,
+                "pressure_hpa": round(float(slp_pa) / 100.0, 1) if slp_pa is not None else None,
+                "visibility_km": round(float(vis_m) / 1000.0, 1) if vis_m is not None else None,
+                "wx_string": wx_str_nws,
+                "wx_condition": wx_cond,
+                "wx_wmo": wx_wmo,
+                "precip_mmhr": wx_mmhr,
+            }
+        except Exception:
+            return None
 
     async def fetch_nearby_stations(
         self,
@@ -119,19 +315,38 @@ class HyperlocalStationService:
         lon: float,
         target_elev_m: float = 0.0,
     ) -> Tuple[List[HyperlocalStationReading], Optional[Dict[str, Any]]]:
-        raw_candidates: List[Dict[str, Any]] = []
+        sector = self._sector_key(lat, lon)
+        now = datetime.now(timezone.utc)
 
-        # 1. Query NOAA / AviationWeather Global METAR & Mesonet Bounding Box (~70km radius)
-        # Note: AviationWeather bbox parameter format is minLat,minLon,maxLat,maxLon
-        delta_deg = 0.65
-        bbox = f"{lat - delta_deg:.3f},{lon - delta_deg:.3f},{lat + delta_deg:.3f},{lon + delta_deg:.3f}"
+        if sector in self._station_cache:
+            entry = self._station_cache[sector]
+            if (now - entry["cached_at"]).total_seconds() < self._station_cache_ttl:
+                self._station_cache.move_to_end(sector)
+                return self._compute_composite_and_readings(
+                    entry["candidates"], lat, lon, target_elev_m
+                )
 
-        headers = {"User-Agent": "ZusWeatherEngine/2.0 (panda-telemetry)"}
-        async with httpx.AsyncClient(timeout=6.0, headers=headers) as client:
+        lock = self._inflight_locks.setdefault(sector, asyncio.Lock())
+        async with lock:
+            if sector in self._station_cache:
+                entry = self._station_cache[sector]
+                if (now - entry["cached_at"]).total_seconds() < self._station_cache_ttl:
+                    self._station_cache.move_to_end(sector)
+                    return self._compute_composite_and_readings(
+                        entry["candidates"], lat, lon, target_elev_m
+                    )
+
+            raw_candidates: List[Dict[str, Any]] = []
+            delta_deg = 0.65
+            bbox = f"{lat - delta_deg:.3f},{lon - delta_deg:.3f},{lat + delta_deg:.3f},{lon + delta_deg:.3f}"
+            client = http_pool.get_client()
+
+            # 1. Query NOAA / AviationWeather Global METAR & Mesonet Bounding Box (~70km radius)
             try:
                 resp = await client.get(
                     settings.noaa_metar_url,
                     params={"bbox": bbox, "format": "json"},
+                    timeout=5.5,
                 )
                 if resp.status_code == 200:
                     metars = resp.json()
@@ -196,215 +411,96 @@ class HyperlocalStationService:
             except Exception:
                 pass
 
-            # 2. If in the US and we want hyperlocal density, also check NWS Mesonet/CWOP observation stations
+            # 2. If in the US and <3 METAR candidates found, fetch NWS Mesonet stations in parallel
             if db_manager.is_us_region(lat, lon) and len(raw_candidates) < 3:
                 try:
-                    pt_resp = await client.get(f"{settings.nws_base_url}/points/{lat:.4f},{lon:.4f}")
-                    if pt_resp.status_code == 200:
-                        stations_url = pt_resp.json().get("properties", {}).get("observationStations")
-                        if stations_url:
-                            st_resp = await client.get(stations_url, params={"limit": 5})
-                            if st_resp.status_code == 200:
-                                features = st_resp.json().get("features", [])
-                                for feat in features[:3]:
-                                    props = feat.get("properties", {})
-                                    st_id = props.get("stationIdentifier")
-                                    if not st_id or any(c["station_id"] == st_id for c in raw_candidates):
-                                        continue
-                                    obs_resp = await client.get(f"{settings.nws_base_url}/stations/{st_id}/observations/latest")
-                                    if obs_resp.status_code == 200:
-                                        obs_props = obs_resp.json().get("properties", {})
-                                        t_val = obs_props.get("temperature", {}).get("value")
-                                        coords = feat.get("geometry", {}).get("coordinates", [lon, lat])
-                                        if t_val is not None and len(coords) >= 2:
-                                            s_lon, s_lat = float(coords[0]), float(coords[1])
-                                            elev_m = float(props.get("elevation", {}).get("value") or target_elev_m)
-                                            dist_km = haversine_km(lat, lon, s_lat, s_lon)
-                                            raw_temp_c = round(float(t_val), 2)
-                                            adj_temp_c = elevation_adjust_temp(raw_temp_c, elev_m, target_elev_m)
-                                            dewp_val = obs_props.get("dewpoint", {}).get("value")
-                                            rh_val = obs_props.get("relativeHumidity", {}).get("value")
-                                            wspd_val = obs_props.get("windSpeed", {}).get("value")
-                                            wgst_val = obs_props.get("windGust", {}).get("value")
-                                            wdir_val = obs_props.get("windDirection", {}).get("value")
-                                            slp_pa = obs_props.get("seaLevelPressure", {}).get("value")
-                                            vis_m = obs_props.get("visibility", {}).get("value")
-                                            raw_metar = obs_props.get("rawMessage") or ""
-                                            text_desc = (obs_props.get("textDescription") or "").lower()
-                                            wx_str_nws = None
-                                            if "rain" in text_desc or " -ra" in raw_metar.lower():
-                                                wx_str_nws = "-RA" if "light" in text_desc else "RA"
-                                            elif "drizzle" in text_desc:
-                                                wx_str_nws = "-DZ"
-                                            elif "snow" in text_desc:
-                                                wx_str_nws = "-SN"
-                                            elif "thunder" in text_desc:
-                                                wx_str_nws = "TSRA"
-                                            wx_cond, wx_wmo, wx_mmhr = parse_metar_wx(wx_str_nws, None)
+                    pt_key = f"{lat:.2f},{lon:.2f}"
+                    stations_url = self._nws_points_cache.get(pt_key)
+                    if not stations_url:
+                        pt_resp = await client.get(
+                            f"{settings.nws_base_url}/points/{lat:.4f},{lon:.4f}",
+                            timeout=4.5,
+                        )
+                        if pt_resp.status_code == 200:
+                            stations_url = pt_resp.json().get("properties", {}).get("observationStations")
+                            if stations_url:
+                                self._nws_points_cache[pt_key] = str(stations_url)
+                                if len(self._nws_points_cache) > 512:
+                                    self._nws_points_cache.popitem(last=False)
 
-                                            raw_candidates.append(
-                                                {
-                                                    "station_id": st_id,
-                                                    "name": props.get("name", st_id),
-                                                    "network": "CWOP_MESONET" if len(st_id) > 4 else "NWS_METAR",
-                                                    "lat": s_lat,
-                                                    "lon": s_lon,
-                                                    "dist_km": round(dist_km, 2),
-                                                    "elev_m": elev_m,
-                                                    "raw_temp_c": raw_temp_c,
-                                                    "adj_temp_c": adj_temp_c,
-                                                    "dewpoint_c": round(float(dewp_val), 2) if dewp_val is not None else None,
-                                                    "humidity": int(round(float(rh_val))) if rh_val is not None else None,
-                                                    "wind_kmh": round(float(wspd_val), 1) if wspd_val is not None else None,
-                                                    "gust_kmh": round(float(wgst_val), 1) if wgst_val is not None else None,
-                                                    "wind_dir": int(wdir_val) if wdir_val is not None else 0,
-                                                    "pressure_hpa": round(float(slp_pa) / 100.0, 1) if slp_pa is not None else None,
-                                                    "visibility_km": round(float(vis_m) / 1000.0, 1) if vis_m is not None else None,
-                                                    "wx_string": wx_str_nws,
-                                                    "wx_condition": wx_cond,
-                                                    "wx_wmo": wx_wmo,
-                                                    "precip_mmhr": wx_mmhr,
-                                                }
-                                            )
+                    if stations_url:
+                        st_resp = await client.get(stations_url, params={"limit": 5}, timeout=4.5)
+                        if st_resp.status_code == 200:
+                            features = st_resp.json().get("features", [])
+                            existing_ids = {c["station_id"] for c in raw_candidates}
+                            to_fetch = [
+                                feat
+                                for feat in features[:4]
+                                if feat.get("properties", {}).get("stationIdentifier") not in existing_ids
+                            ][:3]
+                            if to_fetch:
+                                nws_results = await asyncio.gather(
+                                    *(
+                                        self._fetch_single_nws_station_obs(feat, lat, lon, target_elev_m)
+                                        for feat in to_fetch
+                                    ),
+                                    return_exceptions=True,
+                                )
+                                for r in nws_results:
+                                    if isinstance(r, dict):
+                                        raw_candidates.append(r)
                 except Exception:
                     pass
 
-        if not raw_candidates:
-            return [], None
+            if not raw_candidates:
+                return [], None
 
-        # Sort by distance ascending and take closest 8 stations
-        raw_candidates.sort(key=lambda x: x["dist_km"])
-        raw_candidates = raw_candidates[:8]
+            raw_candidates.sort(key=lambda x: x["dist_km"])
+            raw_candidates = raw_candidates[:8]
 
-        # 3. Run Spatial Buddy Check QC (+/- 2.0 sigma outlier rejection on elevation-adjusted temps)
-        adj_temps = [c["adj_temp_c"] for c in raw_candidates]
-        mean_t = statistics.mean(adj_temps)
-        stdev_t = statistics.pstdev(adj_temps) if len(adj_temps) >= 3 else 0.0
+            # 3. Spatial Buddy Check QC (+/- 2.0 sigma outlier rejection on elevation-adjusted temps)
+            adj_temps = [c["adj_temp_c"] for c in raw_candidates]
+            mean_t = statistics.mean(adj_temps)
+            stdev_t = statistics.pstdev(adj_temps) if len(adj_temps) >= 3 else 0.0
 
-        verified_readings: List[HyperlocalStationReading] = []
-        valid_for_blend: List[Dict[str, Any]] = []
-        now = datetime.now(timezone.utc)
+            for c in raw_candidates:
+                if stdev_t > 1.2:
+                    z_score = round(abs(c["adj_temp_c"] - mean_t) / stdev_t, 2)
+                    qc_passed = z_score <= 2.0
+                else:
+                    z_score = 0.0
+                    qc_passed = True
 
-        for idx, c in enumerate(raw_candidates):
-            if stdev_t > 1.2:
-                z_score = round(abs(c["adj_temp_c"] - mean_t) / stdev_t, 2)
-                qc_passed = z_score <= 2.0
-            else:
-                z_score = 0.0
-                qc_passed = True
+                if len(adj_temps) >= 2:
+                    peer_mean = (sum(adj_temps) - c["adj_temp_c"]) / (len(adj_temps) - 1)
+                    spatial_res_c = round(c["adj_temp_c"] - peer_mean, 2)
+                else:
+                    spatial_res_c = 0.0
 
-            # Compute leave-one-out spatial residual against neighboring stations
-            if len(adj_temps) >= 2:
-                peer_mean = (sum(adj_temps) - c["adj_temp_c"]) / (len(adj_temps) - 1)
-                spatial_res_c = round(c["adj_temp_c"] - peer_mean, 2)
-            else:
-                spatial_res_c = 0.0
+                c["qc_passed"] = qc_passed
+                c["qc_zscore"] = z_score
+                c["spatial_residual_c"] = spatial_res_c
 
-            # Persist station & observation to PostGIS and retrieve recursively updated reliability & bias
-            rel_score, res_bias_c = await db_manager.upsert_station_and_observation(
-                station_id=c["station_id"],
-                name=c["name"],
-                network=c["network"],
-                lat=c["lat"],
-                lon=c["lon"],
-                elevation_m=c["elev_m"],
+            # 4. Batch-persist all stations & observations in 1 transaction
+            rel_map = await db_manager.batch_upsert_stations_and_observations(
+                records=raw_candidates,
                 observed_at=now.replace(second=0, microsecond=0),
-                temp_c=c["raw_temp_c"],
-                dewpoint_c=c["dewpoint_c"],
-                humidity=c["humidity"],
-                wind_kmh=c["wind_kmh"],
-                wind_dir=c["wind_dir"],
-                pressure_hpa=c["pressure_hpa"],
-                precip_rate_mm=c.get("precip_mmhr", 0.0),
-                qc_passed=qc_passed,
-                qc_zscore=z_score,
-                spatial_residual_c=spatial_res_c,
             )
-            c["reliability_score"] = rel_score
-            c["residual_bias_c"] = res_bias_c
+            for c in raw_candidates:
+                rel_score, res_bias_c = rel_map.get(c["station_id"], (1.0, 0.0))
+                c["reliability_score"] = rel_score
+                c["residual_bias_c"] = res_bias_c
 
-            reading = HyperlocalStationReading(
-                stationId=c["station_id"],
-                stationName=c["name"],
-                network=c["network"],
-                distanceKm=c["dist_km"],
-                elevationMeters=round(c["elev_m"], 1),
-                rawTempCelsius=c["raw_temp_c"],
-                elevationAdjustedTempCelsius=c["adj_temp_c"],
-                humidity=c["humidity"],
-                windSpeedKmh=c["wind_kmh"],
-                windGustKmh=c.get("gust_kmh"),
-                pressureHpa=c.get("pressure_hpa"),
-                visibilityKm=c.get("visibility_km"),
-                presentWeather=c.get("wx_string"),
-                qcPassed=qc_passed,
-                zScore=z_score,
-                reliabilityScore=rel_score,
-                residualBiasCelsius=res_bias_c,
+            self._station_cache[sector] = {
+                "cached_at": now,
+                "candidates": raw_candidates,
+            }
+            while len(self._station_cache) > self._max_cache_entries:
+                self._station_cache.popitem(last=False)
+
+            return self._compute_composite_and_readings(
+                raw_candidates, lat, lon, target_elev_m
             )
-            verified_readings.append(reading)
-
-            if qc_passed:
-                valid_for_blend.append(c)
-
-        if not valid_for_blend:
-            valid_for_blend = raw_candidates[:1]
-
-        # 4. Inverse Distance, Elevation & Recursive Reliability Weighting (IDERW)
-        total_w = 0.0
-        blended_temp = 0.0
-        blended_dewp = 0.0
-        dewp_w = 0.0
-        blended_press = 0.0
-        press_w = 0.0
-
-        for c in valid_for_blend:
-            elev_diff_km = abs(c["elev_m"] - target_elev_m) / 1000.0
-            rel_w = max(0.2, float(c.get("reliability_score") or 1.0))
-            net_prior = 1.0 if "METAR" in str(c.get("network", "")) else 0.78
-            # Weight combines inverse distance^2, elevation penalty, and learned station reliability
-            w = (rel_w * net_prior) / (((c["dist_km"] + 1.5) ** 2) * (1.0 + elev_diff_km * 2.0))
-            # Correct citizen PWS micro-site warm/cold bias (e.g. asphalt radiation) by 50% of learned residual bias
-            bias_adj = float(c.get("residual_bias_c") or 0.0) * (0.25 if "METAR" in str(c.get("network", "")) else 0.55)
-            blended_temp += (c["adj_temp_c"] - bias_adj) * w
-            total_w += w
-            if c["dewpoint_c"] is not None:
-                blended_dewp += c["dewpoint_c"] * w
-                dewp_w += w
-            if c.get("pressure_hpa") is not None:
-                blended_press += c["pressure_hpa"] * w
-                press_w += w
-
-        closest = valid_for_blend[0]
-        # Find nearest station within 25km reporting active present weather (e.g. -RA, -DZ, SN, TS)
-        active_wx_station = next(
-            (
-                c
-                for c in valid_for_blend
-                if c.get("wx_condition") is not None and c["dist_km"] <= 25.0
-            ),
-            None,
-        )
-
-        composite = {
-            "temperature_c": round(blended_temp / total_w, 2) if total_w > 0 else closest["adj_temp_c"],
-            "dewpoint_c": round(blended_dewp / dewp_w, 2) if dewp_w > 0 else closest["dewpoint_c"],
-            "pressure_hpa": round(blended_press / press_w, 1) if press_w > 0 else closest.get("pressure_hpa"),
-            "humidity": closest["humidity"],
-            "wind_kmh": closest["wind_kmh"],
-            "gust_kmh": closest.get("gust_kmh"),
-            "wind_dir": closest.get("wind_dir"),
-            "visibility_km": closest.get("visibility_km"),
-            "closest_station_id": closest["station_id"],
-            "closest_station_name": f"{closest['station_id']} ({closest['name']})",
-            "closest_distance_km": closest["dist_km"],
-            "wx_string": active_wx_station["wx_string"] if active_wx_station else closest.get("wx_string"),
-            "wx_condition": active_wx_station["wx_condition"] if active_wx_station else None,
-            "wx_wmo": active_wx_station["wx_wmo"] if active_wx_station else None,
-            "precip_mmhr": active_wx_station["precip_mmhr"] if active_wx_station else 0.0,
-            "wx_station_dist_km": active_wx_station["dist_km"] if active_wx_station else None,
-        }
-        return verified_readings, composite
 
 
 station_service = HyperlocalStationService()

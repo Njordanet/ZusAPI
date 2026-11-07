@@ -573,6 +573,120 @@ class DatabaseManager:
                 return (round(float(row["reliability_score"]), 3), round(float(row["residual_bias_c"]), 2))
             return (1.0, 0.0)
 
+    async def batch_upsert_stations_and_observations(
+        self,
+        records: List[Dict[str, Any]],
+        observed_at: datetime,
+    ) -> Dict[str, Tuple[float, float]]:
+        """
+        Batch-upserts up to N stations and their observations inside a single pooled connection
+        and transaction, reducing PostGIS connection acquisitions from 2N to 1.
+        Returns mapping of station_id -> (reliability_score, residual_bias_c).
+        """
+        if not self.pool or not records:
+            return {r["station_id"]: (1.0, 0.0) for r in records}
+
+        results: Dict[str, Tuple[float, float]] = {}
+        obs_batch: List[Tuple[Any, ...]] = []
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for c in records:
+                    spatial_res = float(c.get("spatial_residual_c") or 0.0)
+                    abs_res = abs(spatial_res)
+                    clamped_res = max(-5.0, min(5.0, spatial_res))
+                    qc_passed = bool(c.get("qc_passed", True))
+                    qc_zscore = float(c.get("qc_zscore") or 0.0)
+
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO weather_stations
+                            (station_id, name, network, latitude, longitude, elevation_m, residual_bias_c, residual_mae_c, last_seen_at, geom)
+                        VALUES ($1, $2, $3, $4, $5, $6, $8::double precision * 0.15, GREATEST(0.25, $9::double precision), NOW(), ST_SetSRID(ST_MakePoint($5, $4), 4326))
+                        ON CONFLICT (station_id) DO UPDATE SET
+                            last_seen_at = NOW(),
+                            outlier_strikes = CASE WHEN $7 = FALSE THEN weather_stations.outlier_strikes + 1 ELSE weather_stations.outlier_strikes END,
+                            residual_bias_c = CASE
+                                WHEN $7 = TRUE THEN GREATEST(-3.5, LEAST(3.5, 0.90 * weather_stations.residual_bias_c + 0.10 * $8::double precision))
+                                ELSE weather_stations.residual_bias_c
+                            END,
+                            residual_mae_c = GREATEST(0.20, LEAST(4.0, 0.88 * weather_stations.residual_mae_c + 0.12 * $9::double precision)),
+                            reliability_score = CASE
+                                WHEN $7 = FALSE THEN GREATEST(0.15, weather_stations.reliability_score - 0.12)
+                                ELSE GREATEST(0.20, LEAST(1.0, 1.0 / (1.0 + 0.35 * POW(0.88 * weather_stations.residual_mae_c + 0.12 * $9::double precision, 2))))
+                            END
+                        RETURNING reliability_score, residual_bias_c;
+                        """,
+                        c["station_id"],
+                        c["name"],
+                        c["network"],
+                        c["lat"],
+                        c["lon"],
+                        c["elev_m"],
+                        qc_passed,
+                        clamped_res,
+                        abs_res,
+                    )
+                    if row:
+                        results[c["station_id"]] = (
+                            round(float(row["reliability_score"]), 3),
+                            round(float(row["residual_bias_c"]), 2),
+                        )
+                    else:
+                        results[c["station_id"]] = (1.0, 0.0)
+
+                    obs_batch.append(
+                        (
+                            c["station_id"],
+                            observed_at,
+                            c["raw_temp_c"],
+                            c["dewpoint_c"],
+                            c["humidity"],
+                            c["wind_kmh"],
+                            c["wind_dir"],
+                            c["pressure_hpa"],
+                            float(c.get("precip_mmhr") or 0.0),
+                            qc_passed,
+                            qc_zscore,
+                            clamped_res,
+                        )
+                    )
+
+                if obs_batch:
+                    await conn.executemany(
+                        """
+                        INSERT INTO station_observations
+                            (station_id, observed_at, temperature_c, dewpoint_c, humidity, wind_speed_kmh, wind_dir, pressure_hpa, precip_rate_mm, qc_passed, qc_zscore, spatial_residual_c)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                        ON CONFLICT (station_id, observed_at) DO UPDATE SET
+                            precip_rate_mm = GREATEST(station_observations.precip_rate_mm, EXCLUDED.precip_rate_mm),
+                            pressure_hpa = COALESCE(EXCLUDED.pressure_hpa, station_observations.pressure_hpa),
+                            spatial_residual_c = EXCLUDED.spatial_residual_c;
+                        """,
+                        obs_batch,
+                    )
+        return results
+
+    async def has_expired_unverified_snapshots(self, cell_id: str) -> bool:
+        """
+        O(1) indexed check whether a cell has any unverified snapshots older than 3 hours
+        that require past_hours=24 historical backfill from Open-Meteo.
+        """
+        if not self.pool:
+            return False
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM forecast_snapshots
+                    WHERE cell_id = $1
+                      AND verified = FALSE
+                      AND target_hour < NOW() - INTERVAL '3 hours'
+                );
+                """,
+                cell_id,
+            )
+            return bool(val)
+
     async def save_forecast_snapshots_and_verify(
         self,
         cell_id: str,
@@ -634,6 +748,7 @@ class DatabaseManager:
 
                 # Group verified predictions by lead_hours bucket so RLS can grade the full K-model vector together
                 bucket_vectors: Dict[str, Dict[str, float]] = {"short": {}, "med": {}, "ext": {}}
+                verify_updates_batch: List[Tuple[Any, ...]] = []
 
                 for row in unverified:
                     m_name = row["model_name"]
@@ -652,25 +767,16 @@ class DatabaseManager:
                     )
                     brier_err = (pred_prob - obs_wet) ** 2
 
-                    await conn.execute(
-                        """
-                        UPDATE forecast_snapshots
-                        SET verified = TRUE,
-                            actual_temp_c = $2,
-                            abs_error_c = $3,
-                            signed_bias_c = $4,
-                            actual_wind_kmh = $5,
-                            wind_abs_error_kmh = $6,
-                            brier_error = $7
-                        WHERE id = $1;
-                        """,
-                        row["id"],
-                        ground_truth_temp_c,
-                        abs_err,
-                        signed_bias,
-                        ground_truth_wind_kmh,
-                        wind_err,
-                        brier_err,
+                    verify_updates_batch.append(
+                        (
+                            row["id"],
+                            ground_truth_temp_c,
+                            abs_err,
+                            signed_bias,
+                            ground_truth_wind_kmh,
+                            wind_err,
+                            brier_err,
+                        )
                     )
 
                     if m_name in model_state:
@@ -703,6 +809,22 @@ class DatabaseManager:
                             bucket_vectors["med"][m_name] = b_corr_pred
                         else:
                             bucket_vectors["ext"][m_name] = b_corr_pred
+
+                if verify_updates_batch:
+                    await conn.executemany(
+                        """
+                        UPDATE forecast_snapshots
+                        SET verified = TRUE,
+                            actual_temp_c = $2,
+                            abs_error_c = $3,
+                            signed_bias_c = $4,
+                            actual_wind_kmh = $5,
+                            wind_abs_error_kmh = $6,
+                            brier_error = $7
+                        WHERE id = $1;
+                        """,
+                        verify_updates_batch,
+                    )
 
                 # Step 2: Also grade current-hour (0h) live stream against ground truth for immediate short-range responsiveness
                 now_hour_utc = current_hour.hour
@@ -822,6 +944,7 @@ class DatabaseManager:
                     raw_comp[m] = rls_blend * brier_mod * wind_mod
 
                 total_comp = sum(raw_comp.values()) or 1.0
+                weight_updates_batch: List[Tuple[Any, ...]] = []
                 for m, st in model_state.items():
                     comp_w = round(raw_comp[m] / total_comp, 4)
                     acc_pct = round(
@@ -837,7 +960,27 @@ class DatabaseManager:
                         ),
                         1,
                     )
-                    await conn.execute(
+                    weight_updates_batch.append(
+                        (
+                            cell_id,
+                            m,
+                            round(float(st["mae_temp_c"]), 3),
+                            round(float(st["bias_temp_c"]), 4),
+                            round(float(st["bias_sin_c"]), 4),
+                            round(float(st["bias_cos_c"]), 4),
+                            round(float(st["mae_wind_kmh"]), 2),
+                            round(float(st["bias_wind_kmh"]), 2),
+                            round(float(st["brier_precip"]), 4),
+                            comp_w,
+                            round(float(st["weight_short"]), 4),
+                            round(float(st["weight_med"]), 4),
+                            round(float(st["weight_ext"]), 4),
+                            acc_pct,
+                            int(st["samples_verified"]),
+                        )
+                    )
+                if weight_updates_batch:
+                    await conn.executemany(
                         """
                         UPDATE model_accuracy_weights
                         SET mae_temp_c = $3,
@@ -856,45 +999,38 @@ class DatabaseManager:
                             updated_at = NOW()
                         WHERE cell_id = $1 AND model_name = $2;
                         """,
-                        cell_id,
-                        m,
-                        round(float(st["mae_temp_c"]), 3),
-                        round(float(st["bias_temp_c"]), 4),
-                        round(float(st["bias_sin_c"]), 4),
-                        round(float(st["bias_cos_c"]), 4),
-                        round(float(st["mae_wind_kmh"]), 2),
-                        round(float(st["bias_wind_kmh"]), 2),
-                        round(float(st["brier_precip"]), 4),
-                        comp_w,
-                        round(float(st["weight_short"]), 4),
-                        round(float(st["weight_med"]), 4),
-                        round(float(st["weight_ext"]), 4),
-                        acc_pct,
-                        int(st["samples_verified"]),
+                        weight_updates_batch,
                     )
 
             # Step 5: Store future forecast snapshots across short, med, and ext horizons (1, 3, 6, 12, 24, 48h)
+            snapshot_inserts_batch: List[Tuple[Any, ...]] = []
             for model_name, hours in model_forecasts.items():
                 for lead in (1, 3, 6, 12, 24, 48):
                     if lead < len(hours):
                         h = hours[lead]
-                        await conn.execute(
-                            """
-                            INSERT INTO forecast_snapshots
-                                (cell_id, model_name, issued_at, target_hour, lead_hours, predicted_temp_c, predicted_precip_prob, predicted_wind_kmh, wmo_code)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                            ON CONFLICT (cell_id, model_name, target_hour, lead_hours) DO NOTHING;
-                            """,
-                            cell_id,
-                            model_name,
-                            now,
-                            h["time"],
-                            lead,
-                            h["temp_c"],
-                            h["precip_prob"],
-                            h["wind_kmh"],
-                            h["wmo_code"],
+                        snapshot_inserts_batch.append(
+                            (
+                                cell_id,
+                                model_name,
+                                now,
+                                h["time"],
+                                lead,
+                                h["temp_c"],
+                                h["precip_prob"],
+                                h["wind_kmh"],
+                                h["wmo_code"],
+                            )
                         )
+            if snapshot_inserts_batch:
+                await conn.executemany(
+                    """
+                    INSERT INTO forecast_snapshots
+                        (cell_id, model_name, issued_at, target_hour, lead_hours, predicted_temp_c, predicted_precip_prob, predicted_wind_kmh, wmo_code)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (cell_id, model_name, target_hour, lead_hours) DO NOTHING;
+                    """,
+                    snapshot_inserts_batch,
+                )
 
             # Lightweight housekeeping: prune verified snapshots older than 14 days so disk stays compact
             await conn.execute(

@@ -169,6 +169,7 @@ class WeatherDataModel(BaseModel):
     elevationMeters: Optional[float] = None
     usAqi: Optional[int] = None
     aqiCategory: Optional[str] = None
+    pm25: Optional[float] = None
     dewPoint: Optional[float] = None
     comfortLevel: Optional[str] = None
     nowcastSummary: Optional[str] = None
@@ -176,6 +177,8 @@ class WeatherDataModel(BaseModel):
     cloudCover: Optional[int] = None
     precipIntensityMmHr: float = 0.0
     observedWeatherCode: Optional[int] = None
+    capeJkg: Optional[float] = None
+    liftedIndex: Optional[float] = None
 
 
 class HourlyForecastModel(BaseModel):
@@ -201,6 +204,8 @@ class HourlyForecastModel(BaseModel):
     windGusts: Optional[float] = None
     gustMin: Optional[float] = None
     gustMax: Optional[float] = None
+    windDirection: Optional[int] = None
+    humidity: Optional[int] = None
     uvIndex: Optional[float] = None
     uvMin: Optional[float] = None
     uvMax: Optional[float] = None
@@ -216,6 +221,7 @@ class HourlyForecastModel(BaseModel):
     pressure: Optional[float] = None
     pressMin: Optional[float] = None
     pressMax: Optional[float] = None
+    capeJkg: Optional[float] = None
 
 
 class DailyForecastModel(BaseModel):
@@ -244,6 +250,8 @@ class WeatherResponse(BaseModel):
     nowcast: Optional[NowcastSummary] = None
     dopplerTelemetry: Optional[RadarLocalTelemetry] = None
     regionMode: str = "US_HYPERLOCAL"
+    timezone: str = "UTC"
+    utcOffsetSeconds: int = 0
     source: str = "ZüsAPI / Panda Consensus Engine"
     cached: bool = False
     generatedAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -1,7 +1,9 @@
-import httpx
+from datetime import datetime, timezone
 from fastapi import APIRouter, Query
 from app.config import settings
 from app.models.weather import LightningTelemetryResponse
+from app.services.weather_provider import weather_service
+from app.services.http_client import http_pool
 
 router = APIRouter()
 
@@ -19,13 +21,23 @@ async def get_lightning(
     """
     Evaluates atmospheric convective potential (CAPE J/kg and Lifted Index)
     and active thunderstorm codes around the queried coordinates.
+    Reuses the in-memory WeatherProviderService cache when available for 0ms response.
     """
     cape = 0.0
     lifted_idx = 2.0
     wmo_code = 0
 
-    try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
+    key = weather_service._cache_key(lat, lon)
+    now = datetime.now(timezone.utc)
+    cached_entry = weather_service._cache.get(key)
+    if cached_entry and (now - cached_entry["cached_at"]).total_seconds() < settings.cache_ttl_seconds:
+        w_resp = cached_entry["data"]
+        wmo_code = int(w_resp.current.observedWeatherCode or 0)
+        cape = float(w_resp.current.capeJkg or 0.0)
+        lifted_idx = float(w_resp.current.liftedIndex if w_resp.current.liftedIndex is not None else 2.0)
+    else:
+        try:
+            client = http_pool.get_client()
             resp = await client.get(
                 settings.open_meteo_forecast_url,
                 params={
@@ -35,6 +47,7 @@ async def get_lightning(
                     "hourly": "cape,lifted_index",
                     "forecast_days": 1,
                 },
+                timeout=5.0,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -45,8 +58,8 @@ async def get_lightning(
                     cape = float(cape_arr[0])
                 if li_arr and li_arr[0] is not None:
                     lifted_idx = float(li_arr[0])
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     if wmo_code in (96, 99) or cape >= 2500:
         threat = "Divine Wrath (Severe)"

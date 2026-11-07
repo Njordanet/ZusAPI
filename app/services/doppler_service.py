@@ -203,10 +203,13 @@ class DopplerRadarService:
         self._last_ingested_at: Optional[datetime] = None
         self._last_backfill_at: Optional[datetime] = None
         self._total_backfilled_frames: int = 0
-        self._global_motion_drow_15m: int = 3   # default ~45 km/h E/ESE synoptic drift
-        self._global_motion_dcol_15m: int = 11  # ~11.5km per 15m (~46 km/h)
-        self._motion_field_drow_15m: Optional[np.ndarray] = None  # shape (9, 19) float32
-        self._motion_field_dcol_15m: Optional[np.ndarray] = None  # shape (9, 19) float32
+        self._global_motion_drow_15m: int = 2   # default synoptic drift
+        self._global_motion_dcol_15m: int = 8
+        self._motion_field_drow_15m: Optional[np.ndarray] = None  # shape (55, 123) float32
+        self._motion_field_dcol_15m: Optional[np.ndarray] = None  # shape (55, 123) float32
+        self._cum_drow_fields: Dict[int, np.ndarray] = {}         # fut_mult (1..8) -> shape (110, 245) float32
+        self._cum_dcol_fields: Dict[int, np.ndarray] = {}         # fut_mult (1..8) -> shape (110, 245) float32
+        self._hrrr_trend_fields: Dict[int, np.ndarray] = {}       # fut_mult (1..8) -> shape (110, 245) float32
         self._rainviewer_frames: List[Dict[str, Any]] = []
         self._rainviewer_host: str = "https://tilecache.rainviewer.com"
 
@@ -220,9 +223,10 @@ class DopplerRadarService:
     def _prune_disk_archive(self, max_age_hours: int = 24) -> None:
         try:
             cutoff_ts = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
-            for p in self.archive_dir.glob("n0q_*.png"):
-                if p.stat().st_mtime < cutoff_ts:
-                    p.unlink(missing_ok=True)
+            for pattern in ("n0q_*.png", "hrrr_*.png"):
+                for p in self.archive_dir.glob(pattern):
+                    if p.stat().st_mtime < cutoff_ts:
+                        p.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -315,8 +319,9 @@ class DopplerRadarService:
         h, w = hp1.shape
         scale_to_15m = 15.0 / max(5.0, minutes_apart)
 
-        # Search candidate shifts whose 15-minute equivalent speed is 10.5..22 km / 15m (42..88 km/h)
-        max_shift = max(5, int(round(22.0 / (step_km * scale_to_15m))) + 1)
+        # Search candidate shifts whose 15-minute equivalent speed is 0..25 km / 15m (0..100 km/h)
+        # in all 360° directions so cyclonic pivots and westward wrap-around bands are accurately tracked
+        max_shift = max(5, int(round(25.0 / (step_km * scale_to_15m))) + 1)
         max_shift = min(max_shift, min(h, w) // 3)
 
         best_score = -1.0
@@ -325,13 +330,10 @@ class DopplerRadarService:
 
         for dr in range(-max_shift, max_shift + 1):
             for dc in range(-max_shift, max_shift + 1):
-                if dr == 0 and dc == 0:
-                    continue
                 drow_15m_flt = dr * step_km * scale_to_15m
                 dcol_15m_flt = dc * step_km * scale_to_15m
                 dist_15m_km = math.hypot(drow_15m_flt, dcol_15m_flt)
-                # Enforce realistic synoptic steering flow (42..88 km/h = 10.5..22 km per 15m)
-                if dist_15m_km < 10.5 or dist_15m_km > 22.0:
+                if dist_15m_km > 25.0:
                     continue
 
                 r1_s = max(0, -dr)
@@ -349,17 +351,14 @@ class DopplerRadarService:
                 if n1 < 15.0 or n2 < 15.0:
                     continue
 
-                zncc = float((patch1 * patch2).sum()) / (n1 * n2 + 1e-5)
-                # Slight westerly-to-easterly synoptic prior when correlation ties
-                synoptic_prior = 1.0 + (0.04 if dcol_15m_flt > 0 else -0.02)
-                score = zncc * synoptic_prior
+                score = float((patch1 * patch2).sum()) / (n1 * n2 + 1e-5)
 
                 if score > best_score:
                     best_score = score
                     best_drow_15m = int(round(drow_15m_flt))
                     best_dcol_15m = int(round(dcol_15m_flt))
 
-        if best_score < 0.08:
+        if best_score < 0.12:
             return (fallback_drow, fallback_dcol)
         return (best_drow_15m, best_dcol_15m)
 
@@ -443,84 +442,260 @@ class DopplerRadarService:
             min_active_pixels=50,
         )
 
-    def _build_regional_motion_field(
-        self,
-        older_grid: np.ndarray,
-        newer_grid: np.ndarray,
+    @staticmethod
+    def _compute_mesoscale_flow_grid(
+        g1: np.ndarray,
+        g2: np.ndarray,
         minutes_apart: float,
-        global_drow: int,
-        global_dcol: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        step_dec: int = 4,
+        grid_step_km: float = 1.0,
+        fh: int = 55,
+        fw: int = 123,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Builds a spatially smooth (9, 19) regional storm velocity field (in 1km pixels per 15 min)
-        across the 2700x6100 CONUS grid so every storm system moves along its local optical-flow
-        trajectory with zero seams between WebMercator tiles.
+        Computes a high-resolution (55, 123) mesoscale storm velocity field (~50km spacing across CONUS)
+        using vectorized exact-overlap ZNCC across active precipitation patches with zero speed clamp
+        and zero directional bias, followed by confidence-weighted spatial diffusion so cyclonic
+        vortices, stationary pivots, and wrap-around bands are preserved with full fidelity.
         """
-        fh, fw = 9, 19
-        drow_field = np.full((fh, fw), float(global_drow), dtype=np.float32)
-        dcol_field = np.full((fh, fw), float(global_dcol), dtype=np.float32)
+        s1 = np.clip(g1[::step_dec, ::step_dec].astype(np.float32) - 78.0, 0.0, 110.0)
+        s2 = np.clip(g2[::step_dec, ::step_dec].astype(np.float32) - 78.0, 0.0, 110.0)
+        H, W = s1.shape
+        eff_km = float(step_dec) * grid_step_km
+        rad = max(10, int(round(76.0 / eff_km)))
+        r_cs = np.round(np.linspace(rad, H - rad - 1, fh)).astype(np.int32)
+        c_cs = np.round(np.linspace(rad, W - rad - 1, fw)).astype(np.int32)
 
-        for iy in range(fh):
-            r_center = int(round((iy / (fh - 1)) * (self.GRID_H - 1)))
-            r0 = max(0, r_center - 220)
-            r1 = min(self.GRID_H, r_center + 220)
-            for ix in range(fw):
-                c_center = int(round((ix / (fw - 1)) * (self.GRID_W - 1)))
-                c0 = max(0, c_center - 240)
-                c1 = min(self.GRID_W, c_center + 240)
-                sub1 = older_grid[r0:r1:3, c0:c1:3]
-                sub2 = newer_grid[r0:r1:3, c0:c1:3]
-                dr, dc = self._zncc_block_motion_15m(
-                    sub1,
-                    sub2,
-                    step_km=3.0,
-                    minutes_apart=minutes_apart,
-                    fallback_drow=global_drow,
-                    fallback_dcol=global_dcol,
-                    min_active_pixels=24,
-                )
-                drow_field[iy, ix] = float(dr)
-                dcol_field[iy, ix] = float(dc)
+        patches1, patches2, coords = [], [], []
+        for iy, rc in enumerate(r_cs):
+            for ix, cc in enumerate(c_cs):
+                p1 = s1[rc - rad : rc + rad, cc - rad : cc + rad]
+                p2 = s2[rc - rad : rc + rad, cc - rad : cc + rad]
+                if (p1 > 2.0).sum() >= 12 and (p2 > 2.0).sum() >= 12:
+                    patches1.append(p1 - p1.mean())
+                    patches2.append(p2 - p2.mean())
+                    coords.append((iy, ix))
 
-        # Track target speed magnitude (in km per 15m) before directional smoothing so vector averaging never cancels speed
-        raw_mag = np.hypot(drow_field, dcol_field)
-        target_mag = np.clip(raw_mag, 12.0, 19.5)
+        drow_15m = np.zeros((fh, fw), dtype=np.float32)
+        dcol_15m = np.zeros((fh, fw), dtype=np.float32)
+        conf = np.zeros((fh, fw), dtype=np.float32)
 
-        # Two-pass 3x3 Gaussian spatial smoothing so direction & speed transition smoothly across CONUS
-        for _ in range(2):
-            pr = np.pad(drow_field, 1, mode="edge")
-            pc = np.pad(dcol_field, 1, mode="edge")
-            pm = np.pad(target_mag, 1, mode="edge")
-            drow_field = (
-                pr[:-2, :-2] + pr[:-2, 1:-1] * 2.0 + pr[:-2, 2:]
-                + pr[1:-1, :-2] * 2.0 + pr[1:-1, 1:-1] * 4.0 + pr[1:-1, 2:] * 2.0
-                + pr[2:, :-2] + pr[2:, 1:-1] * 2.0 + pr[2:, 2:]
+        if patches1:
+            P1 = np.stack(patches1, axis=0)
+            P2 = np.stack(patches2, axis=0)
+            N, ph, pw = P1.shape
+            scale_15m = (15.0 / max(5.0, minutes_apart)) * eff_km
+            max_sh = min(10, max(4, int(round(24.0 / scale_15m))))
+
+            best_sc = np.full(N, -1.0, dtype=np.float32)
+            best_r = np.zeros(N, dtype=np.float32)
+            best_c = np.zeros(N, dtype=np.float32)
+
+            for dr in range(-max_sh, max_sh + 1):
+                for dc in range(-max_sh, max_sh + 1):
+                    if math.hypot(dr * scale_15m, dc * scale_15m) > 25.0:
+                        continue
+                    r1s, r1e = max(0, -dr), min(ph, ph - dr)
+                    c1s, c1e = max(0, -dc), min(pw, pw - dc)
+                    sub1 = P1[:, r1s:r1e, c1s:c1e]
+                    sub2 = P2[:, r1s + dr : r1e + dr, c1s + dc : c1e + dc]
+                    e1 = (sub1 * sub1).sum(axis=(1, 2))
+                    e2 = (sub2 * sub2).sum(axis=(1, 2))
+                    cross = (sub1 * sub2).sum(axis=(1, 2))
+                    denom = np.sqrt(e1 * e2) + 1e-5
+                    sc = np.where((e1 > 30.0) & (e2 > 30.0), cross / denom, -1.0)
+                    better = sc > best_sc
+                    best_sc = np.where(better, sc, best_sc)
+                    best_r = np.where(better, dr * scale_15m, best_r)
+                    best_c = np.where(better, dc * scale_15m, best_c)
+
+            for k, (iy, ix) in enumerate(coords):
+                if best_sc[k] >= 0.15:
+                    drow_15m[iy, ix] = float(best_r[k])
+                    dcol_15m[iy, ix] = float(best_c[k])
+                    conf[iy, ix] = float(best_sc[k])
+
+        w = np.maximum(conf, 1e-4)
+        wr = drow_15m * w
+        wc = dcol_15m * w
+        for _ in range(7):
+            pw_pad = np.pad(w, 1, mode="edge")
+            pr_pad = np.pad(wr, 1, mode="edge")
+            pc_pad = np.pad(wc, 1, mode="edge")
+            w_nbr = (
+                pw_pad[:-2, :-2] + pw_pad[:-2, 1:-1] * 2.0 + pw_pad[:-2, 2:]
+                + pw_pad[1:-1, :-2] * 2.0 + pw_pad[1:-1, 1:-1] * 4.0 + pw_pad[1:-1, 2:] * 2.0
+                + pw_pad[2:, :-2] + pw_pad[2:, 1:-1] * 2.0 + pw_pad[2:, 2:]
             ) / 16.0
-            dcol_field = (
-                pc[:-2, :-2] + pc[:-2, 1:-1] * 2.0 + pc[:-2, 2:]
-                + pc[1:-1, :-2] * 2.0 + pc[1:-1, 1:-1] * 4.0 + pc[1:-1, 2:] * 2.0
-                + pc[2:, :-2] + pc[2:, 1:-1] * 2.0 + pc[2:, 2:]
+            wr_nbr = (
+                pr_pad[:-2, :-2] + pr_pad[:-2, 1:-1] * 2.0 + pr_pad[:-2, 2:]
+                + pr_pad[1:-1, :-2] * 2.0 + pr_pad[1:-1, 1:-1] * 4.0 + pr_pad[1:-1, 2:] * 2.0
+                + pr_pad[2:, :-2] + pr_pad[2:, 1:-1] * 2.0 + pr_pad[2:, 2:]
             ) / 16.0
-            target_mag = (
-                pm[:-2, :-2] + pm[:-2, 1:-1] * 2.0 + pm[:-2, 2:]
-                + pm[1:-1, :-2] * 2.0 + pm[1:-1, 1:-1] * 4.0 + pm[1:-1, 2:] * 2.0
-                + pm[2:, :-2] + pm[2:, 1:-1] * 2.0 + pm[2:, 2:]
+            wc_nbr = (
+                pc_pad[:-2, :-2] + pc_pad[:-2, 1:-1] * 2.0 + pc_pad[:-2, 2:]
+                + pc_pad[1:-1, :-2] * 2.0 + pc_pad[1:-1, 1:-1] * 4.0 + pc_pad[1:-1, 2:] * 2.0
+                + pc_pad[2:, :-2] + pc_pad[2:, 1:-1] * 2.0 + pc_pad[2:, 2:]
             ) / 16.0
+            keep = np.clip(conf * 1.35, 0.0, 0.82)
+            wr = keep * (drow_15m * w) + (1.0 - keep) * wr_nbr
+            wc = keep * (dcol_15m * w) + (1.0 - keep) * wc_nbr
+            w = keep * w + (1.0 - keep) * np.maximum(w_nbr, 1e-4)
 
-        # Renormalize smoothed vectors so directional averaging never shrinks storm propagation speed,
-        # and convert eastward km displacement to 0.01-deg longitude columns via 1 / cos(lat)
-        cur_mag = np.hypot(drow_field, dcol_field)
-        fallback_norm = max(1.0, math.hypot(global_drow, global_dcol))
-        ux = np.where(cur_mag > 1.5, dcol_field / np.maximum(cur_mag, 1e-4), global_dcol / fallback_norm)
-        uy = np.where(cur_mag > 1.5, drow_field / np.maximum(cur_mag, 1e-4), global_drow / fallback_norm)
+        smooth_dr = (wr / np.maximum(w, 1e-4)).astype(np.float32)
+        smooth_dc = (wc / np.maximum(w, 1e-4)).astype(np.float32)
+        return (smooth_dr, smooth_dc, conf)
+
+    def _build_curved_trajectories_sync(
+        self,
+        past_frames: List[DopplerGridFrame],
+        hrrr_grids: Dict[int, np.ndarray],
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        Dict[int, np.ndarray],
+        Dict[int, np.ndarray],
+        Dict[int, np.ndarray],
+    ]:
+        """
+        Combines dual-baseline observed NEXRAD N0Q optical flow (-45m/LIVE and -30m/LIVE) with
+        NOAA HRRR 15-minute Subhourly Forecast reflectivity velocity & intensity evolution, and
+        integrates 16-step RK2 curved backward trajectories across CONUS on a (110, 245) grid
+        for each of the 8 future frames (+15m .. +2h).
+        """
+        fh, fw = 55, 123
+        live_f = past_frames[-1]
+        ref_a = past_frames[0]
+        ref_b = past_frames[1] if len(past_frames) >= 4 else past_frames[0]
+
+        mins_a = max(5.0, (live_f.dt - ref_a.dt).total_seconds() / 60.0)
+        mins_b = max(5.0, (live_f.dt - ref_b.dt).total_seconds() / 60.0)
+
+        dr_a, dc_a, conf_a = self._compute_mesoscale_flow_grid(ref_a.grid, live_f.grid, mins_a, step_dec=4, grid_step_km=1.0, fh=fh, fw=fw)
+        if ref_b is not ref_a:
+            dr_b, dc_b, conf_b = self._compute_mesoscale_flow_grid(ref_b.grid, live_f.grid, mins_b, step_dec=4, grid_step_km=1.0, fh=fh, fw=fw)
+            obs_dr = (0.45 * dr_a + 0.55 * dr_b).astype(np.float32)
+            obs_dc = (0.45 * dc_a + 0.55 * dc_b).astype(np.float32)
+            obs_conf = np.maximum(conf_a, conf_b)
+        else:
+            obs_dr, obs_dc, obs_conf = dr_a, dc_a, conf_a
+
+        # Compute NOAA HRRR forecast flow fields for 0..+60m and +60m..+120m when available
+        hrrr_dr_1, hrrr_dc_1, hrrr_conf_1 = obs_dr, obs_dc, np.zeros_like(obs_conf)
+        hrrr_dr_2, hrrr_dc_2, hrrr_conf_2 = obs_dr, obs_dc, np.zeros_like(obs_conf)
+        if 0 in hrrr_grids and 60 in hrrr_grids:
+            hrrr_dr_1, hrrr_dc_1, hrrr_conf_1 = self._compute_mesoscale_flow_grid(
+                hrrr_grids[0], hrrr_grids[60], 60.0, step_dec=2, grid_step_km=2.0, fh=fh, fw=fw
+            )
+        if 60 in hrrr_grids and 120 in hrrr_grids:
+            hrrr_dr_2, hrrr_dc_2, hrrr_conf_2 = self._compute_mesoscale_flow_grid(
+                hrrr_grids[60], hrrr_grids[120], 60.0, step_dec=2, grid_step_km=2.0, fh=fh, fw=fw
+            )
+        elif 0 in hrrr_grids and 60 in hrrr_grids:
+            hrrr_dr_2, hrrr_dc_2, hrrr_conf_2 = hrrr_dr_1, hrrr_dc_1, hrrr_conf_1
 
         lats_row = self.LAT_MAX - (np.arange(fh, dtype=np.float32) / (fh - 1)) * (self.LAT_MAX - self.LAT_MIN)
         cos_lats = np.clip(np.cos(np.radians(lats_row)), 0.55, 0.95)[:, None]
 
-        drow_field = (uy * target_mag).astype(np.float32)
-        dcol_field = ((ux * target_mag) / cos_lats).astype(np.float32)
+        # Build time-indexed velocity fields V(step) for step = 1..8 (in 0.01-deg grid units per 15m)
+        v_dr_steps: Dict[int, np.ndarray] = {}
+        v_dc_steps: Dict[int, np.ndarray] = {}
+        for step in range(1, 9):
+            if step <= 4:
+                # Ramp HRRR guidance weight from 0.15 at +15m to 0.45 at +60m where HRRR has active signal
+                w_h = (0.10 + 0.085 * step) * np.clip(hrrr_conf_1 * 2.2, 0.0, 1.0)
+                dr_s = (1.0 - w_h) * obs_dr + w_h * hrrr_dr_1
+                dc_s = (1.0 - w_h) * obs_dc + w_h * hrrr_dc_1
+            else:
+                # Ramp HRRR guidance weight from 0.50 at +75m to 0.70 at +120m
+                w_h = (0.45 + 0.06 * (step - 4)) * np.clip(hrrr_conf_2 * 2.2, 0.0, 1.0)
+                dr_s = (1.0 - w_h) * obs_dr + w_h * hrrr_dr_2
+                dc_s = (1.0 - w_h) * obs_dc + w_h * hrrr_dc_2
+            v_dr_steps[step] = dr_s.astype(np.float32)
+            v_dc_steps[step] = (dc_s / cos_lats).astype(np.float32)
 
-        return (drow_field, dcol_field)
+        obs_dc_deg = (obs_dc / cos_lats).astype(np.float32)
+
+        # Helper to bilinearly sample a (fh, fw) velocity grid at arbitrary (r_grid, c_grid) coordinates
+        def _sample_v(v_r_grid: np.ndarray, v_c_grid: np.ndarray, r_pts: np.ndarray, c_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            fy = np.clip((r_pts / (self.GRID_H - 1)) * (fh - 1), 0.0, fh - 1.001)
+            fx = np.clip((c_pts / (self.GRID_W - 1)) * (fw - 1), 0.0, fw - 1.001)
+            iy = fy.astype(np.int32)
+            ix = fx.astype(np.int32)
+            dy = fy - iy
+            dx = fx - ix
+            vr = (
+                v_r_grid[iy, ix] * (1.0 - dy) * (1.0 - dx)
+                + v_r_grid[iy, ix + 1] * (1.0 - dy) * dx
+                + v_r_grid[iy + 1, ix] * dy * (1.0 - dx)
+                + v_r_grid[iy + 1, ix + 1] * dy * dx
+            )
+            vc = (
+                v_c_grid[iy, ix] * (1.0 - dy) * (1.0 - dx)
+                + v_c_grid[iy, ix + 1] * (1.0 - dy) * dx
+                + v_c_grid[iy + 1, ix] * dy * (1.0 - dx)
+                + v_c_grid[iy + 1, ix + 1] * dy * dx
+            )
+            return vr, vc
+
+        # Integrate curved backward trajectories on a (110, 245) grid (~25km spacing) across CONUS using RK2
+        th, tw = 110, 245
+        base_r = np.linspace(0.0, float(self.GRID_H - 1), th, dtype=np.float32)[:, None]
+        base_c = np.linspace(0.0, float(self.GRID_W - 1), tw, dtype=np.float32)[None, :]
+        base_r_2d = np.broadcast_to(base_r, (th, tw)).copy()
+        base_c_2d = np.broadcast_to(base_c, (th, tw)).copy()
+
+        cum_drow: Dict[int, np.ndarray] = {}
+        cum_dcol: Dict[int, np.ndarray] = {}
+        hrrr_trends: Dict[int, np.ndarray] = {}
+
+        # Pre-smooth HRRR 2km grids on (110, 245) for Lagrangian intensity trend modulation
+        hrrr_coarse: Dict[int, np.ndarray] = {}
+        for m_min, h_grid in hrrr_grids.items():
+            # h_grid is (1340, 3050) uint8 -> sample onto (110, 245) with local 5x5 mean
+            hr_idx = np.clip(np.round(np.linspace(0, h_grid.shape[0] - 1, th)).astype(np.int32), 0, h_grid.shape[0] - 1)
+            hc_idx = np.clip(np.round(np.linspace(0, h_grid.shape[1] - 1, tw)).astype(np.int32), 0, h_grid.shape[1] - 1)
+            sub_h = h_grid[np.ix_(hr_idx, hc_idx)].astype(np.float32)
+            ph_pad = np.pad(sub_h, 1, mode="edge")
+            hrrr_coarse[m_min] = (
+                ph_pad[:-2, :-2] + ph_pad[:-2, 1:-1] * 2.0 + ph_pad[:-2, 2:]
+                + ph_pad[1:-1, :-2] * 2.0 + ph_pad[1:-1, 1:-1] * 4.0 + ph_pad[1:-1, 2:] * 2.0
+                + ph_pad[2:, :-2] + ph_pad[2:, 1:-1] * 2.0 + ph_pad[2:, 2:]
+            ) / 16.0
+
+        for target_step in range(1, 9):
+            cur_r = base_r_2d.copy()
+            cur_c = base_c_2d.copy()
+            # Step backwards from t = target_step to t = 0 in half-steps (dt = 0.5 = 7.5 min) using RK2 midpoint
+            for sub in range(target_step * 2, 0, -1):
+                step_idx = max(1, min(8, (sub + 1) // 2))
+                vr_grid = v_dr_steps[step_idx]
+                vc_grid = v_dc_steps[step_idx]
+                vr1, vc1 = _sample_v(vr_grid, vc_grid, cur_r, cur_c)
+                mid_r = cur_r - 0.25 * vr1
+                mid_c = cur_c - 0.25 * vc1
+                vr2, vc2 = _sample_v(vr_grid, vc_grid, mid_r, mid_c)
+                cur_r = cur_r - 0.5 * vr2
+                cur_c = cur_c - 0.5 * vc2
+
+            cum_drow[target_step] = (base_r_2d - cur_r).astype(np.float32)
+            cum_dcol[target_step] = (base_c_2d - cur_c).astype(np.float32)
+
+            # Compute subtle HRRR Lagrangian intensity trend along the parcel trajectory (clamped to [-5, +6] index units)
+            fut_min = target_step * 15
+            near_hrrr_min = min(hrrr_coarse.keys(), key=lambda k: abs(k - fut_min)) if hrrr_coarse else -1
+            if 0 in hrrr_coarse and near_hrrr_min > 0:
+                h_end = hrrr_coarse[near_hrrr_min]
+                # Sample hrrr_coarse[0] at the parcel origin (cur_r, cur_c)
+                oy = np.clip(np.round((cur_r / (self.GRID_H - 1)) * (th - 1)).astype(np.int32), 0, th - 1)
+                ox = np.clip(np.round((cur_c / (self.GRID_W - 1)) * (tw - 1)).astype(np.int32), 0, tw - 1)
+                h_start = hrrr_coarse[0][oy, ox]
+                raw_diff = (h_end - h_start) * 0.35
+                hrrr_trends[target_step] = np.clip(raw_diff, -5.0, 6.0).astype(np.float32)
+            else:
+                hrrr_trends[target_step] = np.zeros((th, tw), dtype=np.float32)
+
+        return (obs_dr, obs_dc_deg, cum_drow, cum_dcol, hrrr_trends)
 
     @staticmethod
     def _advect_grid(grid: np.ndarray, drow: int, dcol: int, decay_indices: int = 2) -> np.ndarray:
@@ -692,7 +867,46 @@ class DopplerRadarService:
                         return
 
                     live_frame = new_past_frames[-1]
-                    # Compute global & 2D regional storm motion field between -30m/-45m frame and LIVE
+
+                    # Fetch NOAA HRRR 15-minute Subhourly Forecast Reflectivity grids (0m, +30m, +60m, +90m, +120m)
+                    hrrr_grids: Dict[int, np.ndarray] = {}
+                    try:
+                        hrrr_base = "https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr"
+                        h_meta_resp = await client.get(f"{hrrr_base}/refd_0000.json")
+                        if h_meta_resp.status_code == 200:
+                            init_str = h_meta_resp.json().get("model_init_utc")
+                            if init_str:
+                                h_init_dt = datetime.strptime(init_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                                    tzinfo=timezone.utc
+                                )
+                                lead0 = max(
+                                    0,
+                                    int(round((live_frame.dt - h_init_dt).total_seconds() / 60.0 / 15.0)) * 15,
+                                )
+                                init_tag = f"{h_init_dt:%Y%m%d%H%M}"
+                                for h_off in (0, 30, 60, 90, 120):
+                                    lead = lead0 + h_off
+                                    if lead > 1080:
+                                        continue
+                                    h_file = self.archive_dir / f"hrrr_{init_tag}_{lead:04d}.png"
+                                    h_bytes: Optional[bytes] = None
+                                    if h_file.exists() and h_file.stat().st_size > 20_000:
+                                        h_bytes = h_file.read_bytes()
+                                    else:
+                                        h_resp = await client.get(f"{hrrr_base}/refd_{lead:04d}.png")
+                                        if h_resp.status_code == 200 and len(h_resp.content) > 20_000:
+                                            h_bytes = h_resp.content
+                                            try:
+                                                h_file.write_bytes(h_bytes)
+                                            except Exception:
+                                                pass
+                                    if h_bytes is not None:
+                                        with Image.open(io.BytesIO(h_bytes)) as h_img:
+                                            hrrr_grids[h_off] = np.asarray(h_img, dtype=np.uint8)
+                    except Exception as e:
+                        print(f"⚠️ HRRR reflectivity guidance fetch warning: {e}")
+
+                    # Compute mesoscale storm motion field + 16-step RK2 curved backward trajectories
                     if len(new_past_frames) >= 2:
                         ref_frame = new_past_frames[1] if len(new_past_frames) >= 4 else new_past_frames[0]
                         mins_diff = max(5.0, (live_frame.dt - ref_frame.dt).total_seconds() / 60.0)
@@ -704,16 +918,22 @@ class DopplerRadarService:
                         )
                         self._global_motion_drow_15m = drow
                         self._global_motion_dcol_15m = dcol
-                        f_drow, f_dcol = await asyncio.to_thread(
-                            self._build_regional_motion_field,
-                            ref_frame.grid,
-                            live_frame.grid,
-                            mins_diff,
-                            drow,
-                            dcol,
+                        (
+                            f_drow,
+                            f_dcol,
+                            cum_dr,
+                            cum_dc,
+                            hrrr_trends,
+                        ) = await asyncio.to_thread(
+                            self._build_curved_trajectories_sync,
+                            new_past_frames,
+                            hrrr_grids,
                         )
                         self._motion_field_drow_15m = f_drow
                         self._motion_field_dcol_15m = f_dcol
+                        self._cum_drow_fields = cum_dr
+                        self._cum_dcol_fields = cum_dc
+                        self._hrrr_trend_fields = hrrr_trends
 
                     # 3. Synthesize 2-Hour (+15m .. +2h in 15m steps) Zero-Copy Advected Nowcast Future Frames
                     future_steps = [
@@ -924,14 +1144,17 @@ class DopplerRadarService:
         base_cols = (lons - self.LON_MIN) / self.STEP_DEG
         base_rows = (self.LAT_MAX - lats) / self.STEP_DEG
 
+        step_idx = max(1, min(8, int(round(fut_mult)))) if fut_mult > 0.0 else 0
         if (
-            fut_mult > 0.0
-            and self._motion_field_drow_15m is not None
-            and self._motion_field_dcol_15m is not None
+            step_idx > 0
+            and step_idx in self._cum_drow_fields
+            and step_idx in self._cum_dcol_fields
         ):
-            fh, fw = self._motion_field_drow_15m.shape
-            fy = np.clip((base_rows / (self.GRID_H - 1)) * (fh - 1), 0.0, fh - 1.001)
-            fx = np.clip((base_cols / (self.GRID_W - 1)) * (fw - 1), 0.0, fw - 1.001)
+            cum_dr_grid = self._cum_drow_fields[step_idx]
+            cum_dc_grid = self._cum_dcol_fields[step_idx]
+            th, tw = cum_dr_grid.shape
+            fy = np.clip((base_rows / (self.GRID_H - 1)) * (th - 1), 0.0, th - 1.001)
+            fx = np.clip((base_cols / (self.GRID_W - 1)) * (tw - 1), 0.0, tw - 1.001)
             iy = fy.astype(np.int32)
             ix = fx.astype(np.int32)
             dy = (fy - iy)[:, None]
@@ -943,26 +1166,20 @@ class DopplerRadarService:
             ix1 = (ix + 1)[None, :]
 
             drow_2d = (
-                self._motion_field_drow_15m[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
-                + self._motion_field_drow_15m[iy0, ix1] * (1.0 - dy) * dx
-                + self._motion_field_drow_15m[iy1, ix0] * dy * (1.0 - dx)
-                + self._motion_field_drow_15m[iy1, ix1] * dy * dx
+                cum_dr_grid[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                + cum_dr_grid[iy0, ix1] * (1.0 - dy) * dx
+                + cum_dr_grid[iy1, ix0] * dy * (1.0 - dx)
+                + cum_dr_grid[iy1, ix1] * dy * dx
             )
             dcol_2d = (
-                self._motion_field_dcol_15m[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
-                + self._motion_field_dcol_15m[iy0, ix1] * (1.0 - dy) * dx
-                + self._motion_field_dcol_15m[iy1, ix0] * dy * (1.0 - dx)
-                + self._motion_field_dcol_15m[iy1, ix1] * dy * dx
+                cum_dc_grid[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                + cum_dc_grid[iy0, ix1] * (1.0 - dy) * dx
+                + cum_dc_grid[iy1, ix0] * dy * (1.0 - dx)
+                + cum_dc_grid[iy1, ix1] * dy * dx
             )
 
-            # Add subtle continuous mesoscale wave shear along the 2-hour track so bands evolve organically
-            wave_phase_r = base_rows[:, None] * 0.045 + fut_mult * 0.55
-            wave_phase_c = base_cols[None, :] * 0.045 - fut_mult * 0.45
-            shear_r = np.sin(wave_phase_c) * (0.45 * fut_mult)
-            shear_c = np.cos(wave_phase_r) * (0.45 * fut_mult)
-
-            rows_2d = np.floor(base_rows[:, None] - drow_2d * fut_mult - shear_r).astype(np.int32)
-            cols_2d = np.floor(base_cols[None, :] - dcol_2d * fut_mult - shear_c).astype(np.int32)
+            rows_2d = np.floor(base_rows[:, None] - drow_2d).astype(np.int32)
+            cols_2d = np.floor(base_cols[None, :] - dcol_2d).astype(np.int32)
 
             valid_mask = (
                 (rows_2d >= 0)
@@ -976,6 +1193,21 @@ class DopplerRadarService:
             r_clip = np.clip(rows_2d, 0, self.GRID_H - 1)
             c_clip = np.clip(cols_2d, 0, self.GRID_W - 1)
             tile = grid[r_clip, c_clip].copy()
+
+            # Apply HRRR Lagrangian intensity trend on active precipitation bands
+            if step_idx in self._hrrr_trend_fields:
+                tr_grid = self._hrrr_trend_fields[step_idx]
+                trend_2d = (
+                    tr_grid[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                    + tr_grid[iy0, ix1] * (1.0 - dy) * dx
+                    + tr_grid[iy1, ix0] * dy * (1.0 - dx)
+                    + tr_grid[iy1, ix1] * dy * dx
+                )
+                active_echo = tile >= 86
+                if np.any(active_echo):
+                    mod = np.clip(tile.astype(np.float32) + trend_2d, 84.0, 195.0).astype(np.uint8)
+                    tile = np.where(active_echo, mod, tile)
+
             if not np.all(valid_mask):
                 tile[~valid_mask] = 0
         else:
@@ -1352,7 +1584,7 @@ class DopplerRadarService:
                     label=f.label,
                     offsetMinutes=f.offset_minutes,
                     isFuture=f.is_future,
-                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=4",
+                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=7",
                 )
             )
 
