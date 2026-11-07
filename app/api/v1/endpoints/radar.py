@@ -17,6 +17,8 @@ async def get_radar_manifest(
     lon: Optional[float] = Query(None, ge=-180.0, le=180.0, description="Optional longitude for instant point telemetry"),
 ):
     base_url = str(request.base_url).rstrip("/")
+    if request.headers.get("x-forwarded-proto") == "https" and base_url.startswith("http://"):
+        base_url = "https://" + base_url[len("http://") :]
     return await doppler_service.get_manifest(lat=lat, lon=lon, base_url=base_url)
 
 
@@ -60,16 +62,20 @@ async def get_radar_tile(
 ):
     png_bytes = await doppler_service.get_tile_png(frame_id=frame_id, z=z, x=x, y=y)
     # Content-addressed frame_ids are immutable once recorded; "latest" refreshes every 300s
+    is_mutable = frame_id == "latest" or frame_id.startswith("nowcast_")
     cache_header = (
-        "public, max-age=300"
-        if frame_id == "latest"
-        else "public, max-age=86400, immutable"
+        "public, max-age=240, s-maxage=240"
+        if is_mutable
+        else "public, max-age=86400, s-maxage=86400, immutable"
     )
+    cdn_cache_header = "public, max-age=240" if is_mutable else "public, max-age=86400, immutable"
     return Response(
         content=png_bytes,
         media_type="image/png",
         headers={
             "Cache-Control": cache_header,
+            "CDN-Cache-Control": cdn_cache_header,
+            "Cloudflare-CDN-Cache-Control": cdn_cache_header,
             "Access-Control-Allow-Origin": "*",
             "X-Zus-Radar-Engine": "8bit-Indexed-Numpy-ZeroCopy",
         },

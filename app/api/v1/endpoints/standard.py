@@ -390,7 +390,9 @@ async def get_rainviewer_standard_tile(
         content=png_bytes,
         media_type="image/png",
         headers={
-            "Cache-Control": "public, max-age=86400, immutable",
+            "Cache-Control": "public, max-age=86400, s-maxage=86400, immutable",
+            "CDN-Cache-Control": "public, max-age=86400, immutable",
+            "Cloudflare-CDN-Cache-Control": "public, max-age=86400, immutable",
             "Access-Control-Allow-Origin": "*",
         },
     )

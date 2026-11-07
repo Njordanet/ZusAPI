@@ -203,8 +203,10 @@ class DopplerRadarService:
         self._last_ingested_at: Optional[datetime] = None
         self._last_backfill_at: Optional[datetime] = None
         self._total_backfilled_frames: int = 0
-        self._global_motion_drow_15m: int = 1   # default slight E/NE drift
-        self._global_motion_dcol_15m: int = 12  # ~12km east per 15m (~48 km/h)
+        self._global_motion_drow_15m: int = 3   # default ~45 km/h E/ESE synoptic drift
+        self._global_motion_dcol_15m: int = 11  # ~11.5km per 15m (~46 km/h)
+        self._motion_field_drow_15m: Optional[np.ndarray] = None  # shape (9, 19) float32
+        self._motion_field_dcol_15m: Optional[np.ndarray] = None  # shape (9, 19) float32
         self._rainviewer_frames: List[Dict[str, Any]] = []
         self._rainviewer_host: str = "https://tilecache.rainviewer.com"
 
@@ -264,101 +266,261 @@ class DopplerRadarService:
             pooled[nbr_count < 2] = 0
             return pooled
 
+    @staticmethod
+    def _zncc_block_motion_15m(
+        sub1: np.ndarray,
+        sub2: np.ndarray,
+        step_km: float,
+        minutes_apart: float,
+        fallback_drow: int,
+        fallback_dcol: int,
+        min_active_pixels: int = 20,
+    ) -> Tuple[int, int]:
+        """
+        Estimates 15-minute storm displacement (drow_1km, dcol_1km) between `sub1` (older)
+        and `sub2` (newer) using Zero-Mean Normalized Cross-Correlation (ZNCC) on the
+        high-pass spatial reflectivity gradient so flat stratiform shields never bias
+        the motion vector toward zero shift.
+        Enforces a realistic synoptic propagation speed of 30..80 km/h (7.5..20 km per 15m).
+        """
+        if minutes_apart <= 0 or sub1.shape != sub2.shape:
+            return (fallback_drow, fallback_dcol)
+
+        active1 = sub1 >= 80
+        active2 = sub2 >= 80
+        if int(active1.sum()) < min_active_pixels or int(active2.sum()) < min_active_pixels:
+            return (fallback_drow, fallback_dcol)
+
+        # Continuous reflectivity above threshold (0..110)
+        f1 = np.clip(sub1.astype(np.float32) - 78.0, 0.0, 110.0)
+        f2 = np.clip(sub2.astype(np.float32) - 78.0, 0.0, 110.0)
+
+        # Subtract 5x5 local mean (high-pass edge/core filter) so interior plateaus don't dominate
+        p1 = np.pad(f1, 2, mode="edge")
+        p2 = np.pad(f2, 2, mode="edge")
+        smooth1 = (
+            p1[:-4, :-4] + p1[:-4, 2:-2] + p1[:-4, 4:]
+            + p1[2:-2, :-4] + p1[2:-2, 2:-2] * 2.0 + p1[2:-2, 4:]
+            + p1[4:, :-4] + p1[4:, 2:-2] + p1[4:, 4:]
+        ) / 10.0
+        smooth2 = (
+            p2[:-4, :-4] + p2[:-4, 2:-2] + p2[:-4, 4:]
+            + p2[2:-2, :-4] + p2[2:-2, 2:-2] * 2.0 + p2[2:-2, 4:]
+            + p2[4:, :-4] + p2[4:, 2:-2] + p2[4:, 4:]
+        ) / 10.0
+
+        hp1 = np.maximum(0.0, f1 - smooth1 * 0.72)
+        hp2 = np.maximum(0.0, f2 - smooth2 * 0.72)
+
+        h, w = hp1.shape
+        scale_to_15m = 15.0 / max(5.0, minutes_apart)
+
+        # Search candidate shifts whose 15-minute equivalent speed is 10.5..22 km / 15m (42..88 km/h)
+        max_shift = max(5, int(round(22.0 / (step_km * scale_to_15m))) + 1)
+        max_shift = min(max_shift, min(h, w) // 3)
+
+        best_score = -1.0
+        best_drow_15m = fallback_drow
+        best_dcol_15m = fallback_dcol
+
+        for dr in range(-max_shift, max_shift + 1):
+            for dc in range(-max_shift, max_shift + 1):
+                if dr == 0 and dc == 0:
+                    continue
+                drow_15m_flt = dr * step_km * scale_to_15m
+                dcol_15m_flt = dc * step_km * scale_to_15m
+                dist_15m_km = math.hypot(drow_15m_flt, dcol_15m_flt)
+                # Enforce realistic synoptic steering flow (42..88 km/h = 10.5..22 km per 15m)
+                if dist_15m_km < 10.5 or dist_15m_km > 22.0:
+                    continue
+
+                r1_s = max(0, -dr)
+                r1_e = min(h, h - dr)
+                c1_s = max(0, -dc)
+                c1_e = min(w, w - dc)
+                if (r1_e - r1_s) < 12 or (c1_e - c1_s) < 12:
+                    continue
+
+                patch1 = hp1[r1_s:r1_e, c1_s:c1_e]
+                patch2 = hp2[r1_s + dr : r1_e + dr, c1_s + dc : c1_e + dc]
+
+                n1 = float(np.sqrt((patch1 * patch1).sum()))
+                n2 = float(np.sqrt((patch2 * patch2).sum()))
+                if n1 < 15.0 or n2 < 15.0:
+                    continue
+
+                zncc = float((patch1 * patch2).sum()) / (n1 * n2 + 1e-5)
+                # Slight westerly-to-easterly synoptic prior when correlation ties
+                synoptic_prior = 1.0 + (0.04 if dcol_15m_flt > 0 else -0.02)
+                score = zncc * synoptic_prior
+
+                if score > best_score:
+                    best_score = score
+                    best_drow_15m = int(round(drow_15m_flt))
+                    best_dcol_15m = int(round(dcol_15m_flt))
+
+        if best_score < 0.08:
+            return (fallback_drow, fallback_dcol)
+        return (best_drow_15m, best_dcol_15m)
+
     def _estimate_regional_motion_15m(
         self, row: int, col: int
     ) -> Tuple[int, int]:
         """
         Estimates local/regional storm displacement (d_row, d_col) per 15 minutes
-        within a ±85km window around (row, col) using 2km block cross-correlation.
-        Falls back to global motion vector if regional echo density is too sparse.
+        Around (row, col). Uses precomputed smoothed 2D regional velocity field when available,
+        or computes high-pass ZNCC over a ±140km window between the -30m/-45m frame and LIVE.
         """
+        if (
+            self._motion_field_drow_15m is not None
+            and self._motion_field_dcol_15m is not None
+        ):
+            fh, fw = self._motion_field_drow_15m.shape
+            fy = np.clip((row / max(1, self.GRID_H - 1)) * (fh - 1), 0.0, fh - 1.001)
+            fx = np.clip((col / max(1, self.GRID_W - 1)) * (fw - 1), 0.0, fw - 1.001)
+            iy = int(fy)
+            ix = int(fx)
+            dy = fy - iy
+            dx = fx - ix
+            dr_val = (
+                self._motion_field_drow_15m[iy, ix] * (1 - dy) * (1 - dx)
+                + self._motion_field_drow_15m[iy, ix + 1] * (1 - dy) * dx
+                + self._motion_field_drow_15m[iy + 1, ix] * dy * (1 - dx)
+                + self._motion_field_drow_15m[iy + 1, ix + 1] * dy * dx
+            )
+            dc_val = (
+                self._motion_field_dcol_15m[iy, ix] * (1 - dy) * (1 - dx)
+                + self._motion_field_dcol_15m[iy, ix + 1] * (1 - dy) * dx
+                + self._motion_field_dcol_15m[iy + 1, ix] * dy * (1 - dx)
+                + self._motion_field_dcol_15m[iy + 1, ix + 1] * dy * dx
+            )
+            return (int(round(float(dr_val))), int(round(float(dc_val))))
+
         past_frames = [f for f in self._frames.values() if not f.is_future]
         if len(past_frames) < 2:
             return (self._global_motion_drow_15m, self._global_motion_dcol_15m)
 
         live_f = past_frames[-1]
-        ref_f = past_frames[-3] if len(past_frames) >= 3 else past_frames[0]
+        # Prefer -30m frame (past_frames[1]) for a clean 30-minute baseline
+        ref_f = past_frames[1] if len(past_frames) >= 4 else past_frames[0]
         minutes_apart = max(5.0, (live_f.dt - ref_f.dt).total_seconds() / 60.0)
 
-        rad = 85
+        rad = 140
         r0, r1 = max(0, row - rad), min(self.GRID_H, row + rad)
         c0, c1 = max(0, col - rad), min(self.GRID_W, col + rad)
-        if (r1 - r0) < 40 or (c1 - c0) < 40:
+        if (r1 - r0) < 60 or (c1 - c0) < 60:
             return (self._global_motion_drow_15m, self._global_motion_dcol_15m)
 
-        g1 = (ref_f.grid[r0:r1:2, c0:c1:2] >= 80).astype(np.float32)
-        g2 = (live_f.grid[r0:r1:2, c0:c1:2] >= 80).astype(np.float32)
-        if g1.sum() < 12 or g2.sum() < 12:
-            return (self._global_motion_drow_15m, self._global_motion_dcol_15m)
+        sub1 = ref_f.grid[r0:r1:2, c0:c1:2]
+        sub2 = live_f.grid[r0:r1:2, c0:c1:2]
+        return self._zncc_block_motion_15m(
+            sub1,
+            sub2,
+            step_km=2.0,
+            minutes_apart=minutes_apart,
+            fallback_drow=self._global_motion_drow_15m,
+            fallback_dcol=self._global_motion_dcol_15m,
+            min_active_pixels=18,
+        )
 
-        best_score = -1.0
-        best_dr, best_dc = 0, 0
-        h, w = g1.shape
-        for dr in range(-8, 9):
-            for dc in range(-8, 9):
-                if dr == 0 and dc == 0:
-                    continue
-                r1_start = max(0, -dr)
-                r1_end = min(h, h - dr)
-                c1_start = max(0, -dc)
-                c1_end = min(w, w - dc)
-                overlap = float(
-                    (
-                        g1[r1_start:r1_end, c1_start:c1_end]
-                        * g2[r1_start + dr : r1_end + dr, c1_start + dc : c1_end + dc]
-                    ).sum()
-                )
-                if overlap > best_score:
-                    best_score = overlap
-                    best_dr, best_dc = dr, dc
-
-        if best_score <= 3.0:
-            return (self._global_motion_drow_15m, self._global_motion_dcol_15m)
-
-        scale = 15.0 / minutes_apart
-        drow_1km = int(round(best_dr * 2 * scale))
-        dcol_1km = int(round(best_dc * 2 * scale))
-        return (drow_1km, dcol_1km)
-
-    @staticmethod
+    @classmethod
     def _estimate_motion_vector_15m(
-        older_grid: np.ndarray, newer_grid: np.ndarray, minutes_apart: float
+        cls, older_grid: np.ndarray, newer_grid: np.ndarray, minutes_apart: float
     ) -> Tuple[int, int]:
         """
-        Estimates dominant storm displacement (d_row, d_col) per 15 minutes
-        using coarse 4km block cross-correlation on active precipitation cores.
+        Estimates dominant CONUS storm displacement (d_row, d_col) per 15 minutes
+        using 4km high-pass ZNCC across active precipitation bands.
         """
-        if minutes_apart <= 0:
-            return (1, 12)
-        g1 = (older_grid[::4, ::4] >= 105).astype(np.float32)
-        g2 = (newer_grid[::4, ::4] >= 105).astype(np.float32)
-        if g1.sum() < 50 or g2.sum() < 50:
-            return (-2, 11)  # climatological WSW -> ENE storm track
+        sub1 = older_grid[::4, ::4]
+        sub2 = newer_grid[::4, ::4]
+        return cls._zncc_block_motion_15m(
+            sub1,
+            sub2,
+            step_km=4.0,
+            minutes_apart=minutes_apart,
+            fallback_drow=3,
+            fallback_dcol=11,
+            min_active_pixels=50,
+        )
 
-        best_score = -1.0
-        best_dr, best_dc = 0, 3
-        h, w = g1.shape
-        # Search displacements in 4km units (-6..+6 = -24km..+24km)
-        for dr in range(-5, 6):
-            for dc in range(-3, 8):
-                r1_start = max(0, -dr)
-                r1_end = min(h, h - dr)
-                c1_start = max(0, -dc)
-                c1_end = min(w, w - dc)
-                overlap = float(
-                    (
-                        g1[r1_start:r1_end, c1_start:c1_end]
-                        * g2[r1_start + dr : r1_end + dr, c1_start + dc : c1_end + dc]
-                    ).sum()
+    def _build_regional_motion_field(
+        self,
+        older_grid: np.ndarray,
+        newer_grid: np.ndarray,
+        minutes_apart: float,
+        global_drow: int,
+        global_dcol: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Builds a spatially smooth (9, 19) regional storm velocity field (in 1km pixels per 15 min)
+        across the 2700x6100 CONUS grid so every storm system moves along its local optical-flow
+        trajectory with zero seams between WebMercator tiles.
+        """
+        fh, fw = 9, 19
+        drow_field = np.full((fh, fw), float(global_drow), dtype=np.float32)
+        dcol_field = np.full((fh, fw), float(global_dcol), dtype=np.float32)
+
+        for iy in range(fh):
+            r_center = int(round((iy / (fh - 1)) * (self.GRID_H - 1)))
+            r0 = max(0, r_center - 220)
+            r1 = min(self.GRID_H, r_center + 220)
+            for ix in range(fw):
+                c_center = int(round((ix / (fw - 1)) * (self.GRID_W - 1)))
+                c0 = max(0, c_center - 240)
+                c1 = min(self.GRID_W, c_center + 240)
+                sub1 = older_grid[r0:r1:3, c0:c1:3]
+                sub2 = newer_grid[r0:r1:3, c0:c1:3]
+                dr, dc = self._zncc_block_motion_15m(
+                    sub1,
+                    sub2,
+                    step_km=3.0,
+                    minutes_apart=minutes_apart,
+                    fallback_drow=global_drow,
+                    fallback_dcol=global_dcol,
+                    min_active_pixels=24,
                 )
-                if overlap > best_score:
-                    best_score = overlap
-                    best_dr, best_dc = dr, dc
+                drow_field[iy, ix] = float(dr)
+                dcol_field[iy, ix] = float(dc)
 
-        scale = 15.0 / max(5.0, minutes_apart)
-        drow_1km = int(round(best_dr * 4 * scale))
-        dcol_1km = int(round(best_dc * 4 * scale))
-        return (drow_1km, dcol_1km)
+        # Track target speed magnitude (in km per 15m) before directional smoothing so vector averaging never cancels speed
+        raw_mag = np.hypot(drow_field, dcol_field)
+        target_mag = np.clip(raw_mag, 12.0, 19.5)
+
+        # Two-pass 3x3 Gaussian spatial smoothing so direction & speed transition smoothly across CONUS
+        for _ in range(2):
+            pr = np.pad(drow_field, 1, mode="edge")
+            pc = np.pad(dcol_field, 1, mode="edge")
+            pm = np.pad(target_mag, 1, mode="edge")
+            drow_field = (
+                pr[:-2, :-2] + pr[:-2, 1:-1] * 2.0 + pr[:-2, 2:]
+                + pr[1:-1, :-2] * 2.0 + pr[1:-1, 1:-1] * 4.0 + pr[1:-1, 2:] * 2.0
+                + pr[2:, :-2] + pr[2:, 1:-1] * 2.0 + pr[2:, 2:]
+            ) / 16.0
+            dcol_field = (
+                pc[:-2, :-2] + pc[:-2, 1:-1] * 2.0 + pc[:-2, 2:]
+                + pc[1:-1, :-2] * 2.0 + pc[1:-1, 1:-1] * 4.0 + pc[1:-1, 2:] * 2.0
+                + pc[2:, :-2] + pc[2:, 1:-1] * 2.0 + pc[2:, 2:]
+            ) / 16.0
+            target_mag = (
+                pm[:-2, :-2] + pm[:-2, 1:-1] * 2.0 + pm[:-2, 2:]
+                + pm[1:-1, :-2] * 2.0 + pm[1:-1, 1:-1] * 4.0 + pm[1:-1, 2:] * 2.0
+                + pm[2:, :-2] + pm[2:, 1:-1] * 2.0 + pm[2:, 2:]
+            ) / 16.0
+
+        # Renormalize smoothed vectors so directional averaging never shrinks storm propagation speed,
+        # and convert eastward km displacement to 0.01-deg longitude columns via 1 / cos(lat)
+        cur_mag = np.hypot(drow_field, dcol_field)
+        fallback_norm = max(1.0, math.hypot(global_drow, global_dcol))
+        ux = np.where(cur_mag > 1.5, dcol_field / np.maximum(cur_mag, 1e-4), global_dcol / fallback_norm)
+        uy = np.where(cur_mag > 1.5, drow_field / np.maximum(cur_mag, 1e-4), global_drow / fallback_norm)
+
+        lats_row = self.LAT_MAX - (np.arange(fh, dtype=np.float32) / (fh - 1)) * (self.LAT_MAX - self.LAT_MIN)
+        cos_lats = np.clip(np.cos(np.radians(lats_row)), 0.55, 0.95)[:, None]
+
+        drow_field = (uy * target_mag).astype(np.float32)
+        dcol_field = ((ux * target_mag) / cos_lats).astype(np.float32)
+
+        return (drow_field, dcol_field)
 
     @staticmethod
     def _advect_grid(grid: np.ndarray, drow: int, dcol: int, decay_indices: int = 2) -> np.ndarray:
@@ -530,9 +692,9 @@ class DopplerRadarService:
                         return
 
                     live_frame = new_past_frames[-1]
-                    # Compute storm motion vector between ~15-20 mins ago and LIVE
-                    if len(new_past_frames) >= 3:
-                        ref_frame = new_past_frames[-3]
+                    # Compute global & 2D regional storm motion field between -30m/-45m frame and LIVE
+                    if len(new_past_frames) >= 2:
+                        ref_frame = new_past_frames[1] if len(new_past_frames) >= 4 else new_past_frames[0]
                         mins_diff = max(5.0, (live_frame.dt - ref_frame.dt).total_seconds() / 60.0)
                         drow, dcol = await asyncio.to_thread(
                             self._estimate_motion_vector_15m,
@@ -542,6 +704,16 @@ class DopplerRadarService:
                         )
                         self._global_motion_drow_15m = drow
                         self._global_motion_dcol_15m = dcol
+                        f_drow, f_dcol = await asyncio.to_thread(
+                            self._build_regional_motion_field,
+                            ref_frame.grid,
+                            live_frame.grid,
+                            mins_diff,
+                            drow,
+                            dcol,
+                        )
+                        self._motion_field_drow_15m = f_drow
+                        self._motion_field_dcol_15m = f_dcol
 
                     # 3. Synthesize 2-Hour (+15m .. +2h in 15m steps) Zero-Copy Advected Nowcast Future Frames
                     future_steps = [
@@ -568,9 +740,14 @@ class DopplerRadarService:
                             raw_bytes=live_frame.raw_bytes,
                             advect_drow=self._global_motion_drow_15m * fut_mult,
                             advect_dcol=self._global_motion_dcol_15m * fut_mult,
-                            decay_indices=int(round(fut_mult * 1.25)),
+                            decay_indices=fut_mult,
                         )
                         future_frames.append(fut_obj)
+
+                    # Evict any stale nowcast tiles from cache on refresh
+                    stale_keys = [k for k in self._tile_cache if k.startswith("nowcast_")]
+                    for k in stale_keys:
+                        self._tile_cache.pop(k, None)
 
                     # Rebuild ordered ring buffer
                     updated_map: OrderedDict[str, DopplerGridFrame] = OrderedDict()
@@ -729,11 +906,12 @@ class DopplerRadarService:
         advect_drow: int = 0,
         advect_dcol: int = 0,
         decay_indices: int = 0,
+        fut_mult: float = 0.0,
     ) -> bytes:
         """
         Slices a 256x256 WebMercator tile directly from the 2700x6100 uint8 master grid
-        (with optional zero-copy Lagrangian advection offset & intensity decay)
-        and encodes an 8-bit Indexed PNG with the Züs Storm Palette in <0.4ms.
+        (with spatially-smooth 2D regional Lagrangian advection for future nowcast frames)
+        and encodes an 8-bit Indexed PNG with the Züs Storm Palette in <0.5ms.
         """
         n = 2.0 ** z
         px = (np.arange(256, dtype=np.float64) + 0.5) / 256.0
@@ -743,30 +921,89 @@ class DopplerRadarService:
         merc_y = math.pi * (1.0 - 2.0 * (y + py) / n)
         lats = np.degrees(np.arctan(np.sinh(merc_y)))
 
-        cols = np.floor((lons - self.LON_MIN) / self.STEP_DEG).astype(np.int32) - int(advect_dcol)
-        rows = np.floor((self.LAT_MAX - lats) / self.STEP_DEG).astype(np.int32) - int(advect_drow)
+        base_cols = (lons - self.LON_MIN) / self.STEP_DEG
+        base_rows = (self.LAT_MAX - lats) / self.STEP_DEG
 
-        valid_r = (rows >= 0) & (rows < self.GRID_H)
-        valid_c = (cols >= 0) & (cols < self.GRID_W)
+        if (
+            fut_mult > 0.0
+            and self._motion_field_drow_15m is not None
+            and self._motion_field_dcol_15m is not None
+        ):
+            fh, fw = self._motion_field_drow_15m.shape
+            fy = np.clip((base_rows / (self.GRID_H - 1)) * (fh - 1), 0.0, fh - 1.001)
+            fx = np.clip((base_cols / (self.GRID_W - 1)) * (fw - 1), 0.0, fw - 1.001)
+            iy = fy.astype(np.int32)
+            ix = fx.astype(np.int32)
+            dy = (fy - iy)[:, None]
+            dx = (fx - ix)[None, :]
 
-        if not np.any(valid_r) or not np.any(valid_c):
-            return EMPTY_TILE_PNG
+            iy0 = iy[:, None]
+            iy1 = (iy + 1)[:, None]
+            ix0 = ix[None, :]
+            ix1 = (ix + 1)[None, :]
 
-        rows_clipped = np.clip(rows, 0, self.GRID_H - 1)
-        cols_clipped = np.clip(cols, 0, self.GRID_W - 1)
+            drow_2d = (
+                self._motion_field_drow_15m[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                + self._motion_field_drow_15m[iy0, ix1] * (1.0 - dy) * dx
+                + self._motion_field_drow_15m[iy1, ix0] * dy * (1.0 - dx)
+                + self._motion_field_drow_15m[iy1, ix1] * dy * dx
+            )
+            dcol_2d = (
+                self._motion_field_dcol_15m[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                + self._motion_field_dcol_15m[iy0, ix1] * (1.0 - dy) * dx
+                + self._motion_field_dcol_15m[iy1, ix0] * dy * (1.0 - dx)
+                + self._motion_field_dcol_15m[iy1, ix1] * dy * dx
+            )
 
-        tile = grid[np.ix_(rows_clipped, cols_clipped)].copy()
+            # Add subtle continuous mesoscale wave shear along the 2-hour track so bands evolve organically
+            wave_phase_r = base_rows[:, None] * 0.045 + fut_mult * 0.55
+            wave_phase_c = base_cols[None, :] * 0.045 - fut_mult * 0.45
+            shear_r = np.sin(wave_phase_c) * (0.45 * fut_mult)
+            shear_c = np.cos(wave_phase_r) * (0.45 * fut_mult)
 
-        # Zero out out-of-bounds margins
-        if not np.all(valid_r):
-            tile[~valid_r, :] = 0
-        if not np.all(valid_c):
-            tile[:, ~valid_c] = 0
+            rows_2d = np.floor(base_rows[:, None] - drow_2d * fut_mult - shear_r).astype(np.int32)
+            cols_2d = np.floor(base_cols[None, :] - dcol_2d * fut_mult - shear_c).astype(np.int32)
+
+            valid_mask = (
+                (rows_2d >= 0)
+                & (rows_2d < self.GRID_H)
+                & (cols_2d >= 0)
+                & (cols_2d < self.GRID_W)
+            )
+            if not np.any(valid_mask):
+                return EMPTY_TILE_PNG
+
+            r_clip = np.clip(rows_2d, 0, self.GRID_H - 1)
+            c_clip = np.clip(cols_2d, 0, self.GRID_W - 1)
+            tile = grid[r_clip, c_clip].copy()
+            if not np.all(valid_mask):
+                tile[~valid_mask] = 0
+        else:
+            cols = np.floor(base_cols).astype(np.int32) - int(advect_dcol)
+            rows = np.floor(base_rows).astype(np.int32) - int(advect_drow)
+
+            valid_r = (rows >= 0) & (rows < self.GRID_H)
+            valid_c = (cols >= 0) & (cols < self.GRID_W)
+
+            if not np.any(valid_r) or not np.any(valid_c):
+                return EMPTY_TILE_PNG
+
+            rows_clipped = np.clip(rows, 0, self.GRID_H - 1)
+            cols_clipped = np.clip(cols, 0, self.GRID_W - 1)
+
+            tile = grid[np.ix_(rows_clipped, cols_clipped)].copy()
+
+            if not np.all(valid_r):
+                tile[~valid_r, :] = 0
+            if not np.all(valid_c):
+                tile[:, ~valid_c] = 0
 
         if decay_indices > 0:
-            active = tile >= (78 + decay_indices)
-            tile[active] -= decay_indices
-            tile[~active] = 0
+            # Gently relax intense convective cores (>32 dBZ / idx > 130) toward moderate stratiform rain
+            # while preserving light/moderate rain bands (idx 86..130) across the full 2-hour track
+            core_mask = tile > 130
+            if np.any(core_mask):
+                tile[core_mask] = np.maximum(126, tile[core_mask].astype(np.int16) - decay_indices * 2).astype(np.uint8)
 
         if int(tile.max()) < 90:
             return EMPTY_TILE_PNG
@@ -865,6 +1102,7 @@ class DopplerRadarService:
 
             png_bytes = EMPTY_TILE_PNG
             if intersects_conus and frame is not None:
+                fut_mult = (frame.offset_minutes / 15.0) if (frame.is_future and frame.offset_minutes > 0) else 0.0
                 png_bytes = await asyncio.to_thread(
                     self._slice_conus_tile_sync,
                     frame.grid,
@@ -874,6 +1112,7 @@ class DopplerRadarService:
                     frame.advect_drow,
                     frame.advect_dcol,
                     frame.decay_indices,
+                    fut_mult,
                 )
             elif self._rainviewer_frames:
                 # Global fallback outside CONUS
@@ -1113,7 +1352,7 @@ class DopplerRadarService:
                     label=f.label,
                     offsetMinutes=f.offset_minutes,
                     isFuture=f.is_future,
-                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=2",
+                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=4",
                 )
             )
 

@@ -55,7 +55,7 @@ services:
     depends_on:
       zus-api:
         condition: service_healthy
-    command: tunnel --no-autoupdate --url http://zus-api:8000
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-eyJhIjoiZWE4MTVjN2FlOWZlNjFmYzc4NDE0YzRkYTk2YWYwNjYiLCJ0IjoiZDNjMTQ3MTktMzUyMi00MTk2LTkxYWQtNTZhMWYxNjk1MDI3IiwicyI6Ik5HTTBPRFE1TjJJdE5UazNNeTAwWTJSaExUZ3dZekl0WTJRNFlUUmtNbUprWmpZeiJ9}
 
 volumes:
   zus-postgres-data:

@@ -103,6 +103,9 @@ async def add_private_network_access_header(request, call_next):
     response = await call_next(request)
     response.headers["Access-Control-Allow-Private-Network"] = "true"
     response.headers["Access-Control-Allow-Origin"] = "*"
+    if request.url.path.startswith("/api/v1/radar/tiles/") or request.url.path.startswith("/v2/radar/"):
+        if "vary" in response.headers:
+            del response.headers["vary"]
     return response
 
 app.include_router(api_router, prefix="/api/v1")

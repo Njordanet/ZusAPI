@@ -61,7 +61,7 @@ class WeatherProviderService:
         self._cache: Dict[str, Dict[str, Any]] = {}
 
     def _cache_key(self, lat: float, lon: float) -> str:
-        return f"{lat:.3f}:{lon:.3f}"
+        return f"{lat:.2f}:{lon:.2f}"
 
     async def _fetch_open_meteo_ensemble(
         self, client: httpx.AsyncClient, lat: float, lon: float
