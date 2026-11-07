@@ -52,9 +52,15 @@ class WeatherCondition(str, Enum):
 class ModelWeightDetail(BaseModel):
     modelName: str
     weight: float
+    weightShort: Optional[float] = None
+    weightMed: Optional[float] = None
+    weightExt: Optional[float] = None
     accuracyPercent: float
     maeCelsius: float
     biasCelsius: float
+    diurnalBiasNowCelsius: Optional[float] = None
+    maeWindKmh: Optional[float] = None
+    brierPrecip: Optional[float] = None
     samplesVerified: int
 
 
@@ -74,6 +80,8 @@ class HyperlocalStationReading(BaseModel):
     presentWeather: Optional[str] = None
     qcPassed: bool = True
     zScore: float = 0.0
+    reliabilityScore: Optional[float] = None
+    residualBiasCelsius: Optional[float] = None
 
 
 class WeatherAlertModel(BaseModel):
@@ -120,7 +128,10 @@ class RadarLocalTelemetry(BaseModel):
     stormMotionKmh: float = 0.0
     stormMotionDegrees: int = 0
     stormMotionCompass: str = "E"
+    echoTrendDbzPer10m: float = 0.0
+    virgaFactor: float = 1.0
     minuteRates60m: List[float] = []
+    minuteByMinuteRates: List[float] = []
 
 
 class RadarManifestResponse(BaseModel):

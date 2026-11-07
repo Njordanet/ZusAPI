@@ -285,13 +285,43 @@ class HyperlocalStationService:
         valid_for_blend: List[Dict[str, Any]] = []
         now = datetime.now(timezone.utc)
 
-        for c in raw_candidates:
+        for idx, c in enumerate(raw_candidates):
             if stdev_t > 1.2:
                 z_score = round(abs(c["adj_temp_c"] - mean_t) / stdev_t, 2)
                 qc_passed = z_score <= 2.0
             else:
                 z_score = 0.0
                 qc_passed = True
+
+            # Compute leave-one-out spatial residual against neighboring stations
+            if len(adj_temps) >= 2:
+                peer_mean = (sum(adj_temps) - c["adj_temp_c"]) / (len(adj_temps) - 1)
+                spatial_res_c = round(c["adj_temp_c"] - peer_mean, 2)
+            else:
+                spatial_res_c = 0.0
+
+            # Persist station & observation to PostGIS and retrieve recursively updated reliability & bias
+            rel_score, res_bias_c = await db_manager.upsert_station_and_observation(
+                station_id=c["station_id"],
+                name=c["name"],
+                network=c["network"],
+                lat=c["lat"],
+                lon=c["lon"],
+                elevation_m=c["elev_m"],
+                observed_at=now.replace(second=0, microsecond=0),
+                temp_c=c["raw_temp_c"],
+                dewpoint_c=c["dewpoint_c"],
+                humidity=c["humidity"],
+                wind_kmh=c["wind_kmh"],
+                wind_dir=c["wind_dir"],
+                pressure_hpa=c["pressure_hpa"],
+                precip_rate_mm=c.get("precip_mmhr", 0.0),
+                qc_passed=qc_passed,
+                qc_zscore=z_score,
+                spatial_residual_c=spatial_res_c,
+            )
+            c["reliability_score"] = rel_score
+            c["residual_bias_c"] = res_bias_c
 
             reading = HyperlocalStationReading(
                 stationId=c["station_id"],
@@ -309,36 +339,18 @@ class HyperlocalStationService:
                 presentWeather=c.get("wx_string"),
                 qcPassed=qc_passed,
                 zScore=z_score,
+                reliabilityScore=rel_score,
+                residualBiasCelsius=res_bias_c,
             )
             verified_readings.append(reading)
 
             if qc_passed:
                 valid_for_blend.append(c)
 
-            # Persist station & observation to PostGIS
-            await db_manager.upsert_station_and_observation(
-                station_id=c["station_id"],
-                name=c["name"],
-                network=c["network"],
-                lat=c["lat"],
-                lon=c["lon"],
-                elevation_m=c["elev_m"],
-                observed_at=now.replace(second=0, microsecond=0),
-                temp_c=c["raw_temp_c"],
-                dewpoint_c=c["dewpoint_c"],
-                humidity=c["humidity"],
-                wind_kmh=c["wind_kmh"],
-                wind_dir=c["wind_dir"],
-                pressure_hpa=c["pressure_hpa"],
-                precip_rate_mm=c.get("precip_mmhr", 0.0),
-                qc_passed=qc_passed,
-                qc_zscore=z_score,
-            )
-
         if not valid_for_blend:
             valid_for_blend = raw_candidates[:1]
 
-        # 4. Inverse Distance & Elevation Weighting (IDEW)
+        # 4. Inverse Distance, Elevation & Recursive Reliability Weighting (IDERW)
         total_w = 0.0
         blended_temp = 0.0
         blended_dewp = 0.0
@@ -348,9 +360,13 @@ class HyperlocalStationService:
 
         for c in valid_for_blend:
             elev_diff_km = abs(c["elev_m"] - target_elev_m) / 1000.0
-            # Weight decays with distance^2 and elevation difference
-            w = 1.0 / (((c["dist_km"] + 1.5) ** 2) * (1.0 + elev_diff_km * 2.0))
-            blended_temp += c["adj_temp_c"] * w
+            rel_w = max(0.2, float(c.get("reliability_score") or 1.0))
+            net_prior = 1.0 if "METAR" in str(c.get("network", "")) else 0.78
+            # Weight combines inverse distance^2, elevation penalty, and learned station reliability
+            w = (rel_w * net_prior) / (((c["dist_km"] + 1.5) ** 2) * (1.0 + elev_diff_km * 2.0))
+            # Correct citizen PWS micro-site warm/cold bias (e.g. asphalt radiation) by 50% of learned residual bias
+            bias_adj = float(c.get("residual_bias_c") or 0.0) * (0.25 if "METAR" in str(c.get("network", "")) else 0.55)
+            blended_temp += (c["adj_temp_c"] - bias_adj) * w
             total_w += w
             if c["dewpoint_c"] is not None:
                 blended_dewp += c["dewpoint_c"] * w

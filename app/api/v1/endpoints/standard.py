@@ -87,7 +87,13 @@ async def _build_darksky_payload(
     cur = w_resp.current
     now_ts = int(cur.timestamp.timestamp())
 
-    # Interpolate 61 minute-by-minute points (0..60m) from 1km Doppler + HRRR Nowcast
+    # Use 61 1-minute sub-pixel Lagrangian Doppler rates (0..60m) directly when available
+    exact_61_rates: Optional[List[float]] = (
+        list(dop.minuteByMinuteRates[:61])
+        if (dop and dop.inConusGrid and len(dop.minuteByMinuteRates) >= 61)
+        else None
+    )
+
     five_min_rates: List[float] = []
     if dop and dop.inConusGrid and len(dop.minuteRates60m) >= 13:
         five_min_rates = list(dop.minuteRates60m[:13])
@@ -103,12 +109,15 @@ async def _build_darksky_payload(
     # Build 61 minute-by-minute data points
     minutely_data: List[Dict[str, Any]] = []
     for minute in range(61):
-        seg = min(11, minute // 5)
-        frac = (minute - seg * 5) / 5.0
-        r0 = five_min_rates[seg]
-        r1 = five_min_rates[seg + 1] if (seg + 1) < len(five_min_rates) else r0
-        mu = (1.0 - math.cos(frac * math.pi)) / 2.0
-        mmhr = max(0.0, r0 * (1.0 - mu) + r1 * mu)
+        if exact_61_rates is not None:
+            mmhr = max(0.0, float(exact_61_rates[minute]))
+        else:
+            seg = min(11, minute // 5)
+            frac = (minute - seg * 5) / 5.0
+            r0 = five_min_rates[seg]
+            r1 = five_min_rates[seg + 1] if (seg + 1) < len(five_min_rates) else r0
+            mu = (1.0 - math.cos(frac * math.pi)) / 2.0
+            mmhr = max(0.0, r0 * (1.0 - mu) + r1 * mu)
         prob = min(1.0, round((mmhr / 2.5) if mmhr > 0.05 else 0.0, 2))
         pt_dict: Dict[str, Any] = {
             "time": now_ts + (minute * 60),

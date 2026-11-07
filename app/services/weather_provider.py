@@ -1,4 +1,5 @@
 import asyncio
+import math
 import httpx
 import statistics
 from datetime import datetime, timezone, timedelta
@@ -16,7 +17,7 @@ from app.models.weather import (
     NowcastPoint,
     RadarLocalTelemetry,
 )
-from app.services.db import db_manager
+from app.services.db import db_manager, eval_diurnal_bias
 from app.services.station_service import station_service
 from app.services.doppler_service import doppler_service
 
@@ -149,6 +150,7 @@ class WeatherProviderService:
         raw_data: Dict[str, Any],
         doppler: Optional[RadarLocalTelemetry] = None,
         station_composite: Optional[Dict[str, Any]] = None,
+        radar_zr_factor: float = 1.0,
     ) -> NowcastSummary:
         minutely = raw_data.get("minutely_15", {})
         m15_times = minutely.get("time") or []
@@ -162,8 +164,12 @@ class WeatherProviderService:
                 m15_start_idx = i
                 break
 
-        points: List[NowcastPoint] = []
-        max_precip = 0.0
+        # Extract 5 15-minute NWP checkpoints (0, 15, 30, 45, 60m) in mm/hr
+        m15_rates: List[float] = []
+        for idx in range(5):
+            p_idx = m15_start_idx + idx
+            val = float(precips[p_idx]) * 4.0 if (p_idx < len(precips) and precips[p_idx] is not None) else 0.0
+            m15_rates.append(max(0.0, val))
 
         # Ground-truth METAR precipitation rate (if a local station within 25km reports active rain/drizzle/snow)
         station_mmhr = (
@@ -172,76 +178,123 @@ class WeatherProviderService:
             else 0.0
         )
 
-        # Blend Open-Meteo 15-min model precipitation with Züs 1km CONUS Doppler radar trajectory
-        doppler_rates = list(doppler.minuteRates60m) if (doppler and doppler.inConusGrid) else []
-        if station_mmhr > 0.0 and doppler_rates:
-            # Ensure sub-beam drizzle/light rain observed by surface ASOS/METAR is reflected in initial minutes
-            for s_idx in range(min(4, len(doppler_rates))):
-                decay = max(0.35, 1.0 - s_idx * 0.2)
-                doppler_rates[s_idx] = round(max(doppler_rates[s_idx], station_mmhr * decay), 2)
-            doppler.minuteRates60m = doppler_rates
-            if doppler.currentDbz < 18.0:
+        # Build 61 1-minute fused precipitation rates (0..60m) combining 1km Lagrangian Doppler + METAR + NWP
+        has_conus_doppler = bool(doppler and doppler.inConusGrid and len(doppler.minuteByMinuteRates) >= 61)
+        raw_61 = list(doppler.minuteByMinuteRates[:61]) if has_conus_doppler else [0.0] * 61
+
+        fused_61: List[float] = []
+        for t_min in range(61):
+            seg = min(3, t_min // 15)
+            frac = (t_min - seg * 15) / 15.0
+            mu = (1.0 - math.cos(frac * math.pi)) / 2.0
+            nwp_mmhr = m15_rates[seg] * (1.0 - mu) + m15_rates[seg + 1] * mu
+
+            rad_mmhr = raw_61[t_min]
+            # Assimilate sub-beam surface METAR precipitation over the first 20 minutes with exponential decay
+            if station_mmhr > 0.0 and t_min <= 20:
+                st_decay = math.exp(-t_min / 12.0)
+                rad_mmhr = max(rad_mmhr, round(station_mmhr * st_decay, 2))
+
+            if has_conus_doppler:
+                # Radar dominates minutes 0..35 (88%), gradually giving NWP more weight by minute 60 (72% radar / 28% NWP)
+                w_rad = 0.88 - 0.16 * (t_min / 60.0)
+                blended = max(rad_mmhr, rad_mmhr * w_rad + nwp_mmhr * (1.0 - w_rad))
+            else:
+                blended = max(rad_mmhr, nwp_mmhr)
+            fused_61.append(round(blended, 2) if blended >= 0.04 else 0.0)
+
+        if doppler and doppler.inConusGrid:
+            doppler.minuteByMinuteRates = fused_61
+            doppler.minuteRates60m = [fused_61[t] for t in range(0, 61, 5)]
+            if station_mmhr > 0.0 and doppler.currentDbz < 18.0:
                 doppler.currentDbz = 19.5 if station_mmhr >= 1.0 else 15.0
                 doppler.precipRateMmHr = max(doppler.precipRateMmHr, station_mmhr)
                 doppler.intensityCategory = "Light Rain" if station_mmhr >= 0.8 else "Light Drizzle"
 
+        points: List[NowcastPoint] = []
         for idx in range(5):
-            p_idx = m15_start_idx + idx
-            model_val = float(precips[p_idx]) * 4.0 if (p_idx < len(precips) and precips[p_idx] is not None) else 0.0
-            # Map idx (0, 15, 30, 45, 60m) to doppler_rates index (0, 3, 6, 9, 12)
-            dop_idx = idx * 3
-            radar_val = float(doppler_rates[dop_idx]) if dop_idx < len(doppler_rates) else 0.0
-            if idx == 0 and station_mmhr > 0.0:
-                radar_val = max(radar_val, station_mmhr)
-            elif idx == 1 and station_mmhr > 0.0:
-                radar_val = max(radar_val, round(station_mmhr * 0.55, 2))
-            blended_mmhr = round(max(model_val, radar_val * 0.85 + model_val * 0.15), 2)
-            max_precip = max(max_precip, blended_mmhr)
-            prob = min(100, int(round(blended_mmhr * 35))) if blended_mmhr > 0.08 else 0
+            t_m = idx * 15
+            b_mmhr = fused_61[t_m]
+            prob = min(100, int(round(b_mmhr * 35))) if b_mmhr > 0.08 else 0
             points.append(
                 NowcastPoint(
-                    timeOffsetMinutes=idx * 15,
+                    timeOffsetMinutes=t_m,
                     precipProbability=prob,
-                    precipIntensityMmHr=blended_mmhr,
+                    precipIntensityMmHr=b_mmhr,
                 )
             )
 
+        max_precip = max(fused_61) if fused_61 else 0.0
+        peak_min = int(fused_61.index(max_precip)) if max_precip > 0.0 else 0
+        trend_tag = ""
+        if doppler and abs(doppler.echoTrendDbzPer10m) >= 1.5:
+            trend_tag = ", intensifying" if doppler.echoTrendDbzPer10m > 0 else ", weakening"
+
+        # Dark Sky 1-Minute Precision Summary Generator
+        wet_threshold = 0.12
         if max_precip < 0.08:
             if doppler and doppler.nearestEchoKm is not None and doppler.nearestEchoKm <= 35.0:
                 summary_text = (
-                    f"Dry overhead — nearest radar echo ({doppler.maxDbzNearby:.0f} dBZ) "
+                    f"Dry overhead — nearest radar echo ({doppler.maxDbzNearby:.0f} dBZ{trend_tag}) "
                     f"is {doppler.nearestEchoKm:.0f} km {doppler.nearestEchoCompass}, tracking {doppler.stormMotionCompass}."
                 )
             else:
                 summary_text = "Clear skies for the next 60 minutes — no precipitation echoes on Doppler radar."
-        elif points and points[0].precipIntensityMmHr >= 0.15:
-            dbz_tag = f" ({doppler.currentDbz:.0f} dBZ)" if (doppler and doppler.currentDbz >= 12) else ""
-            # Check if rain stops within the hour in doppler_rates
+        elif fused_61[0] >= wet_threshold:
+            dbz_tag = f" ({doppler.currentDbz:.0f} dBZ{trend_tag})" if (doppler and doppler.currentDbz >= 12) else ""
+            # Find exact minute precipitation drops below threshold for >= 3 consecutive minutes
             stop_min = None
-            if doppler_rates:
-                for step_i in range(1, len(doppler_rates)):
-                    if doppler_rates[step_i] < 0.08:
-                        stop_min = step_i * 5
-                        break
+            for m_i in range(1, 61):
+                window = fused_61[m_i : min(61, m_i + 3)]
+                if all(v < 0.08 for v in window):
+                    stop_min = m_i
+                    break
+            intensity_word = (
+                "Heavy rain" if fused_61[0] >= 4.0 else ("Moderate rain" if fused_61[0] >= 1.5 else "Light rain")
+            )
             if stop_min is not None:
                 summary_text = (
-                    f"Active precipitation{dbz_tag} ({points[0].precipIntensityMmHr:.1f} mm/hr) "
-                    f"stopping in ~{stop_min} min."
+                    f"{intensity_word}{dbz_tag} ({fused_61[0]:.1f} mm/hr) — stopping in {stop_min} min."
+                )
+            elif peak_min >= 5 and max_precip >= fused_61[0] * 1.35:
+                summary_text = (
+                    f"{intensity_word}{dbz_tag} ({fused_61[0]:.1f} mm/hr) — peaking in {peak_min} min ({max_precip:.1f} mm/hr)."
                 )
             else:
                 summary_text = (
-                    f"Active precipitation{dbz_tag} ({points[0].precipIntensityMmHr:.1f} mm/hr) "
-                    f"continuing over the next hour."
+                    f"{intensity_word}{dbz_tag} ({fused_61[0]:.1f} mm/hr) continuing for the next hour."
                 )
         else:
-            first_rain = next((pt for pt in points if pt.precipIntensityMmHr >= 0.15), None)
-            if first_rain:
-                summary_text = f"Precipitation echoes approaching — starting in ~{first_rain.timeOffsetMinutes} minutes."
+            # Find exact minute precipitation starts
+            start_min = next((m_i for m_i in range(1, 61) if fused_61[m_i] >= wet_threshold), None)
+            if start_min is not None:
+                stop_after_start = next(
+                    (
+                        m_i
+                        for m_i in range(start_min + 2, 61)
+                        if all(v < 0.08 for v in fused_61[m_i : min(61, m_i + 3)])
+                    ),
+                    None,
+                )
+                intensity_word = (
+                    "Heavy rain" if max_precip >= 4.0 else ("Rain" if max_precip >= 1.2 else "Light rain")
+                )
+                if stop_after_start is not None:
+                    duration_m = stop_after_start - start_min
+                    summary_text = (
+                        f"{intensity_word} starting in {start_min} min, lasting ~{duration_m} min "
+                        f"(peak {max_precip:.1f} mm/hr{trend_tag})."
+                    )
+                else:
+                    summary_text = (
+                        f"{intensity_word} starting in {start_min} min "
+                        f"(peaking at {max_precip:.1f} mm/hr in {peak_min} min{trend_tag})."
+                    )
             else:
                 summary_text = "Light mist or drizzle in the vicinity over the next hour."
 
         source_label = (
-            "Züs 1km CONUS Doppler Master Grid + ASOS/HRRR Nowcast"
+            "Züs 1km CONUS Lagrangian Doppler (1-Min Sub-Pixel) + ASOS/HRRR"
             if (doppler and doppler.inConusGrid)
             else "HRRR / 15-Min High-Res Radar Assimilation"
         )
@@ -362,11 +415,29 @@ class WeatherProviderService:
             if stream:
                 model_hourly_streams[m_name] = stream
 
-        # Query 1km Doppler telemetry early so radar + station ground truth can grade models & condition codes
-        doppler_telemetry = await doppler_service.get_point_telemetry(latitude, longitude)
-        nowcast_obj = self._build_nowcast(raw_data, doppler_telemetry, station_composite)
+        # Query cell RLS metadata & 1km Doppler telemetry with sub-cloud dewpoint virga filter
+        rls_meta_pre = await db_manager.get_cell_rls_metadata(cell_id)
+        est_temp_now = (
+            station_composite["temperature_c"]
+            if station_composite and station_composite.get("temperature_c") is not None
+            else float(current_raw.get("temperature_2m") or current_raw.get("temperature_2m_best_match") or 15.0)
+        )
+        est_dewp_now = (
+            station_composite["dewpoint_c"]
+            if station_composite and station_composite.get("dewpoint_c") is not None
+            else float(current_raw.get("dew_point_2m") or current_raw.get("dew_point_2m_best_match") or (est_temp_now - 4.0))
+        )
+        st_wet_now = bool(station_composite and station_composite.get("wx_condition") is not None)
+        doppler_telemetry = await doppler_service.get_point_telemetry(
+            latitude,
+            longitude,
+            temp_c=est_temp_now,
+            dewpoint_c=est_dewp_now,
+            station_wet=st_wet_now,
+            radar_zr_factor=float(rls_meta_pre.get("radar_zr_factor") or 1.0),
+        )
 
-        # 4. Run Accuracy Verification, Offline Snapshot Backfill & MOS Bias Update
+        # 4. Run Accuracy Verification, Offline Snapshot Backfill, Constrained RLS & Diurnal Harmonic Bias Update
         past_hourly_temps: Dict[datetime, float] = {}
         best_past_arr = (
             hourly_raw.get("temperature_2m_best_match")
@@ -390,6 +461,21 @@ class WeatherProviderService:
             if station_composite and station_composite["closest_distance_km"] <= 45.0
             else None
         )
+        ground_truth_wind = (
+            float(station_composite["wind_kmh"])
+            if (station_composite and station_composite.get("wind_kmh") is not None and station_composite["closest_distance_km"] <= 45.0)
+            else None
+        )
+        ground_truth_precip_mmhr = (
+            float(station_composite.get("precip_mmhr") or 0.0)
+            if (station_composite and station_composite["closest_distance_km"] <= 35.0)
+            else None
+        )
+        radar_raw_mmhr = (
+            float(doppler_telemetry.precipRateMmHr)
+            if (doppler_telemetry and doppler_telemetry.inConusGrid)
+            else None
+        )
         ground_truth_precip_active = bool(
             (station_composite and station_composite.get("wx_condition") is not None)
             or (doppler_telemetry and doppler_telemetry.currentDbz >= 15.0)
@@ -399,9 +485,20 @@ class WeatherProviderService:
             model_forecasts=model_hourly_streams,
             ground_truth_temp_c=ground_truth_temp,
             ground_truth_precip_active=ground_truth_precip_active,
+            ground_truth_wind_kmh=ground_truth_wind,
+            ground_truth_precip_mmhr=ground_truth_precip_mmhr,
+            radar_raw_mmhr=radar_raw_mmhr,
         )
 
-        # 5. Fetch updated dynamic weights & learned MOS bias offsets from PostGIS
+        rls_meta = await db_manager.get_cell_rls_metadata(cell_id)
+        nowcast_obj = self._build_nowcast(
+            raw_data,
+            doppler_telemetry,
+            station_composite,
+            radar_zr_factor=float(rls_meta.get("radar_zr_factor") or 1.0),
+        )
+
+        # 5. Fetch updated RLS horizon weights & learned Diurnal Harmonic MOS bias from PostGIS
         db_weights = await db_manager.get_model_weights(cell_id)
         weights_map: Dict[str, Dict[str, Any]] = {}
         model_weight_details: List[ModelWeightDetail] = []
@@ -410,13 +507,23 @@ class WeatherProviderService:
             m = w_row["model_name"]
             if m in model_hourly_streams:
                 weights_map[m] = w_row
+                b0 = float(w_row.get("bias_temp_c") or 0.0)
+                bsin = float(w_row.get("bias_sin_c") or 0.0)
+                bcos = float(w_row.get("bias_cos_c") or 0.0)
+                diurnal_now = round(eval_diurnal_bias(b0, bsin, bcos, now.hour), 2)
                 model_weight_details.append(
                     ModelWeightDetail(
                         modelName=m,
                         weight=round(float(w_row["dynamic_weight"]), 3),
+                        weightShort=round(float(w_row.get("weight_short") or w_row["dynamic_weight"]), 3),
+                        weightMed=round(float(w_row.get("weight_med") or w_row["dynamic_weight"]), 3),
+                        weightExt=round(float(w_row.get("weight_ext") or w_row["dynamic_weight"]), 3),
                         accuracyPercent=round(float(w_row["accuracy_pct"]), 1),
                         maeCelsius=round(float(w_row["mae_temp_c"]), 2),
-                        biasCelsius=round(float(w_row["bias_temp_c"]), 2),
+                        biasCelsius=round(b0, 2),
+                        diurnalBiasNowCelsius=diurnal_now,
+                        maeWindKmh=round(float(w_row.get("mae_wind_kmh") or 3.5), 2),
+                        brierPrecip=round(float(w_row.get("brier_precip") or 0.10), 3),
                         samplesVerified=int(w_row["samples_verified"]),
                     )
                 )
@@ -425,24 +532,45 @@ class WeatherProviderService:
         if not weights_map:
             equal_w = round(1.0 / max(1, len(model_hourly_streams)), 3)
             for m in model_hourly_streams:
-                weights_map[m] = {"dynamic_weight": equal_w, "bias_temp_c": 0.0, "mae_temp_c": 1.0, "accuracy_pct": 94.0}
+                weights_map[m] = {
+                    "dynamic_weight": equal_w,
+                    "weight_short": equal_w,
+                    "weight_med": equal_w,
+                    "weight_ext": equal_w,
+                    "bias_temp_c": 0.0,
+                    "bias_sin_c": 0.0,
+                    "bias_cos_c": 0.0,
+                    "bias_wind_kmh": 0.0,
+                    "mae_temp_c": 1.0,
+                    "accuracy_pct": 94.0,
+                }
                 model_weight_details.append(
                     ModelWeightDetail(
                         modelName=m,
                         weight=equal_w,
+                        weightShort=equal_w,
+                        weightMed=equal_w,
+                        weightExt=equal_w,
                         accuracyPercent=94.0,
                         maeCelsius=1.0,
                         biasCelsius=0.0,
+                        diurnalBiasNowCelsius=0.0,
                         samplesVerified=1,
                     )
                 )
 
-        # Normalize active weights to sum to 1.0
-        w_sum = sum(weights_map[m]["dynamic_weight"] for m in weights_map) or 1.0
-        for m in weights_map:
-            weights_map[m]["norm_w"] = weights_map[m]["dynamic_weight"] / w_sum
+        # Normalize active weights per horizon bucket to sum to 1.0
+        for bucket_key, norm_key in (
+            ("dynamic_weight", "norm_w"),
+            ("weight_short", "norm_short"),
+            ("weight_med", "norm_med"),
+            ("weight_ext", "norm_ext"),
+        ):
+            b_sum = sum(float(weights_map[m].get(bucket_key) or weights_map[m]["dynamic_weight"]) for m in weights_map) or 1.0
+            for m in weights_map:
+                weights_map[m][norm_key] = float(weights_map[m].get(bucket_key) or weights_map[m]["dynamic_weight"]) / b_sum
 
-        # 6. Compute Bias-Corrected Multi-Model Hourly Blend + Oracle Consensus Score
+        # 6. Compute Horizon-Weighted & Diurnal-Bias-Corrected Multi-Model Hourly Blend + Oracle Consensus Score
         hourly_models: List[HourlyForecastModel] = []
         hourly_spreads: List[float] = []
         total_hourly_horizon = max(24, min(240, len(times_list) - start_idx))
@@ -479,21 +607,39 @@ class WeatherProviderService:
             top_wet_code = 0
             top_wet_w = -1.0
             dt = now + timedelta(hours=h_offset)
+            target_utc_hour = dt.hour
 
             for m_name, stream in model_hourly_streams.items():
                 if h_offset < len(stream) and m_name in weights_map:
                     pt = stream[h_offset]
                     w_info = weights_map[m_name]
-                    w = w_info["norm_w"]
-                    # Subtract learned MOS bias (if model runs +0.5°C hot, subtract 0.5°C)
-                    bias = float(w_info["bias_temp_c"])
+                    # Select lead-time horizon RLS weight (smoothly blending across bucket boundaries)
+                    if h_offset <= 6:
+                        w = w_info["norm_short"]
+                    elif h_offset <= 24:
+                        alpha_h = (h_offset - 6.0) / 18.0
+                        w = (1.0 - alpha_h) * w_info["norm_short"] + alpha_h * w_info["norm_med"]
+                    elif h_offset <= 48:
+                        alpha_h = (h_offset - 24.0) / 24.0
+                        w = (1.0 - alpha_h) * w_info["norm_med"] + alpha_h * w_info["norm_ext"]
+                    else:
+                        w = w_info["norm_ext"]
+
+                    # Evaluate learned 3-parameter Diurnal Harmonic MOS bias at target UTC hour
+                    bias = eval_diurnal_bias(
+                        float(w_info.get("bias_temp_c") or 0.0),
+                        float(w_info.get("bias_sin_c") or 0.0),
+                        float(w_info.get("bias_cos_c") or 0.0),
+                        target_utc_hour,
+                    )
+                    wind_bias = float(w_info.get("bias_wind_kmh") or 0.0) * 0.4
                     bias_corrected_t = pt["temp_c"] - bias
                     bias_corrected_fl = pt.get("feels_c", pt["temp_c"]) - bias
                     bias_corrected_dew = pt.get("dew_c", pt["temp_c"] - 4.0) - bias
                     pop_val = int(pt["precip_prob"])
                     pr_mm_val = float(pt.get("precip_mm", 0.0))
-                    w_val = float(pt.get("wind_kmh", 0.0))
-                    g_val = float(pt.get("gust_kmh", round(w_val * 1.3, 1)))
+                    w_val = max(0.0, float(pt.get("wind_kmh", 0.0)) - wind_bias)
+                    g_val = max(w_val, float(pt.get("gust_kmh", round(w_val * 1.3, 1))) - wind_bias)
                     c_val = int(pt.get("cloud_pct", 0))
                     p_val = float(pt.get("press_hpa", 1013.25))
 
@@ -643,11 +789,27 @@ class WeatherProviderService:
             day_code = 0
             best_w = -1.0
 
+            # Approximate local afternoon max (~15:00 solar) and dawn min (~05:00 solar) in UTC hours
+            utc_offset_hrs = int(round(longitude / 15.0))
+            afternoon_utc_h = (15 - utc_offset_hrs) % 24
+            dawn_utc_h = (5 - utc_offset_hrs) % 24
+
             for m_name, suffix in model_suffixes.items():
                 if m_name not in weights_map:
                     continue
-                w = weights_map[m_name]["norm_w"]
-                bias = float(weights_map[m_name]["bias_temp_c"])
+                w_info = weights_map[m_name]
+                if d_idx == 0:
+                    w = 0.6 * w_info["norm_short"] + 0.4 * w_info["norm_med"]
+                elif d_idx == 1:
+                    w = 0.5 * w_info["norm_med"] + 0.5 * w_info["norm_ext"]
+                else:
+                    w = w_info["norm_ext"]
+
+                b0 = float(w_info.get("bias_temp_c") or 0.0)
+                bsin = float(w_info.get("bias_sin_c") or 0.0)
+                bcos = float(w_info.get("bias_cos_c") or 0.0)
+                bias_max = eval_diurnal_bias(b0, bsin, bcos, afternoon_utc_h)
+                bias_min = eval_diurnal_bias(b0, bsin, bcos, dawn_utc_h)
 
                 d_max_arr = daily_raw.get(f"temperature_2m_max_{suffix}") or daily_raw.get("temperature_2m_max") or []
                 d_min_arr = daily_raw.get(f"temperature_2m_min_{suffix}") or daily_raw.get("temperature_2m_min") or []
@@ -669,8 +831,8 @@ class WeatherProviderService:
                 d_code_arr = daily_raw.get(f"weather_code_{suffix}") or daily_raw.get("weather_code") or []
 
                 if d_idx < len(d_max_arr) and d_max_arr[d_idx] is not None and d_idx < len(d_min_arr) and d_min_arr[d_idx] is not None:
-                    max_t_blend += (float(d_max_arr[d_idx]) - bias) * w
-                    min_t_blend += (float(d_min_arr[d_idx]) - bias) * w
+                    max_t_blend += (float(d_max_arr[d_idx]) - bias_max) * w
+                    min_t_blend += (float(d_min_arr[d_idx]) - bias_min) * w
                     pop_val = float(d_pop_arr[d_idx]) if d_idx < len(d_pop_arr) and d_pop_arr[d_idx] is not None else 0.0
                     psum_val = float(d_psum_arr[d_idx]) if d_idx < len(d_psum_arr) and d_psum_arr[d_idx] is not None else 0.0
                     wmax_val = float(d_wmax_arr[d_idx]) if d_idx < len(d_wmax_arr) and d_wmax_arr[d_idx] is not None else 12.0

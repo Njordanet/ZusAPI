@@ -19,15 +19,17 @@ async def get_datasets():
     }
 
 
-@router.get("/dataset/leaderboard", summary="Get accuracy leaderboard & learned MOS bias for a grid cell")
+@router.get("/dataset/leaderboard", summary="Get accuracy leaderboard, RLS horizon weights & learned harmonic MOS bias for a grid cell")
 async def get_model_leaderboard(
     lat: float = Query(40.0856, ge=-90.0, le=90.0),
     lon: float = Query(22.3585, ge=-180.0, le=180.0),
 ):
     cell_id = db_manager.make_cell_id(lat, lon)
     weights = await db_manager.get_model_weights(cell_id)
+    rls_meta = await db_manager.get_cell_rls_metadata(cell_id)
     return {
         "cell_id": cell_id,
         "region_mode": "US_HYPERLOCAL" if db_manager.is_us_region(lat, lon) else "GLOBAL_ENSEMBLE",
+        "rls_state": rls_meta,
         "models": weights,
     }
