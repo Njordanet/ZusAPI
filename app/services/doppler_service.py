@@ -123,7 +123,7 @@ def _compass_from_degrees(deg: float) -> str:
 
 
 class DopplerGridFrame:
-    """Holds a single 1km CONUS uint8 reflectivity matrix (2700 x 6100 = 16.47 MB)."""
+    """Holds a single 1km CONUS uint8 reflectivity matrix (2700 x 6100 = 16.47 MB) or zero-copy advected view."""
     __slots__ = (
         "frame_id",
         "timestamp",
@@ -132,6 +132,9 @@ class DopplerGridFrame:
         "offset_minutes",
         "is_future",
         "grid",
+        "advect_drow",
+        "advect_dcol",
+        "decay_indices",
         "max_dbz",
         "echo_coverage_pct",
         "storm_cells_count",
@@ -147,6 +150,9 @@ class DopplerGridFrame:
         is_future: bool,
         grid: np.ndarray,
         raw_bytes: int,
+        advect_drow: int = 0,
+        advect_dcol: int = 0,
+        decay_indices: int = 0,
     ):
         self.frame_id = frame_id
         self.dt = dt
@@ -155,15 +161,18 @@ class DopplerGridFrame:
         self.offset_minutes = offset_minutes
         self.is_future = is_future
         self.grid = grid  # shape (2700, 6100), dtype uint8, step 0.01 deg
+        self.advect_drow = int(advect_drow)
+        self.advect_dcol = int(advect_dcol)
+        self.decay_indices = int(decay_indices)
         self.raw_bytes = raw_bytes
 
         # Compute summary stats on decimated slice for speed (<1ms)
         sample = grid[::4, ::4]
-        max_idx = int(sample.max()) if sample.size else 0
+        max_idx = max(0, int(sample.max()) - self.decay_indices) if sample.size else 0
         self.max_dbz = _dbz_from_index(max_idx)
-        active_mask = sample >= 85  # >= 10 dBZ
+        active_mask = sample >= (85 + self.decay_indices)  # >= 10 dBZ
         self.echo_coverage_pct = round(float(active_mask.sum()) / max(1, sample.size) * 100.0, 2)
-        severe_mask = sample >= 145  # >= 40 dBZ
+        severe_mask = sample >= (145 + self.decay_indices)  # >= 40 dBZ
         self.storm_cells_count = int(severe_mask.sum() // 6)
 
 
@@ -534,26 +543,32 @@ class DopplerRadarService:
                         self._global_motion_drow_15m = drow
                         self._global_motion_dcol_15m = dcol
 
-                    # 3. Synthesize +15m and +30m Advected Nowcast Future Frames
+                    # 3. Synthesize 2-Hour (+15m .. +2h in 15m steps) Zero-Copy Advected Nowcast Future Frames
+                    future_steps = [
+                        (1, 15, "+15m"),
+                        (2, 30, "+30m"),
+                        (3, 45, "+45m"),
+                        (4, 60, "+1h"),
+                        (5, 75, "+1h 15m"),
+                        (6, 90, "+1h 30m"),
+                        (7, 105, "+1h 45m"),
+                        (8, 120, "+2h"),
+                    ]
                     future_frames: List[DopplerGridFrame] = []
-                    for fut_mult, fut_min in [(1, 15), (2, 30)]:
+                    for fut_mult, fut_min, fut_label in future_steps:
                         fut_dt = live_frame.dt + timedelta(minutes=fut_min)
                         fut_id = f"nowcast_{fut_dt:%Y%m%d%H%M}"
-                        fut_grid = await asyncio.to_thread(
-                            self._advect_grid,
-                            live_frame.grid,
-                            self._global_motion_drow_15m * fut_mult,
-                            self._global_motion_dcol_15m * fut_mult,
-                            fut_mult * 2,
-                        )
                         fut_obj = DopplerGridFrame(
                             frame_id=fut_id,
                             dt=fut_dt,
-                            label=f"+{fut_min}m",
+                            label=fut_label,
                             offset_minutes=fut_min,
                             is_future=True,
-                            grid=fut_grid,
+                            grid=live_frame.grid,
                             raw_bytes=live_frame.raw_bytes,
+                            advect_drow=self._global_motion_drow_15m * fut_mult,
+                            advect_dcol=self._global_motion_dcol_15m * fut_mult,
+                            decay_indices=int(round(fut_mult * 1.25)),
                         )
                         future_frames.append(fut_obj)
 
@@ -705,9 +720,19 @@ class DopplerRadarService:
         lat_south = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * (y + 1) / n))))
         return (lat_north, lon_west, lat_south, lon_east)
 
-    def _slice_conus_tile_sync(self, grid: np.ndarray, z: int, x: int, y: int) -> bytes:
+    def _slice_conus_tile_sync(
+        self,
+        grid: np.ndarray,
+        z: int,
+        x: int,
+        y: int,
+        advect_drow: int = 0,
+        advect_dcol: int = 0,
+        decay_indices: int = 0,
+    ) -> bytes:
         """
         Slices a 256x256 WebMercator tile directly from the 2700x6100 uint8 master grid
+        (with optional zero-copy Lagrangian advection offset & intensity decay)
         and encodes an 8-bit Indexed PNG with the Züs Storm Palette in <0.4ms.
         """
         n = 2.0 ** z
@@ -718,8 +743,8 @@ class DopplerRadarService:
         merc_y = math.pi * (1.0 - 2.0 * (y + py) / n)
         lats = np.degrees(np.arctan(np.sinh(merc_y)))
 
-        cols = np.floor((lons - self.LON_MIN) / self.STEP_DEG).astype(np.int32)
-        rows = np.floor((self.LAT_MAX - lats) / self.STEP_DEG).astype(np.int32)
+        cols = np.floor((lons - self.LON_MIN) / self.STEP_DEG).astype(np.int32) - int(advect_dcol)
+        rows = np.floor((self.LAT_MAX - lats) / self.STEP_DEG).astype(np.int32) - int(advect_drow)
 
         valid_r = (rows >= 0) & (rows < self.GRID_H)
         valid_c = (cols >= 0) & (cols < self.GRID_W)
@@ -737,6 +762,11 @@ class DopplerRadarService:
             tile[~valid_r, :] = 0
         if not np.all(valid_c):
             tile[:, ~valid_c] = 0
+
+        if decay_indices > 0:
+            active = tile >= (78 + decay_indices)
+            tile[active] -= decay_indices
+            tile[~active] = 0
 
         if int(tile.max()) < 90:
             return EMPTY_TILE_PNG
@@ -835,7 +865,16 @@ class DopplerRadarService:
 
             png_bytes = EMPTY_TILE_PNG
             if intersects_conus and frame is not None:
-                png_bytes = await asyncio.to_thread(self._slice_conus_tile_sync, frame.grid, z, x, y)
+                png_bytes = await asyncio.to_thread(
+                    self._slice_conus_tile_sync,
+                    frame.grid,
+                    z,
+                    x,
+                    y,
+                    frame.advect_drow,
+                    frame.advect_dcol,
+                    frame.decay_indices,
+                )
             elif self._rainviewer_frames:
                 # Global fallback outside CONUS
                 rv_frame = self._rainviewer_frames[-1]
@@ -1082,7 +1121,8 @@ class DopplerRadarService:
         if lat is not None and lon is not None:
             local_telemetry = await self.get_point_telemetry(lat, lon)
 
-        ram_mb = round(sum(f.grid.nbytes for f in self._frames.values()) / (1024 * 1024), 1)
+        unique_grids = {id(f.grid): f.grid for f in self._frames.values()}
+        ram_mb = round(sum(g.nbytes for g in unique_grids.values()) / (1024 * 1024), 1)
         tile_ram_kb = round(sum(len(b) for b in self._tile_cache.values()) / 1024, 1)
 
         return RadarManifestResponse(
