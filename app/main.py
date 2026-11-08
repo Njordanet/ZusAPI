@@ -130,6 +130,7 @@ async def root():
             "zus_native": "/api/v1/weather?lat={lat}&lon={lon}&units={metric|imperial|si}&exclude={blocks}",
             "darksky_pirateweather": "/forecast/{api_key}/{lat},{lon}",
             "darksky_keyless": "/api/v1/darksky/{lat},{lon}",
+            "darksky_standard": "/api/v1/standard/darksky/{lat},{lon}",
             "open_meteo_v1": "/v1/forecast?latitude={lat}&longitude={lon}",
             "owm_onecall_3_0": "/data/3.0/onecall?lat={lat}&lon={lon}&units={metric|imperial|standard}",
             "owm_current_2_5": "/data/2.5/weather?lat={lat}&lon={lon}&units={metric|imperial|standard}",

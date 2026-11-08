@@ -48,7 +48,14 @@ def parse_metar_wx(
             return (WeatherCondition.SEVERE_THUNDERSTORM, 96, max(base_mmhr, 9.5))
         return (WeatherCondition.THUNDERSTORM, 95, max(base_mmhr, 4.5))
 
-    if any(k in joined for k in ("SN", "SG", "PL", "IC", "GS")):
+    if any(k in joined for k in ("FZRA", "FZDZ", "PL", "IC")):
+        if "FZRA" in joined:
+            return (WeatherCondition.SNOW, 67 if "+" in joined else 66, max(base_mmhr, 2.5))
+        if "FZDZ" in joined:
+            return (WeatherCondition.SNOW, 57 if "+" in joined else 56, max(base_mmhr, 0.7))
+        return (WeatherCondition.SNOW, 77, max(base_mmhr, 1.8))
+
+    if any(k in joined for k in ("SN", "SG", "GS")):
         if "+" in joined:
             return (WeatherCondition.SNOW, 75, max(base_mmhr, 3.0))
         if "-" in joined:

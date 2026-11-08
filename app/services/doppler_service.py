@@ -1330,14 +1330,18 @@ class DopplerRadarService:
                     frame.decay_indices,
                     fut_mult,
                 )
-            elif self._rainviewer_frames:
-                # Global fallback outside CONUS
+            elif self._rainviewer_frames and z <= 7:
+                # Global fallback outside CONUS (RainViewer supports z <= 7; z >= 8 returns a 1370-byte error tile)
                 rv_frame = self._rainviewer_frames[-1]
                 rv_url = f"{self._rainviewer_host}{rv_frame['path']}/256/{z}/{x}/{y}/2/1_1.png"
                 try:
                     async with httpx.AsyncClient(timeout=6.0) as client:
                         resp = await client.get(rv_url)
-                        if resp.status_code == 200 and len(resp.content) > 400:
+                        if (
+                            resp.status_code == 200
+                            and len(resp.content) > 400
+                            and len(resp.content) != 1370
+                        ):
                             png_bytes = await asyncio.to_thread(self._remap_rainviewer_tile_sync, resp.content)
                 except Exception:
                     png_bytes = EMPTY_TILE_PNG
@@ -1480,30 +1484,81 @@ class DopplerRadarService:
             bearing_deg = (math.degrees(math.atan2(float(dx_km[min_i]), float(-dy_km[min_i]))) + 360.0) % 360.0
             nearest_compass = _compass_from_degrees(bearing_deg)
 
-        # 4. Regional storm motion vector (estimated within ±85km of the queried coordinate)
-        drow_15m, dcol_15m = self._estimate_regional_motion_15m(row, col)
-        vy_km_15m = -drow_15m * 1.11  # positive = moving north
-        vx_km_15m = dcol_15m * (1.11 * cos_lat)  # positive = moving east
+        # 4. Regional or Curved Trajectory Storm Motion Vector (steps 1..4 = 15m, 30m, 45m, 60m)
+        has_curved = bool(
+            self._cum_drow_fields
+            and self._cum_dcol_fields
+            and all(s in self._cum_drow_fields and s in self._cum_dcol_fields for s in (1, 2, 3, 4))
+        )
+
+        step_cum_dr: Dict[int, float] = {0: 0.0}
+        step_cum_dc: Dict[int, float] = {0: 0.0}
+        step_trend: Dict[int, float] = {0: 0.0}
+
+        def _sample_field_at_pt(field_grid: np.ndarray, r_val: float, c_val: float) -> float:
+            th, tw = field_grid.shape
+            fy = max(0.0, min(float(th - 1.001), (r_val / (self.GRID_H - 1)) * (th - 1)))
+            fx = max(0.0, min(float(tw - 1.001), (c_val / (self.GRID_W - 1)) * (tw - 1)))
+            iy = int(fy)
+            ix = int(fx)
+            dy = fy - iy
+            dx = fx - ix
+            return float(
+                field_grid[iy, ix] * (1.0 - dy) * (1.0 - dx)
+                + field_grid[iy, ix + 1] * (1.0 - dy) * dx
+                + field_grid[iy + 1, ix] * dy * (1.0 - dx)
+                + field_grid[iy + 1, ix + 1] * dy * dx
+            )
+
+        if has_curved:
+            for s in range(1, 5):
+                step_cum_dr[s] = _sample_field_at_pt(self._cum_drow_fields[s], f_row, f_col)
+                step_cum_dc[s] = _sample_field_at_pt(self._cum_dcol_fields[s], f_row, f_col)
+                step_trend[s] = (
+                    _sample_field_at_pt(self._hrrr_trend_fields[s], f_row, f_col)
+                    if (self._hrrr_trend_fields and s in self._hrrr_trend_fields)
+                    else 0.0
+                )
+        else:
+            drow_15m, dcol_15m = self._estimate_regional_motion_15m(row, col)
+            for s in range(1, 5):
+                step_cum_dr[s] = float(drow_15m * s)
+                step_cum_dc[s] = float(dcol_15m * s)
+                step_trend[s] = 0.0
+
+        # Motion from initial tangent (step = 1, 15-minute lead)
+        tan_dr_15m = step_cum_dr[1]
+        tan_dc_15m = step_cum_dc[1]
+        vy_km_15m = -tan_dr_15m * 1.11  # positive = moving north
+        vx_km_15m = tan_dc_15m * (1.11 * cos_lat)  # positive = moving east
         speed_kmh = round(math.hypot(vx_km_15m, vy_km_15m) * 4.0, 1)
         motion_deg = int(round((math.degrees(math.atan2(vx_km_15m, vy_km_15m)) + 360.0) % 360.0))
         motion_compass = _compass_from_degrees(motion_deg)
 
-        # 5. Cast 61 1-minute sub-pixel steps (0..60m) upstream + track Lagrangian Echo Growth/Decay
+        # 5. Cast 61 1-minute curved sub-pixel steps (0..60m) upstream + Lagrangian Trend
         minute_by_minute: List[float] = []
         trend_samples: List[float] = []
-        step_r_1m = drow_15m / 15.0
-        step_c_1m = dcol_15m / 15.0
+        tan_step_r_1m = tan_dr_15m / 15.0
+        tan_step_c_1m = tan_dc_15m / 15.0
 
         for t_min in range(61):
-            up_r = f_row - step_r_1m * t_min
-            up_c = f_col - step_c_1m * t_min
+            step_flt = t_min / 15.0
+            s0 = int(math.floor(step_flt))
+            s1 = min(4, s0 + 1)
+            frac = step_flt - s0
+            dr_t = (1.0 - frac) * step_cum_dr[s0] + frac * step_cum_dr[s1]
+            dc_t = (1.0 - frac) * step_cum_dc[s0] + frac * step_cum_dc[s1]
+            trend_t = (1.0 - frac) * step_trend[s0] + frac * step_trend[s1]
+
+            up_r = f_row - dr_t
+            up_c = f_col - dc_t
             if 0.0 <= up_r < (self.GRID_H - 1) and 0.0 <= up_c < (self.GRID_W - 1):
                 live_dbz = _sample_cone_dbz(grid, up_r, up_c, lead_min=t_min)
                 proj_dbz = live_dbz
                 # Compute Lagrangian growth/decay rate by checking where this parcel was in ref_frame
                 if ref_grid is not None and live_dbz >= 7.5:
-                    prev_r = up_r - step_r_1m * ref_dt_mins
-                    prev_c = up_c - step_c_1m * ref_dt_mins
+                    prev_r = up_r - tan_step_r_1m * ref_dt_mins
+                    prev_c = up_c - tan_step_c_1m * ref_dt_mins
                     if 0.0 <= prev_r < (self.GRID_H - 1) and 0.0 <= prev_c < (self.GRID_W - 1):
                         prev_dbz = _sample_cone_dbz(ref_grid, prev_r, prev_c, lead_min=t_min)
                         # Rate of change in dBZ per minute (clamped to [-0.45, +0.45] dBZ/min)
@@ -1513,6 +1568,13 @@ class DopplerRadarService:
                         tau = 20.0
                         delta_dbz = rate_per_min * tau * (1.0 - math.exp(-t_min / tau))
                         proj_dbz = max(0.0, min(65.0, live_dbz + delta_dbz))
+
+                # Apply HRRR reflectivity trend (with distance dampening) on active echoes before Z-R conversion
+                if proj_dbz >= 7.5 and abs(trend_t) > 1e-4:
+                    dist_km = math.hypot(-dr_t * 1.11, dc_t * 1.11 * cos_lat)
+                    damp_factor = 1.0 / (1.0 + (dist_km / 60.0))
+                    eff_hrrr_dbz = (trend_t * 0.5) * damp_factor
+                    proj_dbz = max(0.0, min(65.0, proj_dbz + eff_hrrr_dbz))
 
                 raw_rate = _mmhr_from_dbz(proj_dbz)
                 eff_vf = virga_factor if proj_dbz < 26.0 else max(0.75, virga_factor)
@@ -1568,7 +1630,7 @@ class DopplerRadarService:
                     label=f.label,
                     offsetMinutes=f.offset_minutes,
                     isFuture=f.is_future,
-                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=8",
+                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=9",
                 )
             )
 

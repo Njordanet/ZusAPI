@@ -30,9 +30,13 @@ class WeatherCondition(str, Enum):
             51: cls.DRIZZLE,
             53: cls.DRIZZLE,
             55: cls.DRIZZLE,
+            56: cls.SNOW,
+            57: cls.SNOW,
             61: cls.RAIN,
             63: cls.RAIN,
             65: cls.HEAVY_RAIN,
+            66: cls.SNOW,
+            67: cls.SNOW,
             71: cls.SNOW,
             73: cls.SNOW,
             75: cls.SNOW,
@@ -179,6 +183,9 @@ class WeatherDataModel(BaseModel):
     observedWeatherCode: Optional[int] = None
     capeJkg: Optional[float] = None
     liftedIndex: Optional[float] = None
+    wetBulbTemperature: Optional[float] = None
+    precipType: Optional[str] = None
+    ozone: Optional[float] = None
 
 
 class HourlyForecastModel(BaseModel):
@@ -222,6 +229,9 @@ class HourlyForecastModel(BaseModel):
     pressMin: Optional[float] = None
     pressMax: Optional[float] = None
     capeJkg: Optional[float] = None
+    wetBulbTemperature: Optional[float] = None
+    precipType: Optional[str] = None
+    snowAccumulationCm: Optional[float] = None
 
 
 class DailyForecastModel(BaseModel):
@@ -238,6 +248,9 @@ class DailyForecastModel(BaseModel):
     windDirectionDominant: int = 180
     sunrise: Optional[str] = None
     sunset: Optional[str] = None
+    precipType: Optional[str] = None
+    snowAccumulationCm: Optional[float] = None
+    snowToLiquidRatio: Optional[float] = None
 
 
 class WeatherResponse(BaseModel):
@@ -274,3 +287,9 @@ class LightningTelemetryResponse(BaseModel):
     capeJkg: float = 0.0
     liftedIndex: float = 0.0
     strikes: List[LightningStrike] = []
+
+
+# Backwards-compatible aliases
+WeatherData = WeatherDataModel
+HourlyForecast = HourlyForecastModel
+DailyForecast = DailyForecastModel

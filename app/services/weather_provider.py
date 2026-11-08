@@ -58,6 +58,112 @@ def classify_dewpoint_comfort(dewpoint_c: float) -> str:
     return "Oppressive"
 
 
+def calc_wet_bulb_c(temp_c: float, rh_pct: float) -> float:
+    """
+    Computes wet-bulb temperature (°C) using Stull's empirical formula (2011).
+    Valid for RH between 1% and 100% and temperatures between -20°C and 50°C.
+    """
+    t = float(temp_c)
+    rh = max(1.0, min(100.0, float(rh_pct)))
+    tw = (
+        t * math.atan(0.151977 * math.sqrt(rh + 8.313659))
+        + math.atan(t + rh)
+        - math.atan(rh - 1.676331)
+        + 0.00391838 * (rh ** 1.5) * math.atan(0.023101 * rh)
+        - 4.686035
+    )
+    return round(tw, 2)
+
+
+def calc_snow_liquid_ratio(temp_c: float, precip_type: Optional[str] = None) -> float:
+    """
+    Computes temperature-dependent Kuchera/Cobb Snow-to-Liquid Ratio (SLR).
+    ~10:1 near 0°C ramping to ~18:1 at -15°C, and 3:1 for sleet.
+    """
+    if precip_type == "sleet":
+        return 3.0
+    if precip_type == "rain":
+        return 0.0
+
+    t = float(temp_c)
+    if t >= 0.5:
+        slr = max(4.0, 10.0 - 3.0 * t)
+    elif t >= -15.0:
+        slr = 10.0 + (8.0 / 15.0) * (-t)
+    elif t >= -25.0:
+        slr = max(14.0, 18.0 - 0.3 * (-t - 15.0))
+    else:
+        slr = 14.0
+    return round(float(slr), 1)
+
+
+def classify_precip_type(
+    temp_c: float,
+    rh_pct: Optional[float] = None,
+    wet_bulb_c: Optional[float] = None,
+    wmo_code: Optional[int] = None,
+    metar_wx: Optional[str] = None,
+) -> str:
+    """
+    Classifies precipitation phase into 'rain', 'snow', or 'sleet' using:
+    - METAR freezing/pellet tokens (FZRA, FZDZ, PL, IC)
+    - WMO freezing/pellet codes (56, 57, 66, 67, 77)
+    - Wet-bulb temperature Tw:
+        Tw <= -0.4°C -> 'snow'
+        -0.4°C < Tw <= +0.8°C -> 'sleet'
+        Tw > +0.8°C -> 'rain'
+    """
+    if metar_wx:
+        m = metar_wx.upper()
+        if any(tok in m for tok in ("FZRA", "FZDZ", "PL", "IC")):
+            return "sleet"
+        if any(tok in m for tok in ("SN", "SG", "GS")):
+            return "snow"
+
+    if wmo_code in (56, 57, 66, 67, 77):
+        return "sleet"
+
+    if wet_bulb_c is None:
+        if rh_pct is not None:
+            wet_bulb_c = calc_wet_bulb_c(temp_c, rh_pct)
+        else:
+            wet_bulb_c = float(temp_c)
+
+    if wet_bulb_c <= -0.4:
+        return "snow"
+    elif wet_bulb_c <= 0.8:
+        return "sleet"
+    else:
+        if wmo_code in (71, 73, 75, 85, 86) and temp_c <= 2.0:
+            return "snow"
+        return "rain"
+
+
+def calc_dobson_units(lat: float, surface_ozone_ugm3: Optional[float] = None) -> float:
+    """
+    Computes total column ozone in Dobson Units (DU), blending a latitude and
+    seasonally modulated climatological baseline (260-360 DU) with real-time
+    surface ozone measurements when available.
+    """
+    lat_rad = math.radians(lat)
+    base_du = 290.0 + 45.0 * (math.sin(abs(lat_rad)) ** 2)
+    doy = datetime.now(timezone.utc).timetuple().tm_yday
+    if lat >= 0:
+        phase = 2.0 * math.pi * (doy - 85) / 365.25
+    else:
+        phase = 2.0 * math.pi * (doy - 265) / 365.25
+    amp = 30.0 * math.sin(abs(lat_rad))
+    climatology_du = base_du + amp * math.cos(phase)
+
+    if surface_ozone_ugm3 is not None and surface_ozone_ugm3 > 0:
+        o3_delta = (float(surface_ozone_ugm3) - 60.0) * 0.22
+        du = max(240.0, min(420.0, climatology_du + o3_delta))
+    else:
+        du = max(240.0, min(420.0, climatology_du))
+
+    return round(float(du), 1)
+
+
 class WeatherProviderService:
     def __init__(self):
         self._cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
@@ -107,13 +213,14 @@ class WeatherProviderService:
 
     async def _fetch_air_quality_and_tz(
         self, client: httpx.AsyncClient, lat: float, lon: float
-    ) -> Tuple[Optional[int], Optional[float], str, int]:
+    ) -> Tuple[Optional[int], Optional[float], Optional[float], str, int]:
         default_offset = int(round(lon / 15.0)) * 3600
+        default_ozone = calc_dobson_units(lat, None)
         try:
             params = {
                 "latitude": lat,
                 "longitude": lon,
-                "current": "us_aqi,pm2_5",
+                "current": "us_aqi,pm2_5,ozone",
                 "timezone": "auto",
             }
             resp = await client.get(settings.open_meteo_air_quality_url, params=params, timeout=5.0)
@@ -122,17 +229,20 @@ class WeatherProviderService:
                 curr = body.get("current", {})
                 aqi = curr.get("us_aqi")
                 pm25 = curr.get("pm2_5")
+                raw_ozone = curr.get("ozone")
+                ozone_du = calc_dobson_units(lat, float(raw_ozone) if raw_ozone is not None else None)
                 tz_name = str(body.get("timezone") or "UTC")
                 utc_off = int(body.get("utc_offset_seconds") or default_offset)
                 return (
                     int(aqi) if aqi is not None else None,
-                     round(float(pm25), 2) if pm25 is not None else None,
+                    round(float(pm25), 2) if pm25 is not None else None,
+                    ozone_du,
                     tz_name,
                     utc_off,
                 )
         except Exception:
             pass
-        return None, None, "UTC", default_offset
+        return None, None, default_ozone, "UTC", default_offset
 
     async def _fetch_nws_polygon_alerts(
         self, client: httpx.AsyncClient, lat: float, lon: float
@@ -407,7 +517,7 @@ class WeatherProviderService:
 
             (
                 raw_data,
-                (us_aqi, pm25_val, tz_name, utc_offset_sec),
+                (us_aqi, pm25_val, ozone_val, tz_name, utc_offset_sec),
                 active_alerts,
                 (nearby_stations, station_composite),
                 _,
@@ -854,6 +964,11 @@ class WeatherProviderService:
                 if len(hour_temps) >= 2:
                     hourly_spreads.append(statistics.pstdev(hour_temps))
 
+                h_wb = calc_wet_bulb_c(final_h_temp, h_rh)
+                h_pt = classify_precip_type(temp_c=final_h_temp, rh_pct=float(h_rh), wet_bulb_c=h_wb, wmo_code=top_code)
+                h_slr = calc_snow_liquid_ratio(final_h_temp, h_pt)
+                h_snow_cm = round((final_h_pr_mm / 10.0) * h_slr, 2) if (h_pt in ("snow", "sleet") and final_h_pr_mm > 0) else 0.0
+
                 hourly_models.append(
                     HourlyForecastModel(
                         time=dt,
@@ -895,6 +1010,9 @@ class WeatherProviderService:
                         pressMin=round(min(hour_press), 1) if hour_press else final_h_press,
                         pressMax=round(max(hour_press), 1) if hour_press else final_h_press,
                         capeJkg=h_cape,
+                        wetBulbTemperature=h_wb,
+                        precipType=h_pt,
+                        snowAccumulationCm=h_snow_cm,
                     )
                 )
 
@@ -993,6 +1111,29 @@ class WeatherProviderService:
                 d_sr = str(d_sr_arr[d_idx]) if d_idx < len(d_sr_arr) and d_sr_arr[d_idx] is not None else None
                 d_ss = str(d_ss_arr[d_idx]) if d_idx < len(d_ss_arr) and d_ss_arr[d_idx] is not None else None
 
+                day_slice = hourly_models[d_idx * 24 : (d_idx + 1) * 24]
+                if day_slice:
+                    d_snow_accum = round(sum((h.snowAccumulationCm or 0.0) for h in day_slice), 2)
+                    d_wet_snow_hours = [h for h in day_slice if h.precipType in ("snow", "sleet") and (h.precipMm or 0.0) > 0]
+                    if d_wet_snow_hours:
+                        sleet_count = sum(1 for h in d_wet_snow_hours if h.precipType == "sleet")
+                        snow_count = sum(1 for h in d_wet_snow_hours if h.precipType == "snow")
+                        d_pt = "sleet" if sleet_count > snow_count else "snow"
+                    elif any((h.precipMm or 0.0) > 0 for h in day_slice):
+                        d_pt = "rain"
+                    else:
+                        d_pt = classify_precip_type(temp_c=(d_min + d_max) / 2.0, wmo_code=day_code)
+
+                    if d_psum > 0 and d_snow_accum > 0:
+                        d_slr = round(d_snow_accum * 10.0 / d_psum, 1)
+                    else:
+                        d_slr = calc_snow_liquid_ratio((d_min + d_max) / 2.0, d_pt)
+                else:
+                    d_mid = (d_min + d_max) / 2.0
+                    d_pt = classify_precip_type(temp_c=d_mid, wmo_code=day_code)
+                    d_slr = calc_snow_liquid_ratio(d_mid, d_pt)
+                    d_snow_accum = round((d_psum / 10.0) * d_slr, 2) if (d_pt in ("snow", "sleet") and d_psum > 0) else 0.0
+
                 daily_models.append(
                     DailyForecastModel(
                         date=dt,
@@ -1007,6 +1148,9 @@ class WeatherProviderService:
                         windDirectionDominant=d_wdir,
                         sunrise=d_sr,
                         sunset=d_ss,
+                        precipType=d_pt,
+                        snowAccumulationCm=d_snow_accum,
+                        snowToLiquidRatio=d_slr,
                     )
                 )
 
@@ -1163,6 +1307,21 @@ class WeatherProviderService:
                 else 2.0
             )
 
+            curr_hum = int(
+                (station_composite and station_composite.get("humidity"))
+                or current_raw.get("relative_humidity_2m")
+                or current_raw.get("relative_humidity_2m_best_match")
+                or 50
+            )
+            curr_wb = calc_wet_bulb_c(final_current_temp, float(curr_hum))
+            curr_pt = classify_precip_type(
+                temp_c=final_current_temp,
+                rh_pct=float(curr_hum),
+                wet_bulb_c=curr_wb,
+                wmo_code=observed_wmo,
+                metar_wx=local_station_wx,
+            )
+
             current_model = WeatherDataModel(
                 cityName=city_name,
                 temperature=final_current_temp,
@@ -1170,12 +1329,7 @@ class WeatherProviderService:
                 condition=current_condition,
                 tempMin=min(temp_min_today, final_current_temp),
                 tempMax=max(temp_max_today, final_current_temp),
-                humidity=int(
-                    (station_composite and station_composite.get("humidity"))
-                    or current_raw.get("relative_humidity_2m")
-                    or current_raw.get("relative_humidity_2m_best_match")
-                    or 50
-                ),
+                humidity=curr_hum,
                 windSpeed=wind_speed_kmh,
                 windDirection=wind_dir_deg,
                 uvIndex=round(current_uv, 1),
@@ -1200,6 +1354,9 @@ class WeatherProviderService:
                 observedWeatherCode=observed_wmo,
                 capeJkg=round(curr_cape, 1),
                 liftedIndex=round(curr_li, 2),
+                wetBulbTemperature=curr_wb,
+                precipType=curr_pt,
+                ozone=ozone_val,
             )
 
             result = WeatherResponse(

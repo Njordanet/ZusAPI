@@ -51,7 +51,14 @@ def _is_daytime_ts(ts: int, sunrise_ts: int, sunset_ts: int) -> bool:
     return 6 <= ((ts // 3600) % 24) <= 18
 
 
-def _darksky_icon(cond: WeatherCondition, is_day: bool = True, wind_kmh: float = 0.0) -> str:
+def _darksky_icon(
+    cond: WeatherCondition,
+    is_day: bool = True,
+    wind_kmh: float = 0.0,
+    precip_type: Optional[str] = None,
+) -> str:
+    if precip_type == "sleet":
+        return "sleet"
     if cond in (WeatherCondition.CLEAR, WeatherCondition.PARTLY_CLOUDY) and wind_kmh >= 45.0:
         return "wind"
     if cond == WeatherCondition.CLEAR:
@@ -178,6 +185,7 @@ async def _build_darksky_payload(
     lon: float,
     units: str = "us",
     exclude: Optional[str] = None,
+    extend: Optional[str] = None,
 ) -> Dict[str, Any]:
     units_norm = units.lower().strip()
     if units_norm == "auto":
@@ -211,16 +219,29 @@ async def _build_darksky_payload(
 
     rates_61 = _extract_61_minutely_rates(w_resp)
     minutely_data: List[Dict[str, Any]] = []
+    curr_pt = cur.precipType or ("snow" if cur.temperature <= 0.5 else "rain")
+    h0 = w_resp.hourly[0] if w_resp.hourly else None
+    ens_spread = max(0.05, float((h0.precipMmMax if h0 and h0.precipMmMax is not None else 0.2) - (h0.precipMmMin if h0 and h0.precipMmMin is not None else 0.0)))
+    base_err_frac = max(0.12, min(0.45, ens_spread / max(0.5, float(h0.precipMm if h0 else 1.0))))
+
     for minute, mmhr in enumerate(rates_61):
-        prob = min(1.0, round((mmhr / 2.5) if mmhr > 0.05 else 0.0, 2))
+        if mmhr >= 0.10:
+            prob = min(1.0, round(0.80 + 0.20 * (1.0 - math.exp(-(mmhr - 0.10) / 1.5)), 2))
+        elif mmhr >= 0.05:
+            prob = round(0.50 + ((mmhr - 0.05) / 0.05) * 0.30, 2)
+        else:
+            prob = 0.0
+
         pt_dict: Dict[str, Any] = {
             "time": now_ts + (minute * 60),
             "precipIntensity": _convert_precip_rate(mmhr, units_norm),
             "precipProbability": prob,
         }
         if mmhr > 0.05:
-            pt_dict["precipIntensityError"] = _convert_precip_rate(mmhr * 0.15, units_norm)
-            pt_dict["precipType"] = "snow" if cur.temperature <= 0.5 else "rain"
+            cone_growth = (minute / 60.0) * 0.20
+            err_val = mmhr * (base_err_frac + cone_growth)
+            pt_dict["precipIntensityError"] = _convert_precip_rate(err_val, units_norm)
+            pt_dict["precipType"] = curr_pt
         minutely_data.append(pt_dict)
 
     curr_mmhr = max(
@@ -251,7 +272,7 @@ async def _build_darksky_payload(
         currently_obj: Dict[str, Any] = {
             "time": now_ts,
             "summary": cur.condition.value,
-            "icon": _darksky_icon(cur.condition, is_day=is_day_now, wind_kmh=cur.windSpeed),
+            "icon": _darksky_icon(cur.condition, is_day=is_day_now, wind_kmh=cur.windSpeed, precip_type=curr_pt if curr_mmhr > 0.05 else None),
             "precipIntensity": _convert_precip_rate(curr_mmhr, units_norm),
             "precipProbability": round((w_resp.hourly[0].precipitationChance / 100.0) if w_resp.hourly else 0.0, 2),
             "temperature": _convert_temp(cur.temperature, units_norm),
@@ -265,10 +286,10 @@ async def _build_darksky_payload(
             "cloudCover": round((cur.cloudCover if cur.cloudCover is not None else 50) / 100.0, 2),
             "uvIndex": cur.uvIndex,
             "visibility": _convert_dist(cur.visibility, units_norm),
-            "ozone": 310.0,
+            "ozone": float(cur.ozone if cur.ozone is not None else 310.0),
         }
         if curr_mmhr > 0.05:
-            currently_obj["precipType"] = "snow" if cur.temperature <= 0.5 else "rain"
+            currently_obj["precipType"] = curr_pt
         if nearest_storm_dist is not None:
             currently_obj["nearestStormDistance"] = nearest_storm_dist
             currently_obj["nearestStormBearing"] = nearest_storm_bearing or 0
@@ -277,13 +298,15 @@ async def _build_darksky_payload(
     if "minutely" not in excluded:
         payload["minutely"] = {
             "summary": w_resp.nowcast.summaryText if w_resp.nowcast else "Clear for the hour.",
-            "icon": "rain" if any(m["precipIntensity"] > 0 for m in minutely_data) else _darksky_icon(cur.condition, is_day=is_day_now),
+            "icon": curr_pt if (any(m["precipIntensity"] > 0 for m in minutely_data) and curr_pt in ("snow", "sleet")) else ("rain" if any(m["precipIntensity"] > 0 for m in minutely_data) else _darksky_icon(cur.condition, is_day=is_day_now)),
             "data": minutely_data,
         }
 
     if "hourly" not in excluded:
         hourly_data: List[Dict[str, Any]] = []
-        for h in w_resp.hourly:
+        max_h_count = 168 if (extend and extend.lower().strip() == "hourly") else 48
+        target_hours = w_resp.hourly[:max_h_count]
+        for h in target_hours:
             h_ts = int(h.time.timestamp())
             h_is_day = _is_daytime_ts(h_ts, sr_today_ts, ss_today_ts)
             h_prob = round(h.precipitationChance / 100.0, 2)
@@ -297,11 +320,12 @@ async def _build_darksky_payload(
             h_cloud = h.cloudCover if h.cloudCover is not None else (75 if h.condition != WeatherCondition.CLEAR else 15)
             h_uv = h.uvIndex if h.uvIndex is not None else (cur.uvIndex if h_is_day else 0.0)
             h_vis = h.visibilityKm if h.visibilityKm is not None else cur.visibility
+            h_pt = h.precipType or ("snow" if h.temperature <= 0.5 else "rain")
 
             h_item: Dict[str, Any] = {
                 "time": h_ts,
                 "summary": h.condition.value,
-                "icon": _darksky_icon(h.condition, is_day=h_is_day, wind_kmh=h.windSpeed),
+                "icon": _darksky_icon(h.condition, is_day=h_is_day, wind_kmh=h.windSpeed, precip_type=h_pt if h_mmhr > 0 else None),
                 "precipIntensity": _convert_precip_rate(h_mmhr, units_norm),
                 "precipProbability": h_prob,
                 "temperature": _convert_temp(h.temperature, units_norm),
@@ -317,12 +341,14 @@ async def _build_darksky_payload(
                 "visibility": _convert_dist(h_vis, units_norm),
             }
             if h_mmhr > 0:
-                h_item["precipType"] = "snow" if h.temperature <= 0.5 else "rain"
+                h_item["precipType"] = h_pt
+                if h_pt in ("snow", "sleet") and h.snowAccumulationCm and h.snowAccumulationCm > 0:
+                    h_item["precipAccumulation"] = round(h.snowAccumulationCm / 2.54, 2) if units_norm in ("us", "imperial", "inch") else round(h.snowAccumulationCm, 2)
             hourly_data.append(h_item)
 
         payload["hourly"] = {
             "summary": f"Multi-model consensus ({cur.dominantModel}) for the next {len(hourly_data)} hours.",
-            "icon": _darksky_icon(cur.condition, is_day=is_day_now, wind_kmh=cur.windSpeed),
+            "icon": _darksky_icon(cur.condition, is_day=is_day_now, wind_kmh=cur.windSpeed, precip_type=curr_pt if curr_mmhr > 0.05 else None),
             "data": hourly_data,
         }
 
@@ -331,14 +357,12 @@ async def _build_darksky_payload(
         for d_idx, d in enumerate(w_resp.daily):
             d_ts = int(d.date.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
             d_prob = round(d.precipitationChance / 100.0, 2)
-            # Average hourly rate from daily sum (or probability fallback)
             d_mmhr = round(d.precipSumMm / 8.0, 2) if d.precipSumMm > 0 else (round(d_prob * 1.8, 2) if d_prob >= 0.30 else 0.0)
             t_min = _convert_temp(d.minTemperature, units_norm)
             t_max = _convert_temp(d.maxTemperature, units_norm)
             sr_ts = _parse_iso_to_ts(d.sunrise, d_ts + 6 * 3600)
             ss_ts = _parse_iso_to_ts(d.sunset, d_ts + 18 * 3600)
 
-            # Slice corresponding 24h window from w_resp.hourly when available for true daily aggregates
             day_hours = w_resp.hourly[d_idx * 24 : (d_idx + 1) * 24]
             if day_hours:
                 avg_hum = round(sum((h.humidity or cur.humidity) for h in day_hours) / len(day_hours) / 100.0, 2)
@@ -346,6 +370,25 @@ async def _build_darksky_payload(
                 avg_cloud = round(sum((h.cloudCover or 50) for h in day_hours) / len(day_hours) / 100.0, 2)
                 avg_dew_c = sum((h.dewPoint if h.dewPoint is not None else d.minTemperature) for h in day_hours) / len(day_hours)
                 max_gust_kmh = max((h.windGusts or h.windSpeed * 1.25) for h in day_hours)
+
+                h_t_max = max(day_hours, key=lambda h: h.temperature)
+                h_t_min = min(day_hours, key=lambda h: h.temperature)
+                t_high_val = _convert_temp(h_t_max.temperature, units_norm)
+                t_high_time = int(h_t_max.time.timestamp())
+                t_low_val = _convert_temp(h_t_min.temperature, units_norm)
+                t_low_time = int(h_t_min.time.timestamp())
+
+                h_fl_max = max(day_hours, key=lambda h: (h.feelsLike if h.feelsLike is not None else h.temperature))
+                h_fl_min = min(day_hours, key=lambda h: (h.feelsLike if h.feelsLike is not None else h.temperature))
+                app_high_val = _convert_temp(h_fl_max.feelsLike if h_fl_max.feelsLike is not None else h_fl_max.temperature, units_norm)
+                app_high_time = int(h_fl_max.time.timestamp())
+                app_low_val = _convert_temp(h_fl_min.feelsLike if h_fl_min.feelsLike is not None else h_fl_min.temperature, units_norm)
+                app_low_time = int(h_fl_min.time.timestamp())
+
+                h_pr_max = max(day_hours, key=lambda h: float(h.precipMm or 0.0))
+                precip_max_time = int(h_pr_max.time.timestamp())
+                h_uv_max = max(day_hours, key=lambda h: float(h.uvIndex or 0.0))
+                uv_max_time = int(h_uv_max.time.timestamp())
             else:
                 avg_hum = round(cur.humidity / 100.0, 2)
                 avg_press = round(cur.airPressure, 2)
@@ -353,41 +396,72 @@ async def _build_darksky_payload(
                 avg_dew_c = d.minTemperature - 2.0
                 max_gust_kmh = d.windSpeedMax * 1.3
 
-            daily_data.append(
-                {
-                    "time": d_ts,
-                    "summary": d.condition.value,
-                    "icon": _darksky_icon(d.condition, is_day=True, wind_kmh=d.windSpeedMax),
-                    "sunriseTime": sr_ts,
-                    "sunsetTime": ss_ts,
-                    "moonPhase": _calc_moon_phase(d.date),
-                    "precipIntensity": _convert_precip_rate(d_mmhr, units_norm),
-                    "precipIntensityMax": _convert_precip_rate(max(d_mmhr * 2.2, d.precipSumMm / 3.0), units_norm),
-                    "precipAccumulation": round(d.precipSumMm / 25.4, 2) if units_norm == "us" else round(d.precipSumMm / 10.0, 2),
-                    "precipProbability": d_prob,
-                    "precipType": "snow" if d.maxTemperature <= 0.5 else "rain",
-                    "temperatureHigh": t_max,
-                    "temperatureHighTime": sr_ts + int((ss_ts - sr_ts) * 0.72),
-                    "temperatureLow": t_min,
-                    "temperatureLowTime": sr_ts - 1800,
-                    "apparentTemperatureHigh": t_max,
-                    "apparentTemperatureLow": t_min,
-                    "temperatureMin": t_min,
-                    "temperatureMax": t_max,
-                    "dewPoint": _convert_temp(avg_dew_c, units_norm),
-                    "humidity": avg_hum,
-                    "pressure": avg_press,
-                    "windSpeed": _convert_wind(d.windSpeedMax, units_norm),
-                    "windGust": _convert_wind(max_gust_kmh, units_norm),
-                    "windBearing": d.windDirectionDominant,
-                    "cloudCover": avg_cloud,
-                    "uvIndex": d.uvIndexMax,
-                    "visibility": _convert_dist(cur.visibility, units_norm),
-                }
-            )
+                t_high_val = t_max
+                t_high_time = sr_ts + int((ss_ts - sr_ts) * 0.72)
+                t_low_val = t_min
+                t_low_time = sr_ts - 1800
+                app_high_val = t_max
+                app_high_time = t_high_time
+                app_low_val = t_min
+                app_low_time = t_low_time
+                precip_max_time = d_ts + 12 * 3600
+                uv_max_time = sr_ts + int((ss_ts - sr_ts) * 0.50)
+
+            d_pt = d.precipType or ("snow" if d.maxTemperature <= 0.5 else "rain")
+            d_icon = _darksky_icon(d.condition, is_day=True, wind_kmh=d.windSpeedMax, precip_type=d_pt if d_mmhr > 0 else None)
+
+            d_dict: Dict[str, Any] = {
+                "time": d_ts,
+                "summary": d.condition.value,
+                "icon": d_icon,
+                "sunriseTime": sr_ts,
+                "sunsetTime": ss_ts,
+                "moonPhase": _calc_moon_phase(d.date),
+                "precipIntensity": _convert_precip_rate(d_mmhr, units_norm),
+                "precipIntensityMax": _convert_precip_rate(max(d_mmhr * 2.2, d.precipSumMm / 3.0), units_norm),
+                "precipIntensityMaxTime": precip_max_time,
+                "precipProbability": d_prob,
+                "temperatureHigh": t_high_val,
+                "temperatureHighTime": t_high_time,
+                "temperatureLow": t_low_val,
+                "temperatureLowTime": t_low_time,
+                "apparentTemperatureHigh": app_high_val,
+                "apparentTemperatureHighTime": app_high_time,
+                "apparentTemperatureLow": app_low_val,
+                "apparentTemperatureLowTime": app_low_time,
+                "temperatureMin": t_min,
+                "temperatureMax": t_max,
+                "dewPoint": _convert_temp(avg_dew_c, units_norm),
+                "humidity": avg_hum,
+                "pressure": avg_press,
+                "windSpeed": _convert_wind(d.windSpeedMax, units_norm),
+                "windGust": _convert_wind(max_gust_kmh, units_norm),
+                "windBearing": d.windDirectionDominant,
+                "cloudCover": avg_cloud,
+                "uvIndex": d.uvIndexMax,
+                "uvIndexTime": uv_max_time,
+                "visibility": _convert_dist(cur.visibility, units_norm),
+                "ozone": float(cur.ozone if cur.ozone is not None else 310.0),
+            }
+
+            if d_mmhr > 0 or d.precipSumMm > 0:
+                d_dict["precipType"] = d_pt
+
+            # Only emit precipAccumulation when precipType in ("snow", "sleet")
+            if d_pt in ("snow", "sleet"):
+                snow_cm = (
+                    d.snowAccumulationCm
+                    if (d.snowAccumulationCm is not None and d.snowAccumulationCm > 0)
+                    else ((d.precipSumMm / 10.0) * (d.snowToLiquidRatio or 10.0) if d.precipSumMm > 0 else 0.0)
+                )
+                if snow_cm > 0.01:
+                    d_dict["precipAccumulation"] = round(snow_cm / 2.54, 2) if units_norm in ("us", "imperial", "inch") else round(snow_cm, 2)
+
+            daily_data.append(d_dict)
+
         payload["daily"] = {
             "summary": "10-day MOS bias-corrected multi-model outlook.",
-            "icon": _darksky_icon(cur.condition, is_day=True),
+            "icon": _darksky_icon(cur.condition, is_day=True, precip_type=curr_pt if curr_mmhr > 0.05 else None),
             "data": daily_data,
         }
 
@@ -441,9 +515,10 @@ async def get_darksky_forecast_with_key(
     coords: str = Path(..., description="Comma-separated latitude,longitude (e.g. 40.7128,-74.0060)"),
     units: str = Query("us", description="Units system: us, si, ca, uk2, or auto"),
     exclude: Optional[str] = Query(None, description="Comma-separated blocks to exclude (currently,minutely,hourly,daily,alerts,flags)"),
+    extend: Optional[str] = Query(None, description="When set to 'hourly', extends hourly forecast to 168 hours (7 days)"),
 ):
     lat, lon = _parse_lat_lon(coords)
-    return await _build_darksky_payload(lat=lat, lon=lon, units=units, exclude=exclude)
+    return await _build_darksky_payload(lat=lat, lon=lon, units=units, exclude=exclude, extend=extend)
 
 
 @router.get(
@@ -451,13 +526,41 @@ async def get_darksky_forecast_with_key(
     summary="Dark Sky / Pirate Weather v1 Standard Endpoint (Keyless)",
     tags=["Standardized Interop (Dark Sky / Open-Meteo / OWM / RainViewer / TileJSON)"],
 )
+@router.get(
+    "/api/v1/standard/darksky/{coords}",
+    summary="Dark Sky / Pirate Weather v1 Standard Endpoint (Standard Path with Coords)",
+    tags=["Standardized Interop (Dark Sky / Open-Meteo / OWM / RainViewer / TileJSON)"],
+)
 async def get_darksky_forecast_keyless(
     coords: str = Path(..., description="Comma-separated latitude,longitude (e.g. 40.7128,-74.0060)"),
     units: str = Query("us", description="Units system: us, si, ca, uk2, or auto"),
     exclude: Optional[str] = Query(None, description="Comma-separated blocks to exclude"),
+    extend: Optional[str] = Query(None, description="When set to 'hourly', extends hourly forecast to 168 hours (7 days)"),
 ):
     lat, lon = _parse_lat_lon(coords)
-    return await _build_darksky_payload(lat=lat, lon=lon, units=units, exclude=exclude)
+    return await _build_darksky_payload(lat=lat, lon=lon, units=units, exclude=exclude, extend=extend)
+
+
+@router.get(
+    "/api/v1/standard/darksky",
+    summary="Dark Sky / Pirate Weather Standard Endpoint (Query Params)",
+    tags=["Standardized Interop (Dark Sky / Open-Meteo / OWM / RainViewer / TileJSON)"],
+)
+async def get_darksky_forecast_query(
+    lat: Optional[float] = Query(None, ge=-90.0, le=90.0, description="Latitude"),
+    lon: Optional[float] = Query(None, ge=-180.0, le=180.0, description="Longitude"),
+    coords: Optional[str] = Query(None, description="Comma-separated latitude,longitude (alternative to lat/lon)"),
+    units: str = Query("us", description="Units system: us, si, ca, uk2, or auto"),
+    exclude: Optional[str] = Query(None, description="Comma-separated blocks to exclude"),
+    extend: Optional[str] = Query(None, description="When set to 'hourly', extends hourly forecast to 168 hours (7 days)"),
+):
+    if coords:
+        c_lat, c_lon = _parse_lat_lon(coords)
+    elif lat is not None and lon is not None:
+        c_lat, c_lon = lat, lon
+    else:
+        raise HTTPException(status_code=400, detail="Must provide either coords (lat,lon) or lat and lon query parameters.")
+    return await _build_darksky_payload(lat=c_lat, lon=c_lon, units=units, exclude=exclude, extend=extend)
 
 
 @router.get(
