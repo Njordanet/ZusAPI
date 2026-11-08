@@ -16,6 +16,7 @@ rsync -avz --delete \
   --exclude '.git' \
   --exclude '.pytest_cache' \
   --exclude 'venv' \
+  --exclude '.venv' \
   --exclude '.env' \
   ./ "${PANDA_HOST}:${REMOTE_DIR}/"
 
