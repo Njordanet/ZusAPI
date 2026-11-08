@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import math
 from collections import OrderedDict
@@ -1291,12 +1292,31 @@ class DopplerRadarService:
         if not self._frames:
             await self.refresh_dataset()
 
-        # Resolve "latest" or unknown frame_id to latest live frame
+        # Resolve exact frame_id, semantic offset aliases (past_45m, nowcast_p15m, latest), or fallback to latest live frame
         frame = self._frames.get(frame_id)
         if frame is None and self._frames:
-            live_candidates = [f for f in self._frames.values() if not f.is_future]
-            frame = live_candidates[-1] if live_candidates else list(self._frames.values())[-1]
-            frame_id = frame.frame_id
+            target_off: Optional[int] = None
+            if frame_id == "latest":
+                target_off = 0
+            elif frame_id.startswith("past_") and frame_id.endswith("m"):
+                try:
+                    target_off = -int(frame_id[len("past_") : -1])
+                except ValueError:
+                    target_off = None
+            elif frame_id.startswith("nowcast_p") and frame_id.endswith("m"):
+                try:
+                    target_off = int(frame_id[len("nowcast_p") : -1])
+                except ValueError:
+                    target_off = None
+
+            if target_off is not None:
+                best_f = min(self._frames.values(), key=lambda f: abs(f.offset_minutes - target_off))
+                frame = best_f
+                frame_id = best_f.frame_id
+            else:
+                live_candidates = [f for f in self._frames.values() if not f.is_future]
+                frame = live_candidates[-1] if live_candidates else list(self._frames.values())[-1]
+                frame_id = frame.frame_id
 
         cache_key = f"{frame_id}:{z}:{x}:{y}"
         if cache_key in self._tile_cache:
@@ -1613,6 +1633,304 @@ class DopplerRadarService:
             minuteByMinuteRates=smoothed_61,
         )
 
+    async def _prewarm_viewport_tiles(self, lat: float, lon: float, z: int = 8) -> None:
+        """Pre-slices and caches the 3x3 viewport tile neighborhood across all timeline frames in RAM."""
+        if not (self.LAT_MIN <= lat <= self.LAT_MAX and self.LON_MIN <= lon <= self.LON_MAX):
+            return
+        try:
+            n = 2.0 ** z
+            cx = int(math.floor(((lon + 180.0) / 360.0) * n))
+            lat_rad = math.radians(max(-85.0, min(85.0, lat)))
+            cy = int(math.floor(((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0) * n))
+            frame_ids = list(self._frames.keys())
+            for fid in frame_ids:
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        tx, ty = cx + dx, cy + dy
+                        if 0 <= tx < int(n) and 0 <= ty < int(n):
+                            ck = f"{fid}:{z}:{tx}:{ty}"
+                            if ck not in self._tile_cache:
+                                await self.get_tile_png(fid, z, tx, ty)
+        except Exception:
+            pass
+
+    def _build_regional_pack_sync(
+        self, snap_lat: float, snap_lon: float, size_px: int = 560
+    ) -> Dict[str, Any]:
+        """
+        Slices all 14 timeline frames (-45m to +2h) in a single vectorized pass into continuous
+        560x560 WebMercator regional PNG images (~830km x 830km span) with zero tile seams.
+        """
+        u_c = (snap_lon + 180.0) / 360.0
+        lat_rad = math.radians(max(-80.0, min(80.0, snap_lat)))
+        v_c = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0
+
+        half_span = 0.0135  # ~9.7 deg lon x ~7.2 deg lat (~800km x 800km regional box)
+        u_min, u_max = u_c - half_span, u_c + half_span
+        v_min, v_max = v_c - half_span, v_c + half_span
+
+        lon_west = u_min * 360.0 - 180.0
+        lon_east = u_max * 360.0 - 180.0
+        lat_north = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * v_min))))
+        lat_south = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * v_max))))
+
+        t = (np.arange(size_px, dtype=np.float64) + 0.5) / float(size_px)
+        u_arr = u_min + t * (u_max - u_min)
+        v_arr = v_min + t * (v_max - v_min)
+
+        lons = u_arr * 360.0 - 180.0
+        merc_y = math.pi * (1.0 - 2.0 * v_arr)
+        lats = np.degrees(np.arctan(np.sinh(merc_y)))
+
+        base_cols = (lons - self.LON_MIN) / self.STEP_DEG
+        base_rows = (self.LAT_MAX - lats) / self.STEP_DEG
+
+        # Precompute trajectory grid bilinear weights once for all frames
+        sample_grid = next(iter(self._cum_drow_fields.values()), None)
+        if sample_grid is not None:
+            th, tw = sample_grid.shape
+        else:
+            th, tw = 110, 245
+
+        fy = np.clip((base_rows / (self.GRID_H - 1)) * (th - 1), 0.0, th - 1.001)
+        fx = np.clip((base_cols / (self.GRID_W - 1)) * (tw - 1), 0.0, tw - 1.001)
+        iy = fy.astype(np.int32)
+        ix = fx.astype(np.int32)
+        dy = (fy - iy)[:, None]
+        dx = (fx - ix)[None, :]
+        iy0 = iy[:, None]
+        iy1 = (iy + 1)[:, None]
+        ix0 = ix[None, :]
+        ix1 = (ix + 1)[None, :]
+
+        frames_b64: Dict[str, str] = {}
+        frames_meta: List[Dict[str, Any]] = []
+
+        for f in self._frames.values():
+            fut_mult = (f.offset_minutes / 15.0) if (f.is_future and f.offset_minutes > 0) else 0.0
+            step_idx = max(1, min(8, int(round(fut_mult)))) if fut_mult > 0.0 else 0
+
+            if (
+                step_idx > 0
+                and step_idx in self._cum_drow_fields
+                and step_idx in self._cum_dcol_fields
+            ):
+                cum_dr_grid = self._cum_drow_fields[step_idx]
+                cum_dc_grid = self._cum_dcol_fields[step_idx]
+                drow_2d = (
+                    cum_dr_grid[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                    + cum_dr_grid[iy0, ix1] * (1.0 - dy) * dx
+                    + cum_dr_grid[iy1, ix0] * dy * (1.0 - dx)
+                    + cum_dr_grid[iy1, ix1] * dy * dx
+                )
+                dcol_2d = (
+                    cum_dc_grid[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                    + cum_dc_grid[iy0, ix1] * (1.0 - dy) * dx
+                    + cum_dc_grid[iy1, ix0] * dy * (1.0 - dx)
+                    + cum_dc_grid[iy1, ix1] * dy * dx
+                )
+                rows_2d = np.floor(base_rows[:, None] - drow_2d).astype(np.int32)
+                cols_2d = np.floor(base_cols[None, :] - dcol_2d).astype(np.int32)
+                valid_mask = (
+                    (rows_2d >= 0)
+                    & (rows_2d < self.GRID_H)
+                    & (cols_2d >= 0)
+                    & (cols_2d < self.GRID_W)
+                )
+                if not np.any(valid_mask):
+                    frames_b64[f.frame_id] = ""
+                    frames_meta.append(
+                        {
+                            "frameId": f.frame_id,
+                            "timestamp": f.timestamp,
+                            "label": f.label,
+                            "offsetMinutes": f.offset_minutes,
+                            "isFuture": f.is_future,
+                        }
+                    )
+                    continue
+                r_clip = np.clip(rows_2d, 0, self.GRID_H - 1)
+                c_clip = np.clip(cols_2d, 0, self.GRID_W - 1)
+                sub = f.grid[r_clip, c_clip].copy()
+
+                if step_idx in self._hrrr_trend_fields:
+                    tr_grid = self._hrrr_trend_fields[step_idx]
+                    trend_2d = (
+                        tr_grid[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                        + tr_grid[iy0, ix1] * (1.0 - dy) * dx
+                        + tr_grid[iy1, ix0] * dy * (1.0 - dx)
+                        + tr_grid[iy1, ix1] * dy * dx
+                    )
+                    active_echo = sub >= 86
+                    if np.any(active_echo):
+                        mod = np.clip(sub.astype(np.float32) + trend_2d, 84.0, 195.0).astype(np.uint8)
+                        sub = np.where(active_echo, mod, sub)
+
+                if not np.all(valid_mask):
+                    sub[~valid_mask] = 0
+            else:
+                cols = np.floor(base_cols).astype(np.int32) - int(f.advect_dcol)
+                rows = np.floor(base_rows).astype(np.int32) - int(f.advect_drow)
+                valid_r = (rows >= 0) & (rows < self.GRID_H)
+                valid_c = (cols >= 0) & (cols < self.GRID_W)
+                if not np.any(valid_r) or not np.any(valid_c):
+                    frames_b64[f.frame_id] = ""
+                    frames_meta.append(
+                        {
+                            "frameId": f.frame_id,
+                            "timestamp": f.timestamp,
+                            "label": f.label,
+                            "offsetMinutes": f.offset_minutes,
+                            "isFuture": f.is_future,
+                        }
+                    )
+                    continue
+                r_clip = np.clip(rows, 0, self.GRID_H - 1)
+                c_clip = np.clip(cols, 0, self.GRID_W - 1)
+                sub = f.grid[np.ix_(r_clip, c_clip)].copy()
+                if not np.all(valid_r):
+                    sub[~valid_r, :] = 0
+                if not np.all(valid_c):
+                    sub[:, ~valid_c] = 0
+
+            if f.decay_indices > 0:
+                core_mask = sub > 130
+                if np.any(core_mask):
+                    sub[core_mask] = np.maximum(
+                        126, sub[core_mask].astype(np.int16) - f.decay_indices * 2
+                    ).astype(np.uint8)
+
+            if int(sub.max()) < 88:
+                frames_b64[f.frame_id] = ""
+            else:
+                padded = np.pad(sub, 1, mode="edge")
+                active_nbrs = (padded >= 88).astype(np.uint8)
+                nbr_sum = (
+                    active_nbrs[:-2, :-2] + active_nbrs[:-2, 1:-1] + active_nbrs[:-2, 2:]
+                    + active_nbrs[1:-1, :-2] + active_nbrs[1:-1, 1:-1] + active_nbrs[1:-1, 2:]
+                    + active_nbrs[2:, :-2] + active_nbrs[2:, 1:-1] + active_nbrs[2:, 2:]
+                )
+                sub = np.where((sub >= 86) & (nbr_sum >= 2), sub, 0)
+                img = Image.fromarray(sub, mode="P")
+                img.putpalette(ZUS_PALETTE_RGB)
+                img.info["transparency"] = ZUS_PALETTE_ALPHA
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=False)
+                frames_b64[f.frame_id] = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            frames_meta.append(
+                {
+                    "frameId": f.frame_id,
+                    "timestamp": f.timestamp,
+                    "label": f.label,
+                    "offsetMinutes": f.offset_minutes,
+                    "isFuture": f.is_future,
+                }
+            )
+
+        return {
+            "inConus": True,
+            "bounds": [
+                [round(lat_south, 5), round(lon_west, 5)],
+                [round(lat_north, 5), round(lon_east, 5)],
+            ],
+            "sizePx": size_px,
+            "frames": frames_meta,
+            "images": frames_b64,
+        }
+
+    async def get_regional_pack(self, lat: float, lon: float) -> Dict[str, Any]:
+        if not self._frames:
+            await self.refresh_dataset()
+
+        if not (self.LAT_MIN <= lat <= self.LAT_MAX and self.LON_MIN <= lon <= self.LON_MAX):
+            return {"inConus": False, "bounds": None, "frames": [], "images": {}}
+
+        snap_lat = round(lat * 4.0) / 4.0
+        snap_lon = round(lon * 4.0) / 4.0
+        live_fid = next((f.frame_id for f in reversed(list(self._frames.values())) if not f.is_future), "latest")
+        cache_key = f"regpack:{live_fid}:{snap_lat:.2f}:{snap_lon:.2f}"
+
+        if not hasattr(self, "_regional_pack_cache"):
+            self._regional_pack_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+
+        if cache_key in self._regional_pack_cache:
+            self._regional_pack_cache.move_to_end(cache_key)
+            return self._regional_pack_cache[cache_key]
+
+        pack = await asyncio.to_thread(self._build_regional_pack_sync, snap_lat, snap_lon, 560)
+        self._regional_pack_cache[cache_key] = pack
+        if len(self._regional_pack_cache) > 40:
+            self._regional_pack_cache.popitem(last=False)
+        return pack
+
+    async def get_viewport_tile_pack(
+        self, lat: float, lon: float, z_levels: Tuple[int, ...] = (7, 8), radius: int = 2
+    ) -> Dict[str, Any]:
+        """
+        Returns a single-request atomic tile bundle containing all viewport WebMercator tiles
+        across all timeline frames in RAM (encoded as base64 PNG strings, or "" for empty tiles).
+        Eliminates 140+ sequential HTTP tile requests and guarantees 0-flicker instant playback.
+        """
+        if not self._frames:
+            await self.refresh_dataset()
+
+        tiles_out: Dict[str, str] = {}
+        aliases: Dict[str, str] = {}
+        if self._frames:
+            for alias_id, off in [
+                ("past_45m", -45),
+                ("past_30m", -30),
+                ("past_15m", -15),
+                ("latest", 0),
+                ("nowcast_p15m", 15),
+                ("nowcast_p30m", 30),
+                ("nowcast_p45m", 45),
+                ("nowcast_p60m", 60),
+                ("nowcast_p75m", 75),
+                ("nowcast_p90m", 90),
+                ("nowcast_p105m", 105),
+                ("nowcast_p120m", 120),
+            ]:
+                best_f = min(self._frames.values(), key=lambda f: abs(f.offset_minutes - off))
+                aliases[alias_id] = best_f.frame_id
+
+        if not (self.LAT_MIN <= lat <= self.LAT_MAX and self.LON_MIN <= lon <= self.LON_MAX):
+            return {"inConus": False, "aliases": aliases, "tiles": tiles_out}
+
+        lat_rad = math.radians(max(-85.0, min(85.0, lat)))
+        frame_ids = list(self._frames.keys())
+
+        for z in z_levels:
+            n = 2.0 ** z
+            cx = int(math.floor(((lon + 180.0) / 360.0) * n))
+            cy = int(
+                math.floor(
+                    ((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0) * n
+                )
+            )
+            for fid in frame_ids:
+                for dy in range(-radius, radius + 1):
+                    for dx in range(-radius, radius + 1):
+                        tx, ty = cx + dx, cy + dy
+                        if 0 <= tx < int(n) and 0 <= ty < int(n):
+                            png_bytes = await self.get_tile_png(fid, z, tx, ty)
+                            key = f"{fid}:{z}:{tx}:{ty}"
+                            if png_bytes == EMPTY_TILE_PNG or len(png_bytes) <= 120:
+                                tiles_out[key] = ""
+                            else:
+                                tiles_out[key] = base64.b64encode(png_bytes).decode("ascii")
+
+        return {
+            "inConus": True,
+            "center": [round(lat, 4), round(lon, 4)],
+            "zLevels": list(z_levels),
+            "radius": radius,
+            "frameIds": frame_ids,
+            "aliases": aliases,
+            "tiles": tiles_out,
+        }
+
     async def get_manifest(
         self, lat: Optional[float] = None, lon: Optional[float] = None, base_url: str = ""
     ) -> RadarManifestResponse:
@@ -1637,6 +1955,7 @@ class DopplerRadarService:
         local_telemetry: Optional[RadarLocalTelemetry] = None
         if lat is not None and lon is not None:
             local_telemetry = await self.get_point_telemetry(lat, lon)
+            asyncio.create_task(self._prewarm_viewport_tiles(lat, lon, z=8))
 
         unique_grids = {id(f.grid): f.grid for f in self._frames.values()}
         ram_mb = round(sum(g.nbytes for g in unique_grids.values()) / (1024 * 1024), 1)

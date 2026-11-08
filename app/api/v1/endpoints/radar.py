@@ -34,6 +34,29 @@ async def get_radar_point(
     return await doppler_service.get_point_telemetry(lat=lat, lon=lon)
 
 
+@router.get(
+    "/radar/regional_pack",
+    summary="Single-request continuous 560x560 WebMercator regional radar images for all 14 frames (zero tile seams)",
+)
+async def get_radar_regional_pack(
+    lat: float = Query(..., ge=-90.0, le=90.0, description="Center latitude"),
+    lon: float = Query(..., ge=-180.0, le=180.0, description="Center longitude"),
+):
+    return await doppler_service.get_regional_pack(lat=lat, lon=lon)
+
+
+@router.get(
+    "/radar/viewport_pack",
+    summary="Single-request atomic bundle of all viewport Doppler tiles across all 14 timeline frames",
+)
+async def get_radar_viewport_pack(
+    lat: float = Query(..., ge=-90.0, le=90.0, description="Center latitude"),
+    lon: float = Query(..., ge=-180.0, le=180.0, description="Center longitude"),
+    radius: int = Query(2, ge=1, le=3, description="Tile radius around center (2 = 5x5 grid)"),
+):
+    return await doppler_service.get_viewport_tile_pack(lat=lat, lon=lon, z_levels=(7, 8), radius=radius)
+
+
 @router.post(
     "/radar/backfill",
     summary="Trigger historical offline gap detection & IEM NEXRAD archive backfill",

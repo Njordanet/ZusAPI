@@ -4,7 +4,7 @@ from pathlib import Path
 
 class Settings(BaseSettings):
     app_name: str = "ZüsAPI"
-    app_version: str = "1.1.0"
+    app_version: str = "1.2.0"
     app_env: str = "production"
     debug: bool = False
     
