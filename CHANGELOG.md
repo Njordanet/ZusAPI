@@ -2,6 +2,14 @@
 
 All notable changes to `ZusAPI` will be documented in this file.
 
+## [v1.4.1] - 2026-11-09
+
+### Location-Local Sunrise/Sunset Ephemeris & Extended Atmospheric Telemetry (`app/models/weather.py` & `app/services/weather_provider.py`)
+- **Location-Local Sunrise/Sunset Conversion & NOAA Ephemeris Fallback (`app/services/weather_provider.py`)**:
+  - Fixed UTC dislocation in daily `sunrise`/`sunset` strings by shifting Open-Meteo UTC timestamps by `utc_offset_seconds` (`dt_utc + timedelta(seconds=utc_offset_sec)`), indexing by local calendar date, and validating/backfilling with `calc_local_sunrise_sunset_iso` (NOAA solar ephemeris equations).
+- **Extended Current & Hourly Telemetry (`app/models/weather.py` & `app/services/weather_provider.py`)**:
+  - Added `isDay`, `shortwaveRadiation`, `vpdKpa`, `cloudCoverLow`, `cloudCoverMid`, `cloudCoverHigh`, `freezingLevelMeters`, `treePollen`, `grassPollen`, and `weedPollen` (CAMS `alder_pollen`, `birch_pollen`, `olive_pollen`, `grass_pollen`, `mugwort_pollen`, `ragweed_pollen`).
+
 ## [v1.4.0] - 2026-11-09
 
 ### Full End-to-End Recursive Alignment Engine & Per-Model Bias-Corrected Telemetry

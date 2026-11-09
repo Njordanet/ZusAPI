@@ -164,6 +164,52 @@ def calc_dobson_units(lat: float, surface_ozone_ugm3: Optional[float] = None) ->
     return round(float(du), 1)
 
 
+def calc_local_sunrise_sunset_iso(
+    lat: float, lon: float, local_date: datetime, utc_offset_sec: int
+) -> Tuple[str, str]:
+    """
+    Computes astronomical local sunrise and sunset ISO strings ('YYYY-MM-DDTHH:MM')
+    using NOAA solar ephemeris equations for the given latitude, longitude, local date,
+    and UTC offset in seconds.
+    """
+    doy = local_date.timetuple().tm_yday
+    gamma = (2.0 * math.pi / 365.0) * (doy - 1)
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2.0 * gamma)
+        - 0.040849 * math.sin(2.0 * gamma)
+    )
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(gamma)
+        + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2.0 * gamma)
+        + 0.000907 * math.sin(2.0 * gamma)
+        - 0.002697 * math.cos(3.0 * gamma)
+        + 0.00148 * math.sin(3.0 * gamma)
+    )
+    lat_rad = math.radians(max(-89.5, min(89.5, lat)))
+    zenith_rad = math.radians(90.833)
+    cos_ha = (math.cos(zenith_rad) / (math.cos(lat_rad) * math.cos(decl))) - (
+        math.tan(lat_rad) * math.tan(decl)
+    )
+    cos_ha = max(-1.0, min(1.0, cos_ha))
+    ha_deg = math.degrees(math.acos(cos_ha))
+
+    tz_min = utc_offset_sec / 60.0
+    rise_min = int(round(720.0 - 4.0 * (lon + ha_deg) - eqtime + tz_min)) % 1440
+    set_min = int(round(720.0 - 4.0 * (lon - ha_deg) - eqtime + tz_min)) % 1440
+    if set_min <= rise_min:
+        rise_min, set_min = 390, 1110
+
+    date_prefix = local_date.strftime("%Y-%m-%d")
+    sr_str = f"{date_prefix}T{rise_min // 60:02d}:{rise_min % 60:02d}"
+    ss_str = f"{date_prefix}T{set_min // 60:02d}:{set_min % 60:02d}"
+    return sr_str, ss_str
+
+
 class WeatherProviderService:
     def __init__(self):
         self._cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
@@ -187,13 +233,16 @@ class WeatherProviderService:
             "current": (
                 "temperature_2m,relative_humidity_2m,apparent_temperature,dew_point_2m,"
                 "weather_code,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,"
-                "wind_gusts_10m,cloud_cover,precipitation,cape"
+                "wind_gusts_10m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,"
+                "precipitation,cape,shortwave_radiation,vapour_pressure_deficit,is_day"
             ),
             "minutely_15": "precipitation,weather_code",
             "hourly": (
                 "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation_probability,"
                 "precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,"
-                "uv_index,dew_point_2m,cloud_cover,visibility,pressure_msl,cape,lifted_index"
+                "uv_index,dew_point_2m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,"
+                "visibility,pressure_msl,cape,lifted_index,shortwave_radiation,"
+                "vapour_pressure_deficit,freezing_level_height,is_day"
             ),
             "daily": (
                 "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,"
@@ -213,14 +262,26 @@ class WeatherProviderService:
 
     async def _fetch_air_quality_and_tz(
         self, client: httpx.AsyncClient, lat: float, lon: float
-    ) -> Tuple[Optional[int], Optional[float], Optional[float], str, int]:
+    ) -> Tuple[
+        Optional[int],
+        Optional[float],
+        Optional[float],
+        str,
+        int,
+        Optional[float],
+        Optional[float],
+        Optional[float],
+    ]:
         default_offset = int(round(lon / 15.0)) * 3600
         default_ozone = calc_dobson_units(lat, None)
         try:
             params = {
                 "latitude": lat,
                 "longitude": lon,
-                "current": "us_aqi,pm2_5,ozone",
+                "current": (
+                    "us_aqi,pm2_5,ozone,alder_pollen,birch_pollen,"
+                    "grass_pollen,mugwort_pollen,olive_pollen,ragweed_pollen"
+                ),
                 "timezone": "auto",
             }
             resp = await client.get(settings.open_meteo_air_quality_url, params=params, timeout=5.0)
@@ -233,16 +294,35 @@ class WeatherProviderService:
                 ozone_du = calc_dobson_units(lat, float(raw_ozone) if raw_ozone is not None else None)
                 tz_name = str(body.get("timezone") or "UTC")
                 utc_off = int(body.get("utc_offset_seconds") or default_offset)
+
+                tree_vals = [
+                    float(curr[k])
+                    for k in ("alder_pollen", "birch_pollen", "olive_pollen")
+                    if curr.get(k) is not None
+                ]
+                grass_vals = [float(curr["grass_pollen"])] if curr.get("grass_pollen") is not None else []
+                weed_vals = [
+                    float(curr[k])
+                    for k in ("mugwort_pollen", "ragweed_pollen")
+                    if curr.get(k) is not None
+                ]
+                tree_pollen = round(max(tree_vals), 1) if tree_vals else None
+                grass_pollen = round(max(grass_vals), 1) if grass_vals else None
+                weed_pollen = round(max(weed_vals), 1) if weed_vals else None
+
                 return (
                     int(aqi) if aqi is not None else None,
                     round(float(pm25), 2) if pm25 is not None else None,
                     ozone_du,
                     tz_name,
                     utc_off,
+                    tree_pollen,
+                    grass_pollen,
+                    weed_pollen,
                 )
         except Exception:
             pass
-        return None, None, default_ozone, "UTC", default_offset
+        return None, None, default_ozone, "UTC", default_offset, None, None, None
 
     async def _fetch_nws_polygon_alerts(
         self, client: httpx.AsyncClient, lat: float, lon: float
@@ -517,7 +597,16 @@ class WeatherProviderService:
 
             (
                 raw_data,
-                (us_aqi, pm25_val, ozone_val, tz_name, utc_offset_sec),
+                (
+                    us_aqi,
+                    pm25_val,
+                    ozone_val,
+                    tz_name,
+                    utc_offset_sec,
+                    tree_pollen_val,
+                    grass_pollen_val,
+                    weed_pollen_val,
+                ),
                 active_alerts,
                 (nearby_stations, station_composite),
                 _,
@@ -575,6 +664,48 @@ class WeatherProviderService:
             li_hourly_arr = (
                 hourly_raw.get("lifted_index_best_match")
                 or hourly_raw.get("lifted_index")
+                or []
+            )
+            sw_hourly_arr = (
+                hourly_raw.get("shortwave_radiation_best_match")
+                or hourly_raw.get("shortwave_radiation_ecmwf_ifs025")
+                or hourly_raw.get("shortwave_radiation")
+                or []
+            )
+            vpd_hourly_arr = (
+                hourly_raw.get("vapour_pressure_deficit_best_match")
+                or hourly_raw.get("vapour_pressure_deficit_ecmwf_ifs025")
+                or hourly_raw.get("vapour_pressure_deficit")
+                or []
+            )
+            flh_hourly_arr = (
+                hourly_raw.get("freezing_level_height_best_match")
+                or hourly_raw.get("freezing_level_height_ecmwf_ifs025")
+                or hourly_raw.get("freezing_level_height")
+                or []
+            )
+            isday_hourly_arr = (
+                hourly_raw.get("is_day_best_match")
+                or hourly_raw.get("is_day_ecmwf_ifs025")
+                or hourly_raw.get("is_day")
+                or []
+            )
+            cclow_hourly_arr = (
+                hourly_raw.get("cloud_cover_low_best_match")
+                or hourly_raw.get("cloud_cover_low_ecmwf_ifs025")
+                or hourly_raw.get("cloud_cover_low")
+                or []
+            )
+            ccmid_hourly_arr = (
+                hourly_raw.get("cloud_cover_mid_best_match")
+                or hourly_raw.get("cloud_cover_mid_ecmwf_ifs025")
+                or hourly_raw.get("cloud_cover_mid")
+                or []
+            )
+            cchigh_hourly_arr = (
+                hourly_raw.get("cloud_cover_high_best_match")
+                or hourly_raw.get("cloud_cover_high_ecmwf_ifs025")
+                or hourly_raw.get("cloud_cover_high")
                 or []
             )
 
@@ -1025,6 +1156,42 @@ class WeatherProviderService:
                 h_slr = calc_snow_liquid_ratio(final_h_temp, h_pt)
                 h_snow_cm = round((final_h_pr_mm / 10.0) * h_slr, 2) if (h_pt in ("snow", "sleet") and final_h_pr_mm > 0) else 0.0
 
+                h_sw = (
+                    round(float(sw_hourly_arr[raw_idx]), 1)
+                    if (raw_idx < len(sw_hourly_arr) and sw_hourly_arr[raw_idx] is not None)
+                    else None
+                )
+                h_vpd = (
+                    round(float(vpd_hourly_arr[raw_idx]), 2)
+                    if (raw_idx < len(vpd_hourly_arr) and vpd_hourly_arr[raw_idx] is not None)
+                    else None
+                )
+                h_flh = (
+                    round(float(flh_hourly_arr[raw_idx]), 0)
+                    if (raw_idx < len(flh_hourly_arr) and flh_hourly_arr[raw_idx] is not None)
+                    else None
+                )
+                h_isday = (
+                    bool(int(isday_hourly_arr[raw_idx]))
+                    if (raw_idx < len(isday_hourly_arr) and isday_hourly_arr[raw_idx] is not None)
+                    else None
+                )
+                h_cclow = (
+                    int(round(float(cclow_hourly_arr[raw_idx])))
+                    if (raw_idx < len(cclow_hourly_arr) and cclow_hourly_arr[raw_idx] is not None)
+                    else None
+                )
+                h_ccmid = (
+                    int(round(float(ccmid_hourly_arr[raw_idx])))
+                    if (raw_idx < len(ccmid_hourly_arr) and ccmid_hourly_arr[raw_idx] is not None)
+                    else None
+                )
+                h_cchigh = (
+                    int(round(float(cchigh_hourly_arr[raw_idx])))
+                    if (raw_idx < len(cchigh_hourly_arr) and cchigh_hourly_arr[raw_idx] is not None)
+                    else None
+                )
+
                 hourly_models.append(
                     HourlyForecastModel(
                         time=dt,
@@ -1069,6 +1236,13 @@ class WeatherProviderService:
                         wetBulbTemperature=h_wb,
                         precipType=h_pt,
                         snowAccumulationCm=h_snow_cm,
+                        isDay=h_isday,
+                        shortwaveRadiation=h_sw,
+                        vpdKpa=h_vpd,
+                        cloudCoverLow=h_cclow,
+                        cloudCoverMid=h_ccmid,
+                        cloudCoverHigh=h_cchigh,
+                        freezingLevelMeters=h_flh,
                     )
                 )
 
@@ -1285,8 +1459,35 @@ class WeatherProviderService:
             d_sr_arr = daily_raw.get("sunrise") or daily_raw.get("sunrise_best_match") or []
             d_ss_arr = daily_raw.get("sunset") or daily_raw.get("sunset_best_match") or []
 
+            # Convert Open-Meteo UTC sunrise/sunset timestamps into location-local clock strings
+            # ('YYYY-MM-DDTHH:MM') indexed by local calendar date so timezones never shift sunrise/sunset.
+            local_sr_by_date: Dict[str, str] = {}
+            local_ss_by_date: Dict[str, str] = {}
+            tz_delta = timedelta(seconds=utc_offset_sec)
+            for raw_sr in d_sr_arr:
+                if raw_sr:
+                    try:
+                        dt_utc = datetime.strptime(str(raw_sr)[:16], "%Y-%m-%dT%H:%M")
+                        dt_loc = dt_utc + tz_delta
+                        local_sr_by_date[dt_loc.strftime("%Y-%m-%d")] = dt_loc.strftime("%Y-%m-%dT%H:%M")
+                    except Exception:
+                        pass
+            for raw_ss in d_ss_arr:
+                if raw_ss:
+                    try:
+                        dt_utc = datetime.strptime(str(raw_ss)[:16], "%Y-%m-%dT%H:%M")
+                        dt_loc = dt_utc + tz_delta
+                        local_ss_by_date[dt_loc.strftime("%Y-%m-%d")] = dt_loc.strftime("%Y-%m-%dT%H:%M")
+                    except Exception:
+                        pass
+
+            local_now = now + tz_delta
+            utc_offset_hrs = int(round(utc_offset_sec / 3600.0))
+
             for d_idx in range(day_limit):
                 dt = now + timedelta(days=d_idx)
+                local_day_dt = local_now + timedelta(days=d_idx)
+                local_date_key = local_day_dt.strftime("%Y-%m-%d")
                 min_t_blend = 0.0
                 max_t_blend = 0.0
                 precip_blend = 0.0
@@ -1296,7 +1497,6 @@ class WeatherProviderService:
                 day_code = 0
                 best_w = -1.0
 
-                utc_offset_hrs = int(round(longitude / 15.0))
                 afternoon_utc_h = (15 - utc_offset_hrs) % 24
                 dawn_utc_h = (5 - utc_offset_hrs) % 24
 
@@ -1366,8 +1566,13 @@ class WeatherProviderService:
                 )
                 d_wdir = int(d_wdir_arr[d_idx]) if d_idx < len(d_wdir_arr) and d_wdir_arr[d_idx] is not None else 180
                 d_uv = float(d_uv_arr[d_idx]) if d_idx < len(d_uv_arr) and d_uv_arr[d_idx] is not None else 5.0
-                d_sr = str(d_sr_arr[d_idx]) if d_idx < len(d_sr_arr) and d_sr_arr[d_idx] is not None else None
-                d_ss = str(d_ss_arr[d_idx]) if d_idx < len(d_ss_arr) and d_ss_arr[d_idx] is not None else None
+                astro_sr, astro_ss = calc_local_sunrise_sunset_iso(
+                    latitude, longitude, local_day_dt, utc_offset_sec
+                )
+                d_sr = local_sr_by_date.get(local_date_key) or astro_sr
+                d_ss = local_ss_by_date.get(local_date_key) or astro_ss
+                if d_ss <= d_sr:
+                    d_sr, d_ss = astro_sr, astro_ss
 
                 day_slice = hourly_models[d_idx * 24 : (d_idx + 1) * 24]
                 if day_slice:
@@ -1445,6 +1650,66 @@ class WeatherProviderService:
             temp_max_today = daily_models[0].maxTemperature if daily_models else final_current_temp
             temp_min_today = daily_models[0].minTemperature if daily_models else final_current_temp
 
+            curr_sw = (
+                hourly_models[0].shortwaveRadiation
+                if (hourly_models and hourly_models[0].shortwaveRadiation is not None)
+                else (
+                    round(float(current_raw["shortwave_radiation"]), 1)
+                    if current_raw.get("shortwave_radiation") is not None
+                    else None
+                )
+            )
+            curr_vpd = (
+                hourly_models[0].vpdKpa
+                if (hourly_models and hourly_models[0].vpdKpa is not None)
+                else (
+                    round(float(current_raw["vapour_pressure_deficit"]), 2)
+                    if current_raw.get("vapour_pressure_deficit") is not None
+                    else None
+                )
+            )
+            curr_flh = (
+                hourly_models[0].freezingLevelMeters
+                if (hourly_models and hourly_models[0].freezingLevelMeters is not None)
+                else None
+            )
+            curr_isday = (
+                bool(int(current_raw["is_day"]))
+                if current_raw.get("is_day") is not None
+                else (
+                    hourly_models[0].isDay
+                    if (hourly_models and hourly_models[0].isDay is not None)
+                    else None
+                )
+            )
+            curr_cclow = (
+                hourly_models[0].cloudCoverLow
+                if (hourly_models and hourly_models[0].cloudCoverLow is not None)
+                else (
+                    int(round(float(current_raw["cloud_cover_low"])))
+                    if current_raw.get("cloud_cover_low") is not None
+                    else None
+                )
+            )
+            curr_ccmid = (
+                hourly_models[0].cloudCoverMid
+                if (hourly_models and hourly_models[0].cloudCoverMid is not None)
+                else (
+                    int(round(float(current_raw["cloud_cover_mid"])))
+                    if current_raw.get("cloud_cover_mid") is not None
+                    else None
+                )
+            )
+            curr_cchigh = (
+                hourly_models[0].cloudCoverHigh
+                if (hourly_models and hourly_models[0].cloudCoverHigh is not None)
+                else (
+                    int(round(float(current_raw["cloud_cover_high"])))
+                    if current_raw.get("cloud_cover_high") is not None
+                    else None
+                )
+            )
+
             current_model = WeatherDataModel(
                 cityName=city_name,
                 temperature=final_current_temp,
@@ -1480,6 +1745,16 @@ class WeatherProviderService:
                 wetBulbTemperature=curr_wb,
                 precipType=curr_pt,
                 ozone=ozone_val,
+                isDay=curr_isday,
+                shortwaveRadiation=curr_sw,
+                vpdKpa=curr_vpd,
+                cloudCoverLow=curr_cclow,
+                cloudCoverMid=curr_ccmid,
+                cloudCoverHigh=curr_cchigh,
+                freezingLevelMeters=curr_flh,
+                treePollen=tree_pollen_val,
+                grassPollen=grass_pollen_val,
+                weedPollen=weed_pollen_val,
             )
 
             result = WeatherResponse(

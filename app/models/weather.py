@@ -189,6 +189,16 @@ class WeatherDataModel(BaseModel):
     wetBulbTemperature: Optional[float] = None
     precipType: Optional[str] = None
     ozone: Optional[float] = None
+    isDay: Optional[bool] = None
+    shortwaveRadiation: Optional[float] = None
+    vpdKpa: Optional[float] = None
+    cloudCoverLow: Optional[int] = None
+    cloudCoverMid: Optional[int] = None
+    cloudCoverHigh: Optional[int] = None
+    freezingLevelMeters: Optional[float] = None
+    treePollen: Optional[float] = None
+    grassPollen: Optional[float] = None
+    weedPollen: Optional[float] = None
 
 
 class HourlyForecastModel(BaseModel):
@@ -235,6 +245,13 @@ class HourlyForecastModel(BaseModel):
     wetBulbTemperature: Optional[float] = None
     precipType: Optional[str] = None
     snowAccumulationCm: Optional[float] = None
+    isDay: Optional[bool] = None
+    shortwaveRadiation: Optional[float] = None
+    vpdKpa: Optional[float] = None
+    cloudCoverLow: Optional[int] = None
+    cloudCoverMid: Optional[int] = None
+    cloudCoverHigh: Optional[int] = None
+    freezingLevelMeters: Optional[float] = None
 
 
 class DailyForecastModel(BaseModel):
