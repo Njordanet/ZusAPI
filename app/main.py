@@ -22,6 +22,12 @@ async def _background_doppler_loop():
         try:
             await doppler_service.refresh_dataset()
             await doppler_service.backfill_offline_gaps(lookback_hours=24, max_batch=16)
+            # Phase 3: Spatial push notification evaluation & anti-spam dispatch
+            try:
+                from app.services.push_worker import push_worker
+                await push_worker.evaluate_and_dispatch()
+            except Exception as e:
+                print(f"⚠️ Push notification worker loop warning: {e}")
         except asyncio.CancelledError:
             break
         except Exception as e:

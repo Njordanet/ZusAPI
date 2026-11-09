@@ -8,3 +8,7 @@ env/
 .env
 .DS_Store
 *.log
+data/
+*.db
+*.sqlite
+

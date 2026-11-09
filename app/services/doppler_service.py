@@ -1373,6 +1373,27 @@ class DopplerRadarService:
         self._inflight_locks.pop(cache_key, None)
         return png_bytes
 
+    async def get_point_nowcast(
+        self,
+        lat: float,
+        lon: float,
+        temp_c: Optional[float] = None,
+        dewpoint_c: Optional[float] = None,
+        station_wet: bool = False,
+        radar_zr_factor: float = 1.0,
+    ) -> RadarLocalTelemetry:
+        """
+        O(1) in-memory radar nowcast alias for get_point_telemetry.
+        """
+        return await self.get_point_telemetry(
+            lat=lat,
+            lon=lon,
+            temp_c=temp_c,
+            dewpoint_c=dewpoint_c,
+            station_wet=station_wet,
+            radar_zr_factor=radar_zr_factor,
+        )
+
     async def get_point_telemetry(
         self,
         lat: float,

@@ -2,6 +2,19 @@
 
 All notable changes to `ZusAPI` will be documented in this file.
 
+## [v1.3.0] - 2026-11-08
+
+### Spatial Cell (0.05°) Push Notification Engine & DND Hysteresis Worker
+- **Privacy-Preserving Spatial Cell Registration (`POST /api/v1/notifications/register`)**:
+  - Quantizes device locations into anonymous `0.05°` (~5 km) spatial grid cells (`SpatialPushWorker`), avoiding exact coordinate storage.
+  - Supports client notification preference configurations (precipitation, severe weather, environmental thresholds, quiet hours, and breakthrough preferences) with token in-place updating and automatic cell migration.
+- **5-Minute O(1) Push Evaluation Cycle (`push_worker.py`)**:
+  - Evaluates active spatial cells in parallel against live MRMS/NEXRAD Doppler radar and NWS warning polygons.
+  - Implements a 90-minute per-cell storm hysteresis window (`last_notified`) to completely eliminate repetitive duplicate push alerts during ongoing weather events.
+- **Exact-Minute Local Timezone DND & Severe Breakthrough**:
+  - Resolves device IANA timezone and evaluates exact-minute quiet hours windows (`start_time` / `end_time`).
+  - Supports severe weather breakthrough, allowing critical life-safety warnings (Tornado, Severe Thunderstorm, Flash Flood) to bypass active quiet hours.
+
 ## [v1.2.0] - 2026-11-08
 
 ### Single-Request Radar Regional Pack & Viewport Pack Endpoints

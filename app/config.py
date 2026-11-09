@@ -2,9 +2,15 @@ from pydantic_settings import BaseSettings
 from typing import Optional
 from pathlib import Path
 
+def _get_version() -> str:
+    version_file = Path(__file__).resolve().parent.parent / "VERSION"
+    if version_file.exists():
+        return version_file.read_text(encoding="utf-8").strip().lstrip("v")
+    return "1.3.0"
+
 class Settings(BaseSettings):
     app_name: str = "ZüsAPI"
-    app_version: str = "1.2.0"
+    app_version: str = _get_version()
     app_env: str = "production"
     debug: bool = False
     
