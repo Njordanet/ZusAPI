@@ -2,6 +2,11 @@
 
 All notable changes to `ZusAPI` will be documented in this file.
 
+## [v1.3.1] - 2026-11-09
+
+### iOS WidgetKit Telemetry Sync Relay (`/api/v1/notifications/widget-sync`)
+- Added ultra-low-latency in-memory widget telemetry relay endpoints (`POST /api/v1/notifications/widget-sync` & `GET /api/v1/notifications/widget-sync`) to synchronize active location, temperature unit, and multi-model forecast snapshots between the ZüsCast mobile app and the iOS WidgetKit extension.
+
 ## [v1.3.0] - 2026-11-08
 
 ### Spatial Cell (0.05°) Push Notification Engine & DND Hysteresis Worker

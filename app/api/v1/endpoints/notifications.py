@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException, Query, Body, status
+from fastapi import APIRouter, HTTPException, Query, Body, Request, status
 from typing import Optional, Dict, Any
+import time
 
 from app.models.notifications import (
     PushSubscriptionRegisterRequest,
@@ -10,6 +11,20 @@ from app.models.notifications import (
 from app.services.push_worker import push_worker
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
+
+# Lightweight in-memory widget telemetry relay keyed by client IP (+ global fallback)
+_WIDGET_SYNC_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _extract_client_ip(request: Request) -> str:
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "default"
+
 
 
 @router.post(
@@ -76,3 +91,39 @@ async def get_notification_stats() -> NotificationStatsResponse:
 )
 async def trigger_evaluation() -> Dict[str, Any]:
     return await push_worker.evaluate_and_dispatch()
+
+
+@router.post(
+    "/widget-sync",
+    summary="Sync active weather telemetry snapshot for iOS WidgetKit extension",
+)
+async def post_widget_sync(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    client_ip = _extract_client_ip(request)
+    entry = {
+        **payload,
+        "syncedAtMs": time.time() * 1000.0,
+    }
+    _WIDGET_SYNC_CACHE[client_ip] = entry
+    _WIDGET_SYNC_CACHE["__latest__"] = entry
+    # Prune if > 500 entries to conserve memory
+    if len(_WIDGET_SYNC_CACHE) > 500:
+        oldest_key = next(iter(_WIDGET_SYNC_CACHE))
+        if oldest_key != "__latest__":
+            _WIDGET_SYNC_CACHE.pop(oldest_key, None)
+    return {"status": "ok", "client_ip": client_ip}
+
+
+@router.get(
+    "/widget-sync",
+    summary="Retrieve active weather telemetry snapshot for iOS WidgetKit extension",
+)
+async def get_widget_sync(request: Request) -> Dict[str, Any]:
+    client_ip = _extract_client_ip(request)
+    entry = _WIDGET_SYNC_CACHE.get(client_ip) or _WIDGET_SYNC_CACHE.get("__latest__")
+    if not entry:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No widget snapshot synced yet")
+    return entry
+
