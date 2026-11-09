@@ -585,12 +585,15 @@ class WeatherProviderService:
                 p_arr = hourly_raw.get(f"precipitation_probability_{suffix}") or hourly_raw.get("precipitation_probability") or []
                 pr_arr = hourly_raw.get(f"precipitation_{suffix}") or hourly_raw.get("precipitation") or []
                 w_arr = hourly_raw.get(f"wind_speed_10m_{suffix}") or hourly_raw.get("wind_speed_10m") or []
+                wdir_arr = hourly_raw.get(f"wind_direction_10m_{suffix}") or hourly_raw.get("wind_direction_10m") or []
                 wg_arr = hourly_raw.get(f"wind_gusts_10m_{suffix}") or hourly_raw.get("wind_gusts_10m") or []
                 uv_arr = hourly_raw.get(f"uv_index_{suffix}") or hourly_raw.get("uv_index") or []
                 dp_arr = hourly_raw.get(f"dew_point_2m_{suffix}") or hourly_raw.get("dew_point_2m") or []
+                rh_arr = hourly_raw.get(f"relative_humidity_2m_{suffix}") or hourly_raw.get("relative_humidity_2m") or []
                 cc_arr = hourly_raw.get(f"cloud_cover_{suffix}") or hourly_raw.get("cloud_cover") or []
                 vis_arr = hourly_raw.get(f"visibility_{suffix}") or hourly_raw.get("visibility") or []
                 pr_msl_arr = hourly_raw.get(f"pressure_msl_{suffix}") or hourly_raw.get("pressure_msl") or []
+                cape_arr = hourly_raw.get(f"cape_{suffix}") or hourly_raw.get("cape") or []
                 c_arr = hourly_raw.get(f"weather_code_{suffix}") or hourly_raw.get("weather_code") or []
 
                 stream: List[Dict[str, Any]] = []
@@ -611,12 +614,15 @@ class WeatherProviderService:
                             "precip_prob": int(p_arr[idx]) if idx < len(p_arr) and p_arr[idx] is not None else 0,
                             "precip_mm": float(pr_arr[idx]) if idx < len(pr_arr) and pr_arr[idx] is not None else 0.0,
                             "wind_kmh": w_val,
+                            "wind_dir": float(wdir_arr[idx]) if idx < len(wdir_arr) and wdir_arr[idx] is not None else None,
                             "gust_kmh": float(wg_arr[idx]) if idx < len(wg_arr) and wg_arr[idx] is not None else round(w_val * 1.3, 1),
                             "uv_index": float(uv_arr[idx]) if idx < len(uv_arr) and uv_arr[idx] is not None else None,
                             "dew_c": float(dp_arr[idx]) if idx < len(dp_arr) and dp_arr[idx] is not None else float(temp_val) - 4.0,
+                            "rh_pct": float(rh_arr[idx]) if idx < len(rh_arr) and rh_arr[idx] is not None else None,
                             "cloud_pct": int(cc_arr[idx]) if idx < len(cc_arr) and cc_arr[idx] is not None else 0,
                             "vis_km": round(float(vis_arr[idx]) / 1000.0, 2) if idx < len(vis_arr) and vis_arr[idx] is not None else None,
                             "press_hpa": float(pr_msl_arr[idx]) if idx < len(pr_msl_arr) and pr_msl_arr[idx] is not None else 1013.25,
+                            "cape_jkg": float(cape_arr[idx]) if idx < len(cape_arr) and cape_arr[idx] is not None else None,
                             "wmo_code": int(c_arr[idx]) if idx < len(c_arr) and c_arr[idx] is not None else 0,
                         }
                     )
@@ -739,6 +745,11 @@ class WeatherProviderService:
                     bsin = float(w_row.get("bias_sin_c") or 0.0)
                     bcos = float(w_row.get("bias_cos_c") or 0.0)
                     diurnal_now = round(eval_diurnal_bias(b0, bsin, bcos, now.hour), 2)
+                    m_stream0 = model_hourly_streams[m][0] if model_hourly_streams[m] else None
+                    m_wind_bias = float(w_row.get("bias_wind_kmh") or 0.0) * 0.4
+                    m_cur_temp = round(float(m_stream0["temp_c"]) - diurnal_now, 1) if m_stream0 else None
+                    m_cur_pop = int(m_stream0.get("precip_prob", 0)) if m_stream0 else None
+                    m_cur_wind = round(max(0.0, float(m_stream0.get("wind_kmh", 0.0)) - m_wind_bias), 1) if m_stream0 else None
                     model_weight_details.append(
                         ModelWeightDetail(
                             modelName=m,
@@ -753,12 +764,16 @@ class WeatherProviderService:
                             maeWindKmh=round(float(w_row.get("mae_wind_kmh") or 3.5), 2),
                             brierPrecip=round(float(w_row.get("brier_precip") or 0.10), 3),
                             samplesVerified=int(w_row["samples_verified"]),
+                            currentTempCelsius=m_cur_temp,
+                            currentPrecipProb=m_cur_pop,
+                            currentWindKmh=m_cur_wind,
                         )
                     )
 
             if not weights_map:
                 equal_w = round(1.0 / max(1, len(model_hourly_streams)), 3)
                 for m in model_hourly_streams:
+                    m_stream0 = model_hourly_streams[m][0] if model_hourly_streams[m] else None
                     weights_map[m] = {
                         "dynamic_weight": equal_w,
                         "weight_short": equal_w,
@@ -783,6 +798,9 @@ class WeatherProviderService:
                             biasCelsius=0.0,
                             diurnalBiasNowCelsius=0.0,
                             samplesVerified=1,
+                            currentTempCelsius=round(float(m_stream0["temp_c"]), 1) if m_stream0 else None,
+                            currentPrecipProb=int(m_stream0.get("precip_prob", 0)) if m_stream0 else None,
+                            currentWindKmh=round(float(m_stream0.get("wind_kmh", 0.0)), 1) if m_stream0 else None,
                         )
                     )
 
@@ -808,13 +826,20 @@ class WeatherProviderService:
                 blended_pr_mm = 0.0
                 blended_wind = 0.0
                 blended_gust = 0.0
+                blended_wdir_sin = 0.0
+                blended_wdir_cos = 0.0
+                wdir_w_total = 0.0
                 blended_uv = 0.0
                 uv_w_total = 0.0
                 blended_dew = 0.0
+                blended_rh = 0.0
+                rh_w_total = 0.0
                 blended_cloud = 0.0
                 blended_vis = 0.0
                 vis_w_total = 0.0
                 blended_press = 0.0
+                blended_cape = 0.0
+                cape_w_total = 0.0
                 total_w = 0.0
                 wet_w = 0.0
                 hour_temps: List[float] = []
@@ -888,6 +913,20 @@ class WeatherProviderService:
                         hour_clouds.append(c_val)
                         hour_press.append(p_val)
 
+                        if pt.get("wind_dir") is not None:
+                            wd_rad = math.radians(float(pt["wind_dir"]))
+                            blended_wdir_sin += math.sin(wd_rad) * w
+                            blended_wdir_cos += math.cos(wd_rad) * w
+                            wdir_w_total += w
+
+                        if pt.get("rh_pct") is not None:
+                            blended_rh += float(pt["rh_pct"]) * w
+                            rh_w_total += w
+
+                        if pt.get("cape_jkg") is not None:
+                            blended_cape += float(pt["cape_jkg"]) * w
+                            cape_w_total += w
+
                         if pt.get("uv_index") is not None:
                             uv_v = float(pt["uv_index"])
                             blended_uv += uv_v * w
@@ -929,24 +968,41 @@ class WeatherProviderService:
                 final_h_vis = round(blended_vis / vis_w_total, 2) if vis_w_total > 0 else 16.0
 
                 raw_idx = start_idx + h_offset
-                h_wdir = (
-                    int(wdir_hourly_arr[raw_idx])
-                    if (raw_idx < len(wdir_hourly_arr) and wdir_hourly_arr[raw_idx] is not None)
-                    else 180
-                )
-                h_rh = (
-                    int(rh_hourly_arr[raw_idx])
-                    if (raw_idx < len(rh_hourly_arr) and rh_hourly_arr[raw_idx] is not None)
-                    else calc_relative_humidity(final_h_temp, final_h_dew)
-                )
-                h_cape = (
-                    round(float(cape_hourly_arr[raw_idx]), 1)
-                    if (raw_idx < len(cape_hourly_arr) and cape_hourly_arr[raw_idx] is not None)
-                    else 0.0
-                )
+                if wdir_w_total > 0:
+                    h_wdir = int(round(math.degrees(math.atan2(blended_wdir_sin, blended_wdir_cos)))) % 360
+                else:
+                    h_wdir = (
+                        int(wdir_hourly_arr[raw_idx])
+                        if (raw_idx < len(wdir_hourly_arr) and wdir_hourly_arr[raw_idx] is not None)
+                        else 180
+                    )
+
+                thermo_rh = calc_relative_humidity(final_h_temp, final_h_dew)
+                if rh_w_total > 0:
+                    model_rh = blended_rh / rh_w_total
+                    h_rh = int(round(0.65 * thermo_rh + 0.35 * model_rh))
+                else:
+                    h_rh = thermo_rh
+
+                if cape_w_total > 0:
+                    h_cape = round(blended_cape / cape_w_total, 1)
+                else:
+                    h_cape = (
+                        round(float(cape_hourly_arr[raw_idx]), 1)
+                        if (raw_idx < len(cape_hourly_arr) and cape_hourly_arr[raw_idx] is not None)
+                        else 0.0
+                    )
 
                 if top_wet_code >= 51 and (wet_w >= 0.32 or final_h_precip >= 40 or final_h_pr_mm >= 0.1):
                     top_code = top_wet_code
+                elif top_code < 45:
+                    # Reconcile sky condition code with RLS-blended cloud cover
+                    if final_h_cloud >= 85:
+                        top_code = 3
+                    elif final_h_cloud >= 36:
+                        top_code = 2
+                    else:
+                        top_code = 0
 
                 # Assimilate live ground-truth METAR / 1km Doppler radar into hour 0
                 if h_offset == 0:
@@ -1019,7 +1075,209 @@ class WeatherProviderService:
             avg_spread = statistics.mean(hourly_spreads) if hourly_spreads else 0.8
             consensus_score = int(round(max(62.0, min(99.0, 100.0 - (avg_spread * 8.5)))))
 
-            # 7. Compute Multi-Model Daily Blend (10 Days)
+            # 7. Assimilate Hyperlocal Station Ground-Truth with Bias-Corrected Model Ensemble for Current Weather & Anchor NOW
+            ensemble_current_temp = (
+                hourly_models[0].temperature
+                if hourly_models
+                else float(current_raw.get("temperature_2m") or current_raw.get("temperature_2m_best_match") or 0.0)
+            )
+
+            local_station_name: Optional[str] = None
+            local_station_dist: Optional[float] = None
+            local_station_wx: Optional[str] = None
+
+            if station_composite and station_composite["closest_distance_km"] <= 35.0:
+                dist = station_composite["closest_distance_km"]
+                station_weight = max(0.35, min(0.75, 1.0 - (dist / 50.0)))
+                final_current_temp = round(
+                    station_composite["temperature_c"] * station_weight
+                    + ensemble_current_temp * (1.0 - station_weight),
+                    1,
+                )
+                local_station_name = station_composite["closest_station_name"]
+                local_station_dist = dist
+                local_station_wx = station_composite.get("wx_string")
+            else:
+                final_current_temp = round(ensemble_current_temp, 1)
+
+            temp_delta_now = round(final_current_temp - ensemble_current_temp, 2)
+
+            raw_dewp = (
+                station_composite["dewpoint_c"]
+                if (station_composite and station_composite.get("dewpoint_c") is not None)
+                else (
+                    hourly_models[0].dewPoint
+                    if (hourly_models and hourly_models[0].dewPoint is not None)
+                    else (final_current_temp - 5.0)
+                )
+            )
+            dewpoint_c = round(float(raw_dewp), 1)
+            comfort_label = classify_dewpoint_comfort(dewpoint_c)
+
+            if station_composite and station_composite.get("wx_condition") is not None:
+                current_condition = station_composite["wx_condition"]
+                observed_wmo = int(station_composite.get("wx_wmo") or 61)
+            elif doppler_telemetry and doppler_telemetry.currentDbz >= 15.0:
+                if final_current_temp <= 0.5:
+                    current_condition = WeatherCondition.SNOW
+                    observed_wmo = 71
+                elif doppler_telemetry.currentDbz >= 35.0:
+                    current_condition = WeatherCondition.HEAVY_RAIN
+                    observed_wmo = 65
+                elif doppler_telemetry.currentDbz >= 20.0:
+                    current_condition = WeatherCondition.RAIN
+                    observed_wmo = 61
+                else:
+                    current_condition = WeatherCondition.DRIZZLE
+                    observed_wmo = 51
+            elif hourly_models:
+                current_condition = hourly_models[0].condition
+                observed_wmo = hourly_models[0].wmoCode
+            else:
+                wmo_fallback = int(current_raw.get("weather_code") or 0)
+                current_condition = WeatherCondition.from_wmo_code(wmo_fallback)
+                observed_wmo = wmo_fallback
+
+            current_uv = float(hourly_models[0].uvIndex) if hourly_models and hourly_models[0].uvIndex is not None else 0.0
+
+            top_models = [m.modelName for m in model_weight_details[:2]]
+            dominant_str = " + ".join(top_models) + " Blend" if top_models else "Multi-Model Blend"
+
+            msl_pressure = (
+                (station_composite and station_composite.get("pressure_hpa"))
+                or (hourly_models[0].pressure if hourly_models and hourly_models[0].pressure is not None else None)
+                or current_raw.get("pressure_msl")
+                or 1013.25
+            )
+
+            wind_speed_kmh = float(
+                (station_composite and station_composite.get("wind_kmh"))
+                if (station_composite and station_composite.get("wind_kmh") is not None)
+                else (
+                    hourly_models[0].windSpeed
+                    if hourly_models
+                    else (current_raw.get("wind_speed_10m") or 0.0)
+                )
+            )
+            wind_gust_kmh = float(
+                (station_composite and station_composite.get("gust_kmh"))
+                if (station_composite and station_composite.get("gust_kmh") is not None)
+                else (
+                    hourly_models[0].windGusts
+                    if (hourly_models and hourly_models[0].windGusts is not None)
+                    else round(wind_speed_kmh * 1.25, 1)
+                )
+            )
+            wind_dir_deg = int(
+                (station_composite and station_composite.get("wind_dir"))
+                if (station_composite and station_composite.get("wind_dir") is not None)
+                else (
+                    hourly_models[0].windDirection
+                    if (hourly_models and hourly_models[0].windDirection is not None)
+                    else 180
+                )
+            )
+
+            visibility_km = float(
+                (station_composite and station_composite.get("visibility_km"))
+                if (station_composite and station_composite.get("visibility_km") is not None)
+                else (
+                    hourly_models[0].visibilityKm
+                    if (hourly_models and hourly_models[0].visibilityKm is not None)
+                    else 16.0
+                )
+            )
+
+            cloud_cover_pct = int(
+                hourly_models[0].cloudCover
+                if (hourly_models and hourly_models[0].cloudCover is not None)
+                else (95 if observed_wmo >= 3 else 25)
+            )
+            if observed_wmo >= 51:
+                cloud_cover_pct = max(cloud_cover_pct, 88)
+            elif observed_wmo == 3:
+                cloud_cover_pct = max(cloud_cover_pct, 85)
+
+            curr_precip_mmhr = float(
+                max(
+                    nowcast_obj.points[0].precipIntensityMmHr if nowcast_obj.points else 0.0,
+                    doppler_telemetry.precipRateMmHr if doppler_telemetry else 0.0,
+                    float(station_composite.get("precip_mmhr") or 0.0) if station_composite else 0.0,
+                )
+            )
+
+            base_feels = (
+                hourly_models[0].feelsLike
+                if (hourly_models and hourly_models[0].feelsLike is not None)
+                else final_current_temp
+            )
+            final_current_feels = round(float(base_feels) + temp_delta_now, 1)
+
+            curr_cape = float(
+                hourly_models[0].capeJkg
+                if (hourly_models and hourly_models[0].capeJkg is not None)
+                else (current_raw.get("cape") or 0.0)
+            )
+            curr_li = float(
+                li_hourly_arr[start_idx]
+                if (start_idx < len(li_hourly_arr) and li_hourly_arr[start_idx] is not None)
+                else 2.0
+            )
+
+            curr_hum = int(
+                (station_composite and station_composite.get("humidity"))
+                if (station_composite and station_composite.get("humidity") is not None)
+                else (
+                    hourly_models[0].humidity
+                    if (hourly_models and hourly_models[0].humidity is not None)
+                    else calc_relative_humidity(final_current_temp, dewpoint_c)
+                )
+            )
+            curr_wb = calc_wet_bulb_c(final_current_temp, float(curr_hum))
+            curr_pt = classify_precip_type(
+                temp_c=final_current_temp,
+                rh_pct=float(curr_hum),
+                wet_bulb_c=curr_wb,
+                wmo_code=observed_wmo,
+                metar_wx=local_station_wx,
+            )
+
+            # Anchor hourly[0] ("NOW") to assimilated current state and smoothly decay station delta into +1h/+2h
+            if hourly_models:
+                h0 = hourly_models[0]
+                h0.temperature = final_current_temp
+                h0.tempMin = min(h0.tempMin if h0.tempMin is not None else final_current_temp, final_current_temp)
+                h0.tempMax = max(h0.tempMax if h0.tempMax is not None else final_current_temp, final_current_temp)
+                h0.feelsLike = final_current_feels
+                h0.feelsMin = min(h0.feelsMin if h0.feelsMin is not None else final_current_feels, final_current_feels)
+                h0.feelsMax = max(h0.feelsMax if h0.feelsMax is not None else final_current_feels, final_current_feels)
+                h0.wmoCode = observed_wmo
+                h0.condition = current_condition
+                h0.cloudCover = cloud_cover_pct
+                h0.humidity = curr_hum
+                h0.dewPoint = dewpoint_c
+                h0.windSpeed = round(wind_speed_kmh, 1)
+                h0.windGusts = round(wind_gust_kmh, 1)
+                h0.windDirection = wind_dir_deg
+                h0.pressure = round(float(msl_pressure), 1)
+                h0.visibilityKm = round(visibility_km, 2)
+                h0.wetBulbTemperature = curr_wb
+                h0.precipType = curr_pt
+
+                if abs(temp_delta_now) >= 0.1:
+                    for decay_idx, decay_factor in ((1, 0.55), (2, 0.25)):
+                        if decay_idx < len(hourly_models):
+                            hk = hourly_models[decay_idx]
+                            adj_delta = round(temp_delta_now * decay_factor, 1)
+                            hk.temperature = round(hk.temperature + adj_delta, 1)
+                            if hk.feelsLike is not None:
+                                hk.feelsLike = round(hk.feelsLike + adj_delta, 1)
+                            if hk.tempMin is not None:
+                                hk.tempMin = min(hk.tempMin, hk.temperature)
+                            if hk.tempMax is not None:
+                                hk.tempMax = max(hk.tempMax, hk.temperature)
+
+            # 8. Compute Multi-Model Daily Blend (10 Days) Reconciled with RLS Hourly Slices
             daily_times = daily_raw.get("time", [])
             daily_models: List[DailyForecastModel] = []
             day_limit = min(len(daily_times), 10)
@@ -1113,6 +1371,36 @@ class WeatherProviderService:
 
                 day_slice = hourly_models[d_idx * 24 : (d_idx + 1) * 24]
                 if day_slice:
+                    slice_temps = [h.temperature for h in day_slice]
+                    if d_idx == 0:
+                        d_min = round(min(d_min, min(slice_temps), final_current_temp), 1)
+                        d_max = round(max(d_max, max(slice_temps), final_current_temp), 1)
+                    else:
+                        d_min = round(min(d_min, min(slice_temps)), 1)
+                        d_max = round(max(d_max, max(slice_temps)), 1)
+
+                    slice_uvs = [float(h.uvIndex) for h in day_slice if h.uvIndex is not None]
+                    if slice_uvs:
+                        d_uv = max(d_uv, max(slice_uvs))
+
+                    sin_sum = sum(math.sin(math.radians(float(h.windDirection))) for h in day_slice if h.windDirection is not None)
+                    cos_sum = sum(math.cos(math.radians(float(h.windDirection))) for h in day_slice if h.windDirection is not None)
+                    if abs(sin_sum) > 1e-6 or abs(cos_sum) > 1e-6:
+                        d_wdir = int(round(math.degrees(math.atan2(sin_sum, cos_sum)))) % 360
+
+                    # Reconcile daily WMO code with RLS-blended hourly conditions
+                    wet_hours = [h.wmoCode for h in day_slice if h.wmoCode >= 51]
+                    if wet_hours and (d_pop >= 35 or d_psum >= 0.4 or len(wet_hours) >= 3):
+                        day_code = max(wet_hours)
+                    elif day_code < 45:
+                        avg_day_cloud = sum((h.cloudCover or 0) for h in day_slice) / len(day_slice)
+                        if avg_day_cloud >= 82:
+                            day_code = 3
+                        elif avg_day_cloud >= 36:
+                            day_code = 2
+                        else:
+                            day_code = 0
+
                     d_snow_accum = round(sum((h.snowAccumulationCm or 0.0) for h in day_slice), 2)
                     d_wet_snow_hours = [h for h in day_slice if h.precipType in ("snow", "sleet") and (h.precipMm or 0.0) > 0]
                     if d_wet_snow_hours:
@@ -1154,178 +1442,13 @@ class WeatherProviderService:
                     )
                 )
 
-            # 8. Assimilate Hyperlocal Station Ground-Truth with Bias-Corrected Model Ensemble for Current Weather
-            ensemble_current_temp = (
-                hourly_models[0].temperature
-                if hourly_models
-                else float(current_raw.get("temperature_2m") or current_raw.get("temperature_2m_best_match") or 0.0)
-            )
-
-            local_station_name: Optional[str] = None
-            local_station_dist: Optional[float] = None
-            local_station_wx: Optional[str] = None
-
-            if station_composite and station_composite["closest_distance_km"] <= 35.0:
-                dist = station_composite["closest_distance_km"]
-                station_weight = max(0.35, min(0.75, 1.0 - (dist / 50.0)))
-                final_current_temp = round(
-                    station_composite["temperature_c"] * station_weight
-                    + ensemble_current_temp * (1.0 - station_weight),
-                    1,
-                )
-                local_station_name = station_composite["closest_station_name"]
-                local_station_dist = dist
-                local_station_wx = station_composite.get("wx_string")
-            else:
-                final_current_temp = round(ensemble_current_temp, 1)
-
-            raw_dewp = (
-                station_composite["dewpoint_c"]
-                if (station_composite and station_composite.get("dewpoint_c") is not None)
-                else (
-                    current_raw["dew_point_2m"]
-                    if current_raw.get("dew_point_2m") is not None
-                    else (
-                        current_raw["dew_point_2m_best_match"]
-                        if current_raw.get("dew_point_2m_best_match") is not None
-                        else (hourly_models[0].dewPoint if hourly_models else (final_current_temp - 5.0))
-                    )
-                )
-            )
-            dewpoint_c = round(float(raw_dewp), 1)
-            comfort_label = classify_dewpoint_comfort(dewpoint_c)
-
-            wmo_now = int(
-                current_raw.get("weather_code")
-                if current_raw.get("weather_code") is not None
-                else (
-                    current_raw.get("weather_code_best_match")
-                    if current_raw.get("weather_code_best_match") is not None
-                    else (hourly_models[0].wmoCode if hourly_models else 0)
-                )
-            )
-
-            if station_composite and station_composite.get("wx_condition") is not None:
-                current_condition = station_composite["wx_condition"]
-                observed_wmo = int(station_composite.get("wx_wmo") or 61)
-            elif doppler_telemetry and doppler_telemetry.currentDbz >= 15.0:
-                if final_current_temp <= 0.5:
-                    current_condition = WeatherCondition.SNOW
-                    observed_wmo = 71
-                elif doppler_telemetry.currentDbz >= 35.0:
-                    current_condition = WeatherCondition.HEAVY_RAIN
-                    observed_wmo = 65
-                elif doppler_telemetry.currentDbz >= 20.0:
-                    current_condition = WeatherCondition.RAIN
-                    observed_wmo = 61
-                else:
-                    current_condition = WeatherCondition.DRIZZLE
-                    observed_wmo = 51
-            elif hourly_models and hourly_models[0].wmoCode >= 51:
-                current_condition = hourly_models[0].condition
-                observed_wmo = hourly_models[0].wmoCode
-            else:
-                current_condition = WeatherCondition.from_wmo_code(wmo_now)
-                observed_wmo = wmo_now
-
-            current_uv = float(hourly_models[0].uvIndex) if hourly_models else 0.0
             temp_max_today = daily_models[0].maxTemperature if daily_models else final_current_temp
             temp_min_today = daily_models[0].minTemperature if daily_models else final_current_temp
-
-            top_models = [m.modelName for m in model_weight_details[:2]]
-            dominant_str = " + ".join(top_models) + " Blend" if top_models else "Multi-Model Blend"
-
-            msl_pressure = (
-                (station_composite and station_composite.get("pressure_hpa"))
-                or current_raw.get("pressure_msl")
-                or current_raw.get("pressure_msl_best_match")
-                or current_raw.get("surface_pressure")
-                or current_raw.get("surface_pressure_best_match")
-                or 1013.25
-            )
-
-            wind_speed_kmh = float(
-                (station_composite and station_composite.get("wind_kmh"))
-                or current_raw.get("wind_speed_10m")
-                or current_raw.get("wind_speed_10m_best_match")
-                or 0.0
-            )
-            wind_gust_kmh = float(
-                (station_composite and station_composite.get("gust_kmh"))
-                or current_raw.get("wind_gusts_10m")
-                or current_raw.get("wind_gusts_10m_best_match")
-                or round(wind_speed_kmh * 1.25, 1)
-            )
-            wind_dir_deg = int(
-                (station_composite and station_composite.get("wind_dir"))
-                or current_raw.get("wind_direction_10m")
-                or current_raw.get("wind_direction_10m_best_match")
-                or 0
-            )
-
-            vis_arr = hourly_raw.get("visibility") or hourly_raw.get("visibility_best_match") or []
-            om_vis_km = round(float(vis_arr[start_idx]) / 1000.0, 1) if (start_idx < len(vis_arr) and vis_arr[start_idx] is not None) else 16.0
-            visibility_km = float(
-                (station_composite and station_composite.get("visibility_km"))
-                or om_vis_km
-            )
-
-            cloud_cover_pct = int(
-                current_raw["cloud_cover"]
-                if current_raw.get("cloud_cover") is not None
-                else (
-                    current_raw["cloud_cover_best_match"]
-                    if current_raw.get("cloud_cover_best_match") is not None
-                    else (hourly_models[0].cloudCover if hourly_models else (95 if observed_wmo >= 3 else 25))
-                )
-            )
-            curr_precip_mmhr = float(
-                max(
-                    nowcast_obj.points[0].precipIntensityMmHr if nowcast_obj.points else 0.0,
-                    doppler_telemetry.precipRateMmHr if doppler_telemetry else 0.0,
-                    float(station_composite.get("precip_mmhr") or 0.0) if station_composite else 0.0,
-                )
-            )
-
-            raw_feels = (
-                current_raw["apparent_temperature"]
-                if current_raw.get("apparent_temperature") is not None
-                else (
-                    current_raw["apparent_temperature_best_match"]
-                    if current_raw.get("apparent_temperature_best_match") is not None
-                    else (hourly_models[0].feelsLike if hourly_models and hourly_models[0].feelsLike is not None else final_current_temp)
-                )
-            )
-            curr_cape = float(
-                current_raw.get("cape")
-                or current_raw.get("cape_best_match")
-                or (hourly_models[0].capeJkg if hourly_models and hourly_models[0].capeJkg is not None else 0.0)
-            )
-            curr_li = float(
-                li_hourly_arr[start_idx]
-                if (start_idx < len(li_hourly_arr) and li_hourly_arr[start_idx] is not None)
-                else 2.0
-            )
-
-            curr_hum = int(
-                (station_composite and station_composite.get("humidity"))
-                or current_raw.get("relative_humidity_2m")
-                or current_raw.get("relative_humidity_2m_best_match")
-                or 50
-            )
-            curr_wb = calc_wet_bulb_c(final_current_temp, float(curr_hum))
-            curr_pt = classify_precip_type(
-                temp_c=final_current_temp,
-                rh_pct=float(curr_hum),
-                wet_bulb_c=curr_wb,
-                wmo_code=observed_wmo,
-                metar_wx=local_station_wx,
-            )
 
             current_model = WeatherDataModel(
                 cityName=city_name,
                 temperature=final_current_temp,
-                feelsLike=round(float(raw_feels), 1),
+                feelsLike=final_current_feels,
                 condition=current_condition,
                 tempMin=min(temp_min_today, final_current_temp),
                 tempMax=max(temp_max_today, final_current_temp),

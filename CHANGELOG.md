@@ -2,6 +2,18 @@
 
 All notable changes to `ZusAPI` will be documented in this file.
 
+## [v1.4.0] - 2026-11-09
+
+### Full End-to-End Recursive Alignment Engine & Per-Model Bias-Corrected Telemetry
+- **Per-Model Current Telemetry in `ModelWeightDetail` (`app/models/weather.py` & `app/services/weather_provider.py`)**:
+  - Added `currentTempCelsius`, `currentPrecipProb`, and `currentWindKmh` (diurnal-bias-corrected per model) to `ModelWeightDetail` so web and mobile clients render model convergence directly from ZüsAPI's RLS ledger.
+- **Full Hourly & Daily RLS Alignment (`app/services/weather_provider.py`)**:
+  - Added vector `sin`/`cos` RLS-weighted wind direction averaging, thermodynamically reconciled relative humidity, and RLS-weighted CAPE across hourly forecast horizons.
+  - Reconciled dry hourly and daily WMO sky codes (`0` Clear, `2` Partly Cloudy, `3` Overcast) with RLS-blended cloud cover percentages (`0%–35%` Clear, `36%–84%` Partly Cloudy, `85%+` Overcast).
+- **Eliminated Raw `current_raw` Leaks & Anchored `hourly[0]` ("NOW")**:
+  - Removed raw `current_raw["weather_code"]`, `current_raw["apparent_temperature"]`, and `current_raw["cloud_cover"]` overrides so `current` always reflects IDERW station ground-truth + the RLS-blended `hourly[0]` consensus.
+  - Anchored `hourly[0]` ("NOW") 100% to the station-assimilated `current` state and smoothly decayed station temperature deltas (`0.55` at `+1h`, `0.25` at `+2h`) into the forward hourly trajectory.
+
 ## [v1.3.1] - 2026-11-09
 
 ### iOS WidgetKit Telemetry Sync Relay (`/api/v1/notifications/widget-sync`)

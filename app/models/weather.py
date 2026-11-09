@@ -66,6 +66,9 @@ class ModelWeightDetail(BaseModel):
     maeWindKmh: Optional[float] = None
     brierPrecip: Optional[float] = None
     samplesVerified: int
+    currentTempCelsius: Optional[float] = None
+    currentPrecipProb: Optional[int] = None
+    currentWindKmh: Optional[float] = None
 
 
 class HyperlocalStationReading(BaseModel):
