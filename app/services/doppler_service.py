@@ -39,8 +39,9 @@ def _build_zus_palette() -> Tuple[List[int], bytes]:
 
     # Key color control stops: (index, R, G, B, Alpha)
     stops = [
-        (82, 56, 189, 248, 0),      # 8.5 dBZ: crisp outer echo boundary
-        (86, 56, 189, 248, 135),    # 10.5 dBZ: crisp cyan mist
+        (82, 56, 189, 248, 0),      # 8.5 dBZ: feathered anti-aliased outer boundary
+        (86, 56, 189, 248, 58),     # 10.5 dBZ: soft cyan outer contour feather
+        (91, 28, 178, 242, 128),    # 13.0 dBZ: crisp sky-cyan mist transition
         (96, 14, 165, 233, 185),    # 15.5 dBZ: light rain sky blue
         (112, 37, 99, 235, 218),    # 23.5 dBZ: moderate electric blue
         (124, 52, 211, 153, 234),   # 29.5 dBZ: intense emerald-cyan transition
@@ -134,6 +135,7 @@ class DopplerGridFrame:
         "label",
         "offset_minutes",
         "is_future",
+        "is_prebaked",
         "grid",
         "advect_drow",
         "advect_dcol",
@@ -156,6 +158,7 @@ class DopplerGridFrame:
         advect_drow: int = 0,
         advect_dcol: int = 0,
         decay_indices: int = 0,
+        is_prebaked: bool = False,
     ):
         self.frame_id = frame_id
         self.dt = dt
@@ -163,6 +166,7 @@ class DopplerGridFrame:
         self.label = label
         self.offset_minutes = offset_minutes
         self.is_future = is_future
+        self.is_prebaked = bool(is_prebaked)
         self.grid = grid  # shape (2700, 6100), dtype uint8, step 0.01 deg
         self.advect_drow = int(advect_drow)
         self.advect_dcol = int(advect_dcol)
@@ -213,6 +217,8 @@ class DopplerRadarService:
         self._cum_drow_fields: Dict[int, np.ndarray] = {}         # fut_mult (1..8) -> shape (110, 245) float32
         self._cum_dcol_fields: Dict[int, np.ndarray] = {}         # fut_mult (1..8) -> shape (110, 245) float32
         self._hrrr_trend_fields: Dict[int, np.ndarray] = {}       # fut_mult (1..8) -> shape (110, 245) float32
+        self._hrrr_1km_cache: Dict[str, np.ndarray] = {}          # "{init_tag}:{lead}" -> (2700, 6100) uint8
+        self._hrrr_active_init_tag: str = ""
         self._rainviewer_frames: List[Dict[str, Any]] = []
         self._rainviewer_host: str = "https://tilecache.rainviewer.com"
 
@@ -226,7 +232,7 @@ class DopplerRadarService:
     def _prune_disk_archive(self, max_age_hours: int = 24) -> None:
         try:
             cutoff_ts = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
-            for pattern in ("n0q_*.png", "hrrr_*.png"):
+            for pattern in ("mrms_*.png", "n0q_*.png", "hrrr_*.png"):
                 for p in self.archive_dir.glob(pattern):
                     if p.stat().st_mtime < cutoff_ts:
                         p.unlink(missing_ok=True)
@@ -234,10 +240,70 @@ class DopplerRadarService:
             pass
 
     @staticmethod
-    def _decode_iem_png_to_1km_grid(png_bytes: bytes) -> np.ndarray:
+    def _box_sum_2d(mask: np.ndarray, radius: int) -> np.ndarray:
+        """Exact O(1)-per-pixel (2*radius+1)x(2*radius+1) neighborhood sum via 2D integral image."""
+        win = 2 * radius + 1
+        padded = np.pad(
+            mask.astype(np.int32),
+            ((radius + 1, radius), (radius + 1, radius)),
+            mode="constant",
+            constant_values=0,
+        )
+        cs = np.cumsum(np.cumsum(padded, axis=0), axis=1)
+        return cs[win:, win:] - cs[:-win, win:] - cs[win:, :-win] + cs[:-win, :-win]
+
+    @classmethod
+    def _decode_mrms_to_1km_grid(
+        cls, lcref_bytes: bytes, a2m_bytes: Optional[bytes] = None
+    ) -> np.ndarray:
         """
-        Decodes IEM 5400x12200 8-bit N0Q PNG into a 2700x6100 (1km) uint8 numpy array,
-        filtering out clear-air ground clutter (<13.5 dBZ / idx < 92) and isolated radar speckles.
+        Decodes NOAA NCEP MRMS 2-minute Quality-Controlled Lowest-Altitude Reflectivity (`lcref`,
+        3500x7000 at 0.01° covering 55°N..20°N, -130°W..-60°W) fused with MRMS 2-minute Surface
+        Precipitation Accumulation (`a2m`, 0.02mm units) into the 2700x6100 (1km) Züs master grid.
+
+        Eliminates elevated virga rings, bright-band beam overshoot, biological/lake chaff, and
+        anomalous propagation while preserving true surface-reaching rain and snow gradients.
+        """
+        with Image.open(io.BytesIO(lcref_bytes)) as lc_img:
+            lc_full = np.asarray(lc_img, dtype=np.uint8)
+            # Exact 1:1 0.01° slice for 50.0°N..23.0°N, -126.0°W..-65.0°W
+            lc_sub = lc_full[500:3200, 400:6500]
+
+        # MRMS lcref lookup: 0 = clear, 255 = nodata, 1..254 -> dBZ = -32.0 + idx * 0.5
+        # Züs master grid lookup: dBZ = -32.5 + zus_idx * 0.5  =>  zus_idx = lcref_idx + 1
+        valid_lc = (lc_sub > 0) & (lc_sub < 255)
+        grid = np.where(valid_lc, np.minimum(254, lc_sub.astype(np.uint16) + 1), 0).astype(np.uint8)
+
+        if a2m_bytes is not None:
+            try:
+                with Image.open(io.BytesIO(a2m_bytes)) as a2_img:
+                    a2_full = np.asarray(a2_img, dtype=np.uint8)
+                    a2_sub = a2_full[500:3200, 400:6500]
+                # Confirmed surface QPE (>= 0.02mm / 2min = 0.6 mm/hr) within 8km radius
+                wet_qpe = (a2_sub >= 1) & (a2_sub < 255)
+                near_qpe = cls._box_sum_2d(wet_qpe, radius=8) > 0
+                # Near active surface precip: preserve smooth outer rain/snow fringes down to 14.5 dBZ (idx 94).
+                # Dry surface QPE (>8km from any a2m>=1): require >= 18.0 dBZ (idx 101) to allow genuine
+                # light winter snow flurries while stripping residual mid-level virga & clear-air clutter.
+                keep = np.where(near_qpe, grid >= 94, grid >= 101)
+                grid = np.where(keep, grid, 0)
+            except Exception:
+                grid[grid < 95] = 0
+        else:
+            grid[grid < 95] = 0
+
+        # Morphological despeckle: 3x3 (>=3 active) + 5x5 (>=8 active) spatial continuity
+        active3 = cls._box_sum_2d(grid >= 94, radius=1)
+        grid[active3 < 3] = 0
+        active5 = cls._box_sum_2d(grid >= 94, radius=2)
+        grid[active5 < 8] = 0
+        return grid
+
+    @classmethod
+    def _decode_iem_png_to_1km_grid(cls, png_bytes: bytes) -> np.ndarray:
+        """
+        Fallback decoder for IEM 5400x12200 8-bit N0Q PNG into a 2700x6100 (1km) uint8 numpy array,
+        filtering out clear-air ground clutter (<15.5 dBZ / idx < 96) and isolated AP speckles.
         """
         with Image.open(io.BytesIO(png_bytes)) as img:
             arr = np.asarray(img, dtype=np.uint8)
@@ -250,38 +316,116 @@ class DopplerRadarService:
             p10 = arr[1:h2:2, 0:w2:2]
             p11 = arr[1:h2:2, 1:w2:2]
 
-            # Require at least 2 of 4 500m sub-pixels to exceed +13.5 dBZ (idx 92)
-            # to reject NEXRAD clear-air/AP ground clutter and high-cloud static
             active_sub = (
-                (p00 >= 92).astype(np.uint8)
-                + (p01 >= 92).astype(np.uint8)
-                + (p10 >= 92).astype(np.uint8)
-                + (p11 >= 92).astype(np.uint8)
+                (p00 >= 96).astype(np.uint8)
+                + (p01 >= 96).astype(np.uint8)
+                + (p10 >= 96).astype(np.uint8)
+                + (p11 >= 96).astype(np.uint8)
             )
             pooled = np.maximum(np.maximum(p00, p01), np.maximum(p10, p11))
             pooled[active_sub < 2] = 0
-            pooled[pooled < 92] = 0
+            pooled[pooled < 96] = 0
 
-            # 3x3 morphological despeckle: reject isolated 1km clutter specks (nbr_count < 3)
-            mask = (pooled >= 92).astype(np.uint8)
-            pad_m = np.pad(mask, 1, mode="constant", constant_values=0)
-            nbr_count = (
-                pad_m[:-2, :-2] + pad_m[:-2, 1:-1] + pad_m[:-2, 2:]
-                + pad_m[1:-1, :-2] + pad_m[1:-1, 1:-1] + pad_m[1:-1, 2:]
-                + pad_m[2:, :-2] + pad_m[2:, 1:-1] + pad_m[2:, 2:]
-            )
-            pooled[nbr_count < 3] = 0
-
-            # 5x5 spatial continuity filter: reject 2-7 pixel urban skyscraper/tower/wind-farm AP clutter islands
-            mask5 = (pooled >= 92).astype(np.uint8)
-            pad5 = np.pad(mask5, 2, mode="constant", constant_values=0)
-            nbr5_count = sum(
-                pad5[dr : dr + mask5.shape[0], dc : dc + mask5.shape[1]]
-                for dr in range(5)
-                for dc in range(5)
-            )
-            pooled[nbr5_count < 8] = 0
+            pooled[cls._box_sum_2d(pooled >= 96, radius=1) < 3] = 0
+            pooled[cls._box_sum_2d(pooled >= 96, radius=2) < 9] = 0
             return pooled
+
+    @classmethod
+    def _decode_hrrr_to_1km_grid(cls, h_arr_2km: np.ndarray) -> np.ndarray:
+        """
+        Upsamples NOAA HRRR 2km (0.02°, 1340x3050, 50.0°N..23.2°N, -126.0°W..-65.0°W)
+        simulated surface reflectivity (`refd`) into the 2700x6100 (1km, 0.01°) master grid
+        via 4-slice bilinear interpolation (~6ms), filtering non-precipitating echoes (<15 dBZ).
+        """
+        clean = np.where((h_arr_2km >= 95) & (h_arr_2km < 255), h_arr_2km, 0).astype(np.uint8)
+        clean[cls._box_sum_2d(clean >= 95, radius=1) < 2] = 0
+
+        out = np.zeros((cls.GRID_H, cls.GRID_W), dtype=np.uint8)
+        if int(clean.max()) < 95:
+            return out
+
+        hf = np.where(clean > 0, clean.astype(np.float32), 80.0)
+        hp = np.pad(hf, ((0, 1), (0, 1)), mode="edge")
+        h00 = hp[:-1, :-1]
+        h01 = hp[:-1, 1:]
+        h10 = hp[1:, :-1]
+        h11 = hp[1:, 1:]
+
+        up_h = min(cls.GRID_H, h00.shape[0] * 2)
+        up_w = min(cls.GRID_W, h00.shape[1] * 2)
+        sh, sw = up_h // 2, up_w // 2
+
+        sub_f = np.empty((sh * 2, sw * 2), dtype=np.float32)
+        sub_f[0::2, 0::2] = h00[:sh, :sw]
+        sub_f[0::2, 1::2] = (h00[:sh, :sw] + h01[:sh, :sw]) * 0.5
+        sub_f[1::2, 0::2] = (h00[:sh, :sw] + h10[:sh, :sw]) * 0.5
+        sub_f[1::2, 1::2] = (h00[:sh, :sw] + h01[:sh, :sw] + h10[:sh, :sw] + h11[:sh, :sw]) * 0.25
+
+        out[: sh * 2, : sw * 2] = np.where(
+            sub_f >= 94.0, np.clip(np.round(sub_f), 0, 254), 0
+        ).astype(np.uint8)
+        return out
+
+    def _warp_and_blend_mrms_hrrr_sync(
+        self,
+        live_grid: np.ndarray,
+        step_idx: int,
+        hrrr_1km: Optional[np.ndarray],
+        w_hrrr: float,
+    ) -> np.ndarray:
+        """
+        Warps `live_grid` along the RK2 curved optical-flow field at `step_idx` and smoothly
+        cross-fades into `hrrr_1km` with weight `w_hrrr` (0..1) so storm initiation and decay
+        transition seamlessly between live MRMS nowcasting and 10-hour HRRR physics simulation.
+        """
+        if step_idx in self._cum_drow_fields and step_idx in self._cum_dcol_fields:
+            cum_dr = self._cum_drow_fields[step_idx]
+            cum_dc = self._cum_dcol_fields[step_idx]
+            th, tw = cum_dr.shape
+            fy = np.linspace(0.0, th - 1.001, self.GRID_H, dtype=np.float32)
+            fx = np.linspace(0.0, tw - 1.001, self.GRID_W, dtype=np.float32)
+            iy = fy.astype(np.int32)
+            ix = fx.astype(np.int32)
+            dy = (fy - iy)[:, None]
+            dx = (fx - ix)[None, :]
+            iy0, iy1 = iy[:, None], (iy + 1)[:, None]
+            ix0, ix1 = ix[None, :], (ix + 1)[None, :]
+
+            drow_2d = (
+                cum_dr[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                + cum_dr[iy0, ix1] * (1.0 - dy) * dx
+                + cum_dr[iy1, ix0] * dy * (1.0 - dx)
+                + cum_dr[iy1, ix1] * dy * dx
+            )
+            dcol_2d = (
+                cum_dc[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
+                + cum_dc[iy0, ix1] * (1.0 - dy) * dx
+                + cum_dc[iy1, ix0] * dy * (1.0 - dx)
+                + cum_dc[iy1, ix1] * dy * dx
+            )
+            rows_2d = np.round(np.arange(self.GRID_H, dtype=np.float32)[:, None] - drow_2d).astype(np.int32)
+            cols_2d = np.round(np.arange(self.GRID_W, dtype=np.float32)[None, :] - dcol_2d).astype(np.int32)
+            valid = (rows_2d >= 0) & (rows_2d < self.GRID_H) & (cols_2d >= 0) & (cols_2d < self.GRID_W)
+            adv_mrms = live_grid[
+                np.clip(rows_2d, 0, self.GRID_H - 1),
+                np.clip(cols_2d, 0, self.GRID_W - 1),
+            ].copy()
+            adv_mrms[~valid] = 0
+        else:
+            adv_mrms = self._advect_grid(
+                live_grid,
+                self._global_motion_drow_15m * step_idx,
+                self._global_motion_dcol_15m * step_idx,
+                decay_indices=step_idx,
+            )
+
+        if hrrr_1km is None or w_hrrr <= 0.0:
+            return adv_mrms
+
+        m_f = np.where(adv_mrms > 0, adv_mrms.astype(np.float32), 80.0)
+        h_f = np.where(hrrr_1km > 0, hrrr_1km.astype(np.float32), 80.0)
+        mix = (1.0 - w_hrrr) * m_f + w_hrrr * h_f
+        return np.where(mix >= 94.0, np.clip(np.round(mix), 0, 254), 0).astype(np.uint8)
 
     @staticmethod
     def _zncc_block_motion_15m(
@@ -735,14 +879,15 @@ class DopplerRadarService:
 
     async def refresh_dataset(self, force: bool = False) -> None:
         """
-        Downloads the latest CONUS N0Q Master Grid (plus historical 5-min archive frames on cold start),
-        builds the +15m and +30m advected nowcast frames, and logs telemetry to PostGIS.
+        Downloads the latest NOAA NCEP MRMS 2-minute Quality-Controlled Surface Reflectivity (`lcref`)
+        and 2-minute Surface QPE (`a2m`) grids (with automatic NEXRAD N0Q fallback), builds the +15m..+2h
+        Lagrangian advected nowcast frames, and logs telemetry to PostGIS.
         """
         now = datetime.now(timezone.utc)
         if (
             not force
             and self._last_ingested_at
-            and (now - self._last_ingested_at).total_seconds() < 240
+            and (now - self._last_ingested_at).total_seconds() < 110
             and len(self._frames) >= 4
         ):
             return
@@ -751,7 +896,7 @@ class DopplerRadarService:
             if (
                 not force
                 and self._last_ingested_at
-                and (datetime.now(timezone.utc) - self._last_ingested_at).total_seconds() < 240
+                and (datetime.now(timezone.utc) - self._last_ingested_at).total_seconds() < 110
                 and len(self._frames) >= 4
             ):
                 return
@@ -759,7 +904,7 @@ class DopplerRadarService:
             self._ensure_dir()
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
-                    # 1. Also refresh RainViewer manifest for global fallback
+                    # 1. Also refresh RainViewer manifest for global fallback outside North America
                     try:
                         rv_resp = await client.get("https://api.rainviewer.com/public/weather-maps.json")
                         if rv_resp.status_code == 200:
@@ -771,14 +916,16 @@ class DopplerRadarService:
                     except Exception:
                         pass
 
-                    # 2. Check IEM's current composite valid timestamp via n0q_0.json (with HEAD fallback)
-                    base_dt = None
+                    # 2. Check IEM's live 2-minute MRMS lcref valid timestamp (with N0Q fallback)
+                    base_dt: Optional[datetime] = None
+                    use_mrms = True
                     try:
-                        meta_resp = await client.get(
-                            "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json"
+                        mrms_meta_resp = await client.get(
+                            "https://mesonet.agron.iastate.edu/data/gis/images/4326/mrms/lcref.json"
                         )
-                        if meta_resp.status_code == 200:
-                            valid_str = meta_resp.json().get("meta", {}).get("valid")
+                        if mrms_meta_resp.status_code == 200:
+                            meta_obj = mrms_meta_resp.json().get("meta", {})
+                            valid_str = meta_obj.get("end_valid") or meta_obj.get("start_valid")
                             if valid_str:
                                 base_dt = datetime.strptime(valid_str, "%Y-%m-%dT%H:%M:%SZ").replace(
                                     tzinfo=timezone.utc
@@ -786,80 +933,173 @@ class DopplerRadarService:
                     except Exception:
                         pass
 
-                    if base_dt is None:
-                        head_resp = await client.head(
-                            "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.png"
-                        )
-                        lm_str = head_resp.headers.get("Last-Modified")
-                        if lm_str:
-                            base_dt = datetime.strptime(lm_str, "%a, %d %b %Y %H:%M:%S %Z").replace(
-                                tzinfo=timezone.utc
+                    if base_dt is not None:
+                        base_dt = base_dt.replace(minute=(base_dt.minute // 2) * 2, second=0, microsecond=0)
+                    else:
+                        use_mrms = False
+                        try:
+                            meta_resp = await client.get(
+                                "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.json"
                             )
-                        else:
-                            base_dt = now
-                    base_dt = base_dt.replace(minute=(base_dt.minute // 5) * 5, second=0, microsecond=0)
+                            if meta_resp.status_code == 200:
+                                valid_str = meta_resp.json().get("meta", {}).get("valid")
+                                if valid_str:
+                                    base_dt = datetime.strptime(valid_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                                        tzinfo=timezone.utc
+                                    )
+                        except Exception:
+                            pass
 
-                    # Offsets to maintain in ring buffer: -45m, -30m, -20m, -10m, -5m, 0m (LIVE)
-                    target_offsets = [-45, -30, -20, -10, -5, 0]
+                        if base_dt is None:
+                            head_resp = await client.head(
+                                "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.png"
+                            )
+                            lm_str = head_resp.headers.get("Last-Modified")
+                            if lm_str:
+                                base_dt = datetime.strptime(lm_str, "%a, %d %b %Y %H:%M:%S %Z").replace(
+                                    tzinfo=timezone.utc
+                                )
+                            else:
+                                base_dt = now
+                        base_dt = base_dt.replace(minute=(base_dt.minute // 5) * 5, second=0, microsecond=0)
+
+                    # Even-minute MRMS offsets mapped to canonical UI timeline slots (-45m..LIVE)
+                    mrms_slots = [
+                        (-44, -45, "-45m"),
+                        (-30, -30, "-30m"),
+                        (-20, -20, "-20m"),
+                        (-10, -10, "-10m"),
+                        (-4, -5, "-5m"),
+                        (0, 0, "LIVE"),
+                    ]
+                    n0q_slots = [
+                        (-45, -45, "-45m"),
+                        (-30, -30, "-30m"),
+                        (-20, -20, "-20m"),
+                        (-10, -10, "-10m"),
+                        (-5, -5, "-5m"),
+                        (0, 0, "LIVE"),
+                    ]
+                    target_slots = mrms_slots if use_mrms else n0q_slots
                     new_past_frames: List[DopplerGridFrame] = []
 
-                    for offset_min in target_offsets:
-                        frame_dt = base_dt + timedelta(minutes=offset_min)
-                        frame_id = f"n0q_{frame_dt:%Y%m%d%H%M}"
-                        label = "LIVE" if offset_min == 0 else f"{offset_min}m"
+                    for fetch_off_min, semantic_off_min, label in target_slots:
+                        frame_dt = base_dt + timedelta(minutes=fetch_off_min)
+                        prefix = "mrms" if use_mrms else "n0q"
+                        frame_id = f"{prefix}_{frame_dt:%Y%m%d%H%M}"
 
                         # Reuse if already decoded in memory
                         if frame_id in self._frames and not self._frames[frame_id].is_future:
                             existing_f = self._frames[frame_id]
                             existing_f.label = label
-                            existing_f.offset_minutes = offset_min
+                            existing_f.offset_minutes = semantic_off_min
                             new_past_frames.append(existing_f)
                             continue
 
-                        if offset_min == 0:
-                            url = "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.png"
-                        else:
-                            url = (
-                                f"https://mesonet.agron.iastate.edu/archive/data/"
-                                f"{frame_dt:%Y/%m/%d}/GIS/uscomp/n0q_{frame_dt:%Y%m%d%H%M}.png"
-                            )
-
                         try:
-                            archive_file = self.archive_dir / f"{frame_id}.png"
-                            raw_bytes: Optional[bytes] = None
-                            was_backfilled = offset_min < 0
+                            grid_1km: Optional[np.ndarray] = None
+                            raw_len = 0
+                            was_backfilled = fetch_off_min < 0
 
-                            if archive_file.exists() and archive_file.stat().st_size > 50_000:
-                                raw_bytes = archive_file.read_bytes()
-                                was_backfilled = False
-                            else:
-                                resp = await client.get(url)
-                                if resp.status_code == 200 and len(resp.content) > 50_000:
-                                    raw_bytes = resp.content
-                                    try:
-                                        archive_file.write_bytes(raw_bytes)
-                                    except Exception:
-                                        pass
+                            if use_mrms:
+                                lc_file = self.archive_dir / f"mrms_lcref_{frame_dt:%Y%m%d%H%M}.png"
+                                a2_file = self.archive_dir / f"mrms_a2m_{frame_dt:%Y%m%d%H%M}.png"
+                                lc_bytes: Optional[bytes] = None
+                                a2_bytes: Optional[bytes] = None
 
-                            if raw_bytes is not None:
-                                grid_1km = await asyncio.to_thread(self._decode_iem_png_to_1km_grid, raw_bytes)
+                                if lc_file.exists() and lc_file.stat().st_size > 20_000:
+                                    lc_bytes = lc_file.read_bytes()
+                                    was_backfilled = False
+                                    if a2_file.exists() and a2_file.stat().st_size > 10_000:
+                                        a2_bytes = a2_file.read_bytes()
+                                else:
+                                    if fetch_off_min == 0:
+                                        lc_url = "https://mesonet.agron.iastate.edu/data/gis/images/4326/mrms/lcref.png"
+                                        a2_url = "https://mesonet.agron.iastate.edu/data/gis/images/4326/mrms/a2m.png"
+                                    else:
+                                        lc_url = (
+                                            f"https://mesonet.agron.iastate.edu/archive/data/"
+                                            f"{frame_dt:%Y/%m/%d}/GIS/mrms/lcref_{frame_dt:%Y%m%d%H%M}.png"
+                                        )
+                                        a2_url = (
+                                            f"https://mesonet.agron.iastate.edu/archive/data/"
+                                            f"{frame_dt:%Y/%m/%d}/GIS/mrms/a2m_{frame_dt:%Y%m%d%H%M}.png"
+                                        )
+                                    lc_resp, a2_resp = await asyncio.gather(
+                                        client.get(lc_url),
+                                        client.get(a2_url),
+                                        return_exceptions=True,
+                                    )
+                                    if (
+                                        not isinstance(lc_resp, Exception)
+                                        and lc_resp.status_code == 200
+                                        and len(lc_resp.content) > 20_000
+                                    ):
+                                        lc_bytes = lc_resp.content
+                                        try:
+                                            lc_file.write_bytes(lc_bytes)
+                                        except Exception:
+                                            pass
+                                    if (
+                                        not isinstance(a2_resp, Exception)
+                                        and a2_resp.status_code == 200
+                                        and len(a2_resp.content) > 10_000
+                                    ):
+                                        a2_bytes = a2_resp.content
+                                        try:
+                                            a2_file.write_bytes(a2_bytes)
+                                        except Exception:
+                                            pass
+
+                                if lc_bytes is not None:
+                                    grid_1km = await asyncio.to_thread(
+                                        self._decode_mrms_to_1km_grid, lc_bytes, a2_bytes
+                                    )
+                                    raw_len = len(lc_bytes) + (len(a2_bytes) if a2_bytes else 0)
+                                    if fetch_off_min == 0:
+                                        try:
+                                            (self.doppler_dir / "latest_conus_mrms_lcref.png").write_bytes(lc_bytes)
+                                        except Exception:
+                                            pass
+
+                            # Per-frame fallback to NEXRAD N0Q if MRMS unavailable
+                            if grid_1km is None:
+                                n0q_dt = frame_dt.replace(minute=(frame_dt.minute // 5) * 5, second=0, microsecond=0)
+                                frame_id = f"n0q_{n0q_dt:%Y%m%d%H%M}"
+                                archive_file = self.archive_dir / f"{frame_id}.png"
+                                raw_bytes: Optional[bytes] = None
+                                if archive_file.exists() and archive_file.stat().st_size > 50_000:
+                                    raw_bytes = archive_file.read_bytes()
+                                    was_backfilled = False
+                                else:
+                                    n0q_url = (
+                                        "https://mesonet.agron.iastate.edu/data/gis/images/4326/USCOMP/n0q_0.png"
+                                        if fetch_off_min == 0
+                                        else f"https://mesonet.agron.iastate.edu/archive/data/{n0q_dt:%Y/%m/%d}/GIS/uscomp/n0q_{n0q_dt:%Y%m%d%H%M}.png"
+                                    )
+                                    resp = await client.get(n0q_url)
+                                    if resp.status_code == 200 and len(resp.content) > 50_000:
+                                        raw_bytes = resp.content
+                                        try:
+                                            archive_file.write_bytes(raw_bytes)
+                                        except Exception:
+                                            pass
+                                if raw_bytes is not None:
+                                    grid_1km = await asyncio.to_thread(self._decode_iem_png_to_1km_grid, raw_bytes)
+                                    raw_len = len(raw_bytes)
+                                    frame_dt = n0q_dt
+
+                            if grid_1km is not None:
                                 frame_obj = DopplerGridFrame(
                                     frame_id=frame_id,
                                     dt=frame_dt,
                                     label=label,
-                                    offset_minutes=offset_min,
+                                    offset_minutes=semantic_off_min,
                                     is_future=False,
                                     grid=grid_1km,
-                                    raw_bytes=len(raw_bytes),
+                                    raw_bytes=raw_len,
                                 )
                                 new_past_frames.append(frame_obj)
-
-                                # Save latest live composite to disk for dataset persistence
-                                if offset_min == 0:
-                                    try:
-                                        (self.doppler_dir / "latest_conus_n0q.png").write_bytes(raw_bytes)
-                                    except Exception:
-                                        pass
 
                                 await db_manager.record_doppler_frame(
                                     frame_id=frame_id,
@@ -869,7 +1109,7 @@ class DopplerRadarService:
                                     max_dbz=frame_obj.max_dbz,
                                     echo_coverage_pct=frame_obj.echo_coverage_pct,
                                     storm_cells_detected=frame_obj.storm_cells_count,
-                                    raw_bytes=len(raw_bytes),
+                                    raw_bytes=raw_len,
                                     is_nowcast=False,
                                     backfilled=was_backfilled,
                                 )
@@ -881,8 +1121,34 @@ class DopplerRadarService:
 
                     live_frame = new_past_frames[-1]
 
-                    # Fetch NOAA HRRR 15-minute Subhourly Forecast Reflectivity grids (0m, +30m, +60m, +90m, +120m)
+                    # Fetch NOAA HRRR Subhourly Forecast Reflectivity grids out to +10h (+600m)
+                    future_steps = [
+                        (15, "+15m"),
+                        (30, "+30m"),
+                        (45, "+45m"),
+                        (60, "+1h"),
+                        (90, "+1h 30m"),
+                        (120, "+2h"),
+                        (150, "+2h 30m"),
+                        (180, "+3h"),
+                        (210, "+3h 30m"),
+                        (240, "+4h"),
+                        (270, "+4h 30m"),
+                        (300, "+5h"),
+                        (330, "+5h 30m"),
+                        (360, "+6h"),
+                        (390, "+6h 30m"),
+                        (420, "+7h"),
+                        (450, "+7h 30m"),
+                        (480, "+8h"),
+                        (510, "+8h 30m"),
+                        (540, "+9h"),
+                        (570, "+9h 30m"),
+                        (600, "+10h"),
+                    ]
+                    needed_hrrr_offs = [0] + [m for m, _ in future_steps if m >= 30]
                     hrrr_grids: Dict[int, np.ndarray] = {}
+                    hrrr_1km_map: Dict[int, np.ndarray] = {}
                     try:
                         hrrr_base = "https://mesonet.agron.iastate.edu/data/gis/images/4326/hrrr"
                         h_meta_resp = await client.get(f"{hrrr_base}/refd_0000.json")
@@ -897,32 +1163,52 @@ class DopplerRadarService:
                                     int(round((live_frame.dt - h_init_dt).total_seconds() / 60.0 / 15.0)) * 15,
                                 )
                                 init_tag = f"{h_init_dt:%Y%m%d%H%M}"
-                                for h_off in (0, 30, 60, 90, 120):
+                                if init_tag != self._hrrr_active_init_tag:
+                                    self._hrrr_1km_cache.clear()
+                                    self._hrrr_active_init_tag = init_tag
+
+                                sem = asyncio.Semaphore(6)
+
+                                async def _load_hrrr_offset(h_off: int) -> None:
                                     lead = lead0 + h_off
                                     if lead > 1080:
-                                        continue
+                                        return
+                                    ck_1km = f"{init_tag}:{lead}"
                                     h_file = self.archive_dir / f"hrrr_{init_tag}_{lead:04d}.png"
                                     h_bytes: Optional[bytes] = None
-                                    if h_file.exists() and h_file.stat().st_size > 20_000:
-                                        h_bytes = h_file.read_bytes()
+                                    if h_file.exists() and h_file.stat().st_size > 15_000:
+                                        if h_off <= 120 or ck_1km not in self._hrrr_1km_cache:
+                                            h_bytes = h_file.read_bytes()
                                     else:
-                                        h_resp = await client.get(f"{hrrr_base}/refd_{lead:04d}.png")
-                                        if h_resp.status_code == 200 and len(h_resp.content) > 20_000:
-                                            h_bytes = h_resp.content
-                                            try:
-                                                h_file.write_bytes(h_bytes)
-                                            except Exception:
-                                                pass
+                                        async with sem:
+                                            h_resp = await client.get(f"{hrrr_base}/refd_{lead:04d}.png")
+                                            if h_resp.status_code == 200 and len(h_resp.content) > 15_000:
+                                                h_bytes = h_resp.content
+                                                try:
+                                                    h_file.write_bytes(h_bytes)
+                                                except Exception:
+                                                    pass
                                     if h_bytes is not None:
                                         with Image.open(io.BytesIO(h_bytes)) as h_img:
-                                            hrrr_grids[h_off] = np.asarray(h_img, dtype=np.uint8)
+                                            arr2k = np.asarray(h_img, dtype=np.uint8)
+                                        if h_off in (0, 30, 60, 90, 120):
+                                            hrrr_grids[h_off] = arr2k
+                                        if h_off >= 30:
+                                            if ck_1km not in self._hrrr_1km_cache:
+                                                self._hrrr_1km_cache[ck_1km] = await asyncio.to_thread(
+                                                    self._decode_hrrr_to_1km_grid, arr2k
+                                                )
+                                    if h_off >= 30 and ck_1km in self._hrrr_1km_cache:
+                                        hrrr_1km_map[h_off] = self._hrrr_1km_cache[ck_1km]
+
+                                await asyncio.gather(*(_load_hrrr_offset(o) for o in needed_hrrr_offs))
                     except Exception as e:
-                        print(f"⚠️ HRRR reflectivity guidance fetch warning: {e}")
+                        print(f"⚠️ HRRR 10h reflectivity guidance fetch warning: {e}")
 
                     # Compute mesoscale storm motion field + 16-step RK2 curved backward trajectories
                     if len(new_past_frames) >= 2:
                         ref_frame = new_past_frames[1] if len(new_past_frames) >= 4 else new_past_frames[0]
-                        mins_diff = max(5.0, (live_frame.dt - ref_frame.dt).total_seconds() / 60.0)
+                        mins_diff = max(4.0, (live_frame.dt - ref_frame.dt).total_seconds() / 60.0)
                         drow, dcol = await asyncio.to_thread(
                             self._estimate_motion_vector_15m,
                             ref_frame.grid,
@@ -948,37 +1234,87 @@ class DopplerRadarService:
                         self._cum_dcol_fields = cum_dc
                         self._hrrr_trend_fields = hrrr_trends
 
-                    # 3. Synthesize 2-Hour (+15m .. +2h in 15m steps) Zero-Copy Advected Nowcast Future Frames
-                    future_steps = [
-                        (1, 15, "+15m"),
-                        (2, 30, "+30m"),
-                        (3, 45, "+45m"),
-                        (4, 60, "+1h"),
-                        (5, 75, "+1h 15m"),
-                        (6, 90, "+1h 30m"),
-                        (7, 105, "+1h 45m"),
-                        (8, 120, "+2h"),
-                    ]
+                    # 3. Synthesize 10-Hour (+15m .. +10h) Seamless MRMS Optical-Flow -> HRRR Forecast Radar Cube
+                    blend_weights = {15: 0.0, 30: 0.22, 45: 0.45, 60: 0.70, 90: 0.88}
                     future_frames: List[DopplerGridFrame] = []
-                    for fut_mult, fut_min, fut_label in future_steps:
+                    for fut_min, fut_label in future_steps:
                         fut_dt = live_frame.dt + timedelta(minutes=fut_min)
                         fut_id = f"nowcast_{fut_dt:%Y%m%d%H%M}"
-                        fut_obj = DopplerGridFrame(
-                            frame_id=fut_id,
-                            dt=fut_dt,
-                            label=fut_label,
-                            offset_minutes=fut_min,
-                            is_future=True,
-                            grid=live_frame.grid,
-                            raw_bytes=live_frame.raw_bytes,
-                            advect_drow=self._global_motion_drow_15m * fut_mult,
-                            advect_dcol=self._global_motion_dcol_15m * fut_mult,
-                            decay_indices=fut_mult,
-                        )
+                        h_grid_1k = hrrr_1km_map.get(fut_min)
+
+                        if fut_min == 15:
+                            # Pure live MRMS sub-pixel RK2 optical-flow nowcast
+                            fut_obj = DopplerGridFrame(
+                                frame_id=fut_id,
+                                dt=fut_dt,
+                                label=fut_label,
+                                offset_minutes=fut_min,
+                                is_future=True,
+                                grid=live_frame.grid,
+                                raw_bytes=live_frame.raw_bytes,
+                                advect_drow=self._global_motion_drow_15m,
+                                advect_dcol=self._global_motion_dcol_15m,
+                                decay_indices=1,
+                                is_prebaked=False,
+                            )
+                        elif fut_min in blend_weights:
+                            w_h = blend_weights[fut_min]
+                            step_idx = max(1, min(8, fut_min // 15))
+                            blended_grid = await asyncio.to_thread(
+                                self._warp_and_blend_mrms_hrrr_sync,
+                                live_frame.grid,
+                                step_idx,
+                                h_grid_1k,
+                                w_h,
+                            )
+                            fut_obj = DopplerGridFrame(
+                                frame_id=fut_id,
+                                dt=fut_dt,
+                                label=fut_label,
+                                offset_minutes=fut_min,
+                                is_future=True,
+                                grid=blended_grid,
+                                raw_bytes=live_frame.raw_bytes,
+                                advect_drow=0,
+                                advect_dcol=0,
+                                decay_indices=0,
+                                is_prebaked=True,
+                            )
+                        elif h_grid_1k is not None:
+                            # +2h .. +10h: Pure 1km upsampled NOAA HRRR physics-simulated radar
+                            fut_obj = DopplerGridFrame(
+                                frame_id=fut_id,
+                                dt=fut_dt,
+                                label=fut_label,
+                                offset_minutes=fut_min,
+                                is_future=True,
+                                grid=h_grid_1k,
+                                raw_bytes=h_grid_1k.nbytes,
+                                advect_drow=0,
+                                advect_dcol=0,
+                                decay_indices=0,
+                                is_prebaked=True,
+                            )
+                        else:
+                            # Graceful advection fallback if HRRR lead unavailable
+                            step_mult = max(1, fut_min // 15)
+                            fut_obj = DopplerGridFrame(
+                                frame_id=fut_id,
+                                dt=fut_dt,
+                                label=fut_label,
+                                offset_minutes=fut_min,
+                                is_future=True,
+                                grid=live_frame.grid,
+                                raw_bytes=live_frame.raw_bytes,
+                                advect_drow=self._global_motion_drow_15m * step_mult,
+                                advect_dcol=self._global_motion_dcol_15m * step_mult,
+                                decay_indices=min(8, step_mult),
+                                is_prebaked=False,
+                            )
                         future_frames.append(fut_obj)
 
-                    # Evict any stale nowcast tiles from cache on refresh
-                    stale_keys = [k for k in self._tile_cache if k.startswith("nowcast_")]
+                    # Evict any stale nowcast/alias tiles from cache on refresh
+                    stale_keys = [k for k in self._tile_cache if k.startswith("nowcast_") or k.startswith("latest:")]
                     for k in stale_keys:
                         self._tile_cache.pop(k, None)
 
@@ -998,14 +1334,13 @@ class DopplerRadarService:
         """
         Detects any missing historical Doppler radar checkpoints in PostGIS over the past
         `lookback_hours` (caused by server power-off, reboot, or network outage) and
-        automatically backfills them from local NVMe archive or Iowa State Mesonet's NEXRAD archive.
+        automatically backfills them from local NVMe archive or Iowa State Mesonet's MRMS archive.
         """
         async with self._backfill_lock:
             self._ensure_dir()
             self._prune_disk_archive(max_age_hours=max(24, lookback_hours))
 
             now = datetime.now(timezone.utc)
-            # Determine latest reference 15-min synoptic mark
             base_dt = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
             if self._frames:
                 live_candidates = [f for f in self._frames.values() if not f.is_future]
@@ -1016,44 +1351,75 @@ class DopplerRadarService:
             since_dt = base_dt - timedelta(hours=lookback_hours)
             existing_ids = await db_manager.get_existing_doppler_frame_ids(since_dt)
 
-            # Build expected 15-minute synoptic checkpoints across the lookback window
             missing_dts: List[datetime] = []
             steps = int((lookback_hours * 60) // 15)
             for step in range(1, steps + 1):
                 cand_dt = base_dt - timedelta(minutes=step * 15)
-                cand_id = f"n0q_{cand_dt:%Y%m%d%H%M}"
-                if cand_id not in existing_ids:
-                    missing_dts.append(cand_dt)
+                mrms_dt = cand_dt.replace(minute=(cand_dt.minute // 2) * 2, second=0, microsecond=0)
+                if (
+                    f"mrms_{mrms_dt:%Y%m%d%H%M}" not in existing_ids
+                    and f"n0q_{cand_dt:%Y%m%d%H%M}" not in existing_ids
+                ):
+                    missing_dts.append(mrms_dt)
 
             recovered = 0
             checked = len(missing_dts)
             if missing_dts:
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     for frame_dt in missing_dts[:max_batch]:
-                        frame_id = f"n0q_{frame_dt:%Y%m%d%H%M}"
-                        archive_file = self.archive_dir / f"{frame_id}.png"
-                        raw_bytes: Optional[bytes] = None
+                        frame_id = f"mrms_{frame_dt:%Y%m%d%H%M}"
+                        lc_file = self.archive_dir / f"mrms_lcref_{frame_dt:%Y%m%d%H%M}.png"
+                        a2_file = self.archive_dir / f"mrms_a2m_{frame_dt:%Y%m%d%H%M}.png"
+                        lc_bytes: Optional[bytes] = None
+                        a2_bytes: Optional[bytes] = None
 
                         try:
-                            if archive_file.exists() and archive_file.stat().st_size > 50_000:
-                                raw_bytes = archive_file.read_bytes()
+                            if lc_file.exists() and lc_file.stat().st_size > 20_000:
+                                lc_bytes = lc_file.read_bytes()
+                                if a2_file.exists() and a2_file.stat().st_size > 10_000:
+                                    a2_bytes = a2_file.read_bytes()
                             else:
-                                url = (
+                                lc_url = (
                                     f"https://mesonet.agron.iastate.edu/archive/data/"
-                                    f"{frame_dt:%Y/%m/%d}/GIS/uscomp/n0q_{frame_dt:%Y%m%d%H%M}.png"
+                                    f"{frame_dt:%Y/%m/%d}/GIS/mrms/lcref_{frame_dt:%Y%m%d%H%M}.png"
                                 )
-                                resp = await client.get(url)
-                                if resp.status_code == 200 and len(resp.content) > 50_000:
-                                    raw_bytes = resp.content
-                                    # Keep recent 6h on disk
+                                a2_url = (
+                                    f"https://mesonet.agron.iastate.edu/archive/data/"
+                                    f"{frame_dt:%Y/%m/%d}/GIS/mrms/a2m_{frame_dt:%Y%m%d%H%M}.png"
+                                )
+                                lc_resp, a2_resp = await asyncio.gather(
+                                    client.get(lc_url),
+                                    client.get(a2_url),
+                                    return_exceptions=True,
+                                )
+                                if (
+                                    not isinstance(lc_resp, Exception)
+                                    and lc_resp.status_code == 200
+                                    and len(lc_resp.content) > 20_000
+                                ):
+                                    lc_bytes = lc_resp.content
                                     if (base_dt - frame_dt).total_seconds() <= 6 * 3600:
                                         try:
-                                            archive_file.write_bytes(raw_bytes)
+                                            lc_file.write_bytes(lc_bytes)
+                                        except Exception:
+                                            pass
+                                if (
+                                    not isinstance(a2_resp, Exception)
+                                    and a2_resp.status_code == 200
+                                    and len(a2_resp.content) > 10_000
+                                ):
+                                    a2_bytes = a2_resp.content
+                                    if (base_dt - frame_dt).total_seconds() <= 6 * 3600:
+                                        try:
+                                            a2_file.write_bytes(a2_bytes)
                                         except Exception:
                                             pass
 
-                            if raw_bytes is not None:
-                                grid_1km = await asyncio.to_thread(self._decode_iem_png_to_1km_grid, raw_bytes)
+                            if lc_bytes is not None:
+                                grid_1km = await asyncio.to_thread(
+                                    self._decode_mrms_to_1km_grid, lc_bytes, a2_bytes
+                                )
+                                raw_len = len(lc_bytes) + (len(a2_bytes) if a2_bytes else 0)
                                 frame_obj = DopplerGridFrame(
                                     frame_id=frame_id,
                                     dt=frame_dt,
@@ -1061,7 +1427,7 @@ class DopplerRadarService:
                                     offset_minutes=-int((base_dt - frame_dt).total_seconds() // 60),
                                     is_future=False,
                                     grid=grid_1km,
-                                    raw_bytes=len(raw_bytes),
+                                    raw_bytes=raw_len,
                                 )
                                 await db_manager.record_doppler_frame(
                                     frame_id=frame_id,
@@ -1071,7 +1437,7 @@ class DopplerRadarService:
                                     max_dbz=frame_obj.max_dbz,
                                     echo_coverage_pct=frame_obj.echo_coverage_pct,
                                     storm_cells_detected=frame_obj.storm_cells_count,
-                                    raw_bytes=len(raw_bytes),
+                                    raw_bytes=raw_len,
                                     is_nowcast=False,
                                     backfilled=True,
                                 )
@@ -1130,6 +1496,73 @@ class DopplerRadarService:
         lat_south = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * (y + 1) / n))))
         return (lat_north, lon_west, lat_south, lon_east)
 
+    def _sample_bilinear_smooth(
+        self,
+        grid: np.ndarray,
+        f_rows: np.ndarray,
+        f_cols: np.ndarray,
+        valid_mask: np.ndarray,
+        smooth_contours: bool = True,
+    ) -> Optional[np.ndarray]:
+        """
+        Vectorized sub-pixel 2D bilinear sampler + separable 3x3 Gaussian contour anti-aliaser.
+        Short-circuits in <0.02ms when the bounding box contains no active precipitation.
+        """
+        r_min = max(0, int(np.floor(np.min(f_rows))) - 1)
+        r_max = min(self.GRID_H - 1, int(np.ceil(np.max(f_rows))) + 2)
+        c_min = max(0, int(np.floor(np.min(f_cols))) - 1)
+        c_max = min(self.GRID_W - 1, int(np.ceil(np.max(f_cols))) + 2)
+        if r_max <= r_min or c_max <= c_min:
+            return None
+
+        win_u8 = grid[r_min : r_max + 1, c_min : c_max + 1]
+        if int(win_u8.max()) < 90:
+            return None
+
+        # Map clear pixels (0) to sub-threshold base index 79.0 (7.0 dBZ, below alpha=0 stop 82)
+        # so storm edges feather smoothly along curved iso-contours without attenuating storm interiors.
+        win_f = np.where(win_u8 > 0, win_u8.astype(np.float32), 79.0)
+        wh, ww = win_f.shape
+
+        lr = np.clip(f_rows.astype(np.float32) - r_min, 0.0, max(0.0, wh - 1.001))
+        lc = np.clip(f_cols.astype(np.float32) - c_min, 0.0, max(0.0, ww - 1.001))
+
+        r0 = lr.astype(np.int32)
+        c0 = lc.astype(np.int32)
+        dr = lr - r0
+        dc = lc - c0
+        r1 = np.minimum(r0 + 1, wh - 1)
+        c1 = np.minimum(c0 + 1, ww - 1)
+
+        if lr.ndim == 1 and lc.ndim == 1:
+            r0_2, r1_2, dr_2 = r0[:, None], r1[:, None], dr[:, None]
+            c0_2, c1_2, dc_2 = c0[None, :], c1[None, :], dc[None, :]
+            val = (
+                win_f[r0_2, c0_2] * (1.0 - dr_2) * (1.0 - dc_2)
+                + win_f[r0_2, c1_2] * (1.0 - dr_2) * dc_2
+                + win_f[r1_2, c0_2] * dr_2 * (1.0 - dc_2)
+                + win_f[r1_2, c1_2] * dr_2 * dc_2
+            )
+        else:
+            val = (
+                win_f[r0, c0] * (1.0 - dr) * (1.0 - dc)
+                + win_f[r0, c1] * (1.0 - dr) * dc
+                + win_f[r1, c0] * dr * (1.0 - dc)
+                + win_f[r1, c1] * dr * dc
+            )
+
+        if smooth_contours:
+            pad = np.pad(val, 1, mode="edge")
+            h_blur = (pad[:, :-2] + 2.0 * pad[:, 1:-1] + pad[:, 2:]) * 0.25
+            val = (h_blur[:-2, :] + 2.0 * h_blur[1:-1, :] + h_blur[2:, :]) * 0.25
+
+        out = np.where(val >= 83.0, np.clip(np.round(val), 0, 254), 0).astype(np.uint8)
+        if not np.all(valid_mask):
+            out[~valid_mask] = 0
+        if int(out.max()) < 86:
+            return None
+        return out
+
     def _slice_conus_tile_sync(
         self,
         grid: np.ndarray,
@@ -1142,9 +1575,8 @@ class DopplerRadarService:
         fut_mult: float = 0.0,
     ) -> bytes:
         """
-        Slices a 256x256 WebMercator tile directly from the 2700x6100 uint8 master grid
-        (with spatially-smooth 2D regional Lagrangian advection for future nowcast frames)
-        and encodes an 8-bit Indexed PNG with the Züs Storm Palette in <0.5ms.
+        Slices a 256x256 WebMercator tile from the 2700x6100 uint8 MRMS master grid
+        using sub-pixel bilinear contour anti-aliasing and Lagrangian advection.
         """
         n = 2.0 ** z
         px = (np.arange(256, dtype=np.float64) + 0.5) / 256.0
@@ -1154,8 +1586,8 @@ class DopplerRadarService:
         merc_y = math.pi * (1.0 - 2.0 * (y + py) / n)
         lats = np.degrees(np.arctan(np.sinh(merc_y)))
 
-        base_cols = (lons - self.LON_MIN) / self.STEP_DEG
-        base_rows = (self.LAT_MAX - lats) / self.STEP_DEG
+        base_cols = (lons - self.LON_MIN) / self.STEP_DEG - 0.5
+        base_rows = (self.LAT_MAX - lats) / self.STEP_DEG - 0.5
 
         step_idx = max(1, min(8, int(round(fut_mult)))) if fut_mult > 0.0 else 0
         if (
@@ -1191,23 +1623,23 @@ class DopplerRadarService:
                 + cum_dc_grid[iy1, ix1] * dy * dx
             )
 
-            rows_2d = np.floor(base_rows[:, None] - drow_2d).astype(np.int32)
-            cols_2d = np.floor(base_cols[None, :] - dcol_2d).astype(np.int32)
-
+            rows_2d = base_rows[:, None] - drow_2d
+            cols_2d = base_cols[None, :] - dcol_2d
             valid_mask = (
-                (rows_2d >= 0)
-                & (rows_2d < self.GRID_H)
-                & (cols_2d >= 0)
-                & (cols_2d < self.GRID_W)
+                (rows_2d >= 0.0)
+                & (rows_2d <= self.GRID_H - 1)
+                & (cols_2d >= 0.0)
+                & (cols_2d <= self.GRID_W - 1)
             )
             if not np.any(valid_mask):
                 return EMPTY_TILE_PNG
 
-            r_clip = np.clip(rows_2d, 0, self.GRID_H - 1)
-            c_clip = np.clip(cols_2d, 0, self.GRID_W - 1)
-            tile = grid[r_clip, c_clip].copy()
+            tile = self._sample_bilinear_smooth(
+                grid, rows_2d, cols_2d, valid_mask, smooth_contours=(z >= 5)
+            )
+            if tile is None:
+                return EMPTY_TILE_PNG
 
-            # Apply HRRR Lagrangian intensity trend on active precipitation bands
             if step_idx in self._hrrr_trend_fields:
                 tr_grid = self._hrrr_trend_fields[step_idx]
                 trend_2d = (
@@ -1220,50 +1652,28 @@ class DopplerRadarService:
                 if np.any(active_echo):
                     mod = np.clip(tile.astype(np.float32) + trend_2d, 84.0, 195.0).astype(np.uint8)
                     tile = np.where(active_echo, mod, tile)
-
-            if not np.all(valid_mask):
-                tile[~valid_mask] = 0
         else:
-            cols = np.floor(base_cols).astype(np.int32) - int(advect_dcol)
-            rows = np.floor(base_rows).astype(np.int32) - int(advect_drow)
-
-            valid_r = (rows >= 0) & (rows < self.GRID_H)
-            valid_c = (cols >= 0) & (cols < self.GRID_W)
-
+            f_rows = base_rows - float(advect_drow)
+            f_cols = base_cols - float(advect_dcol)
+            valid_r = (f_rows >= 0.0) & (f_rows <= self.GRID_H - 1)
+            valid_c = (f_cols >= 0.0) & (f_cols <= self.GRID_W - 1)
             if not np.any(valid_r) or not np.any(valid_c):
                 return EMPTY_TILE_PNG
 
-            rows_clipped = np.clip(rows, 0, self.GRID_H - 1)
-            cols_clipped = np.clip(cols, 0, self.GRID_W - 1)
-
-            tile = grid[np.ix_(rows_clipped, cols_clipped)].copy()
-
-            if not np.all(valid_r):
-                tile[~valid_r, :] = 0
-            if not np.all(valid_c):
-                tile[:, ~valid_c] = 0
+            valid_mask = valid_r[:, None] & valid_c[None, :]
+            tile = self._sample_bilinear_smooth(
+                grid, f_rows, f_cols, valid_mask, smooth_contours=(z >= 5)
+            )
+            if tile is None:
+                return EMPTY_TILE_PNG
 
         if decay_indices > 0:
-            # Gently relax intense convective cores (>32 dBZ / idx > 130) toward moderate stratiform rain
-            # while preserving light/moderate rain bands (idx 86..130) across the full 2-hour track
             core_mask = tile > 130
             if np.any(core_mask):
                 tile[core_mask] = np.maximum(126, tile[core_mask].astype(np.int16) - decay_indices * 2).astype(np.uint8)
 
-        if int(tile.max()) < 90:
+        if int(tile.max()) < 86:
             return EMPTY_TILE_PNG
-
-        # Preserve crisp native 1km reflectivity gradients without Gaussian blur;
-        # only filter out isolated single-pixel noise specks (nbr_sum < 2)
-        if z >= 6:
-            padded = np.pad(tile, 1, mode="edge")
-            active_nbrs = (padded >= 88).astype(np.uint8)
-            nbr_sum = (
-                active_nbrs[:-2, :-2] + active_nbrs[:-2, 1:-1] + active_nbrs[:-2, 2:]
-                + active_nbrs[1:-1, :-2] + active_nbrs[1:-1, 1:-1] + active_nbrs[1:-1, 2:]
-                + active_nbrs[2:, :-2] + active_nbrs[2:, 1:-1] + active_nbrs[2:, 2:]
-            )
-            tile = np.where((tile >= 86) & (nbr_sum >= 2), tile, 0)
 
         img = Image.fromarray(tile, mode="P")
         img.putpalette(ZUS_PALETTE_RGB)
@@ -1350,7 +1760,11 @@ class DopplerRadarService:
 
             png_bytes = EMPTY_TILE_PNG
             if intersects_conus and frame is not None:
-                fut_mult = (frame.offset_minutes / 15.0) if (frame.is_future and frame.offset_minutes > 0) else 0.0
+                fut_mult = (
+                    0.0
+                    if frame.is_prebaked
+                    else ((frame.offset_minutes / 15.0) if (frame.is_future and frame.offset_minutes > 0) else 0.0)
+                )
                 png_bytes = await asyncio.to_thread(
                     self._slice_conus_tile_sync,
                     frame.grid,
@@ -1734,11 +2148,12 @@ class DopplerRadarService:
             pass
 
     def _build_regional_pack_sync(
-        self, snap_lat: float, snap_lon: float, size_px: int = 560
+        self, snap_lat: float, snap_lon: float, size_px: int = 768
     ) -> Dict[str, Any]:
         """
         Slices all 14 timeline frames (-45m to +2h) in a single vectorized pass into continuous
-        560x560 WebMercator regional PNG images (~830km x 830km span) with zero tile seams.
+        768x768 WebMercator regional PNG images (~800km x 800km span, ~1km/px) with sub-pixel
+        bilinear contour anti-aliasing and zero tile seams.
         """
         u_c = (snap_lon + 180.0) / 360.0
         lat_rad = math.radians(max(-80.0, min(80.0, snap_lat)))
@@ -1761,8 +2176,8 @@ class DopplerRadarService:
         merc_y = math.pi * (1.0 - 2.0 * v_arr)
         lats = np.degrees(np.arctan(np.sinh(merc_y)))
 
-        base_cols = (lons - self.LON_MIN) / self.STEP_DEG
-        base_rows = (self.LAT_MAX - lats) / self.STEP_DEG
+        base_cols = (lons - self.LON_MIN) / self.STEP_DEG - 0.5
+        base_rows = (self.LAT_MAX - lats) / self.STEP_DEG - 0.5
 
         # Precompute trajectory grid bilinear weights once for all frames
         sample_grid = next(iter(self._cum_drow_fields.values()), None)
@@ -1786,7 +2201,11 @@ class DopplerRadarService:
         frames_meta: List[Dict[str, Any]] = []
 
         for f in self._frames.values():
-            fut_mult = (f.offset_minutes / 15.0) if (f.is_future and f.offset_minutes > 0) else 0.0
+            fut_mult = (
+                0.0
+                if f.is_prebaked
+                else ((f.offset_minutes / 15.0) if (f.is_future and f.offset_minutes > 0) else 0.0)
+            )
             step_idx = max(1, min(8, int(round(fut_mult)))) if fut_mult > 0.0 else 0
 
             if (
@@ -1808,13 +2227,13 @@ class DopplerRadarService:
                     + cum_dc_grid[iy1, ix0] * dy * (1.0 - dx)
                     + cum_dc_grid[iy1, ix1] * dy * dx
                 )
-                rows_2d = np.floor(base_rows[:, None] - drow_2d).astype(np.int32)
-                cols_2d = np.floor(base_cols[None, :] - dcol_2d).astype(np.int32)
+                rows_2d = base_rows[:, None] - drow_2d
+                cols_2d = base_cols[None, :] - dcol_2d
                 valid_mask = (
-                    (rows_2d >= 0)
-                    & (rows_2d < self.GRID_H)
-                    & (cols_2d >= 0)
-                    & (cols_2d < self.GRID_W)
+                    (rows_2d >= 0.0)
+                    & (rows_2d <= self.GRID_H - 1)
+                    & (cols_2d >= 0.0)
+                    & (cols_2d <= self.GRID_W - 1)
                 )
                 if not np.any(valid_mask):
                     frames_b64[f.frame_id] = ""
@@ -1828,11 +2247,11 @@ class DopplerRadarService:
                         }
                     )
                     continue
-                r_clip = np.clip(rows_2d, 0, self.GRID_H - 1)
-                c_clip = np.clip(cols_2d, 0, self.GRID_W - 1)
-                sub = f.grid[r_clip, c_clip].copy()
 
-                if step_idx in self._hrrr_trend_fields:
+                sub = self._sample_bilinear_smooth(
+                    f.grid, rows_2d, cols_2d, valid_mask, smooth_contours=True
+                )
+                if sub is not None and step_idx in self._hrrr_trend_fields:
                     tr_grid = self._hrrr_trend_fields[step_idx]
                     trend_2d = (
                         tr_grid[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
@@ -1844,14 +2263,11 @@ class DopplerRadarService:
                     if np.any(active_echo):
                         mod = np.clip(sub.astype(np.float32) + trend_2d, 84.0, 195.0).astype(np.uint8)
                         sub = np.where(active_echo, mod, sub)
-
-                if not np.all(valid_mask):
-                    sub[~valid_mask] = 0
             else:
-                cols = np.floor(base_cols).astype(np.int32) - int(f.advect_dcol)
-                rows = np.floor(base_rows).astype(np.int32) - int(f.advect_drow)
-                valid_r = (rows >= 0) & (rows < self.GRID_H)
-                valid_c = (cols >= 0) & (cols < self.GRID_W)
+                f_rows = base_rows - float(f.advect_drow)
+                f_cols = base_cols - float(f.advect_dcol)
+                valid_r = (f_rows >= 0.0) & (f_rows <= self.GRID_H - 1)
+                valid_c = (f_cols >= 0.0) & (f_cols <= self.GRID_W - 1)
                 if not np.any(valid_r) or not np.any(valid_c):
                     frames_b64[f.frame_id] = ""
                     frames_meta.append(
@@ -1864,32 +2280,22 @@ class DopplerRadarService:
                         }
                     )
                     continue
-                r_clip = np.clip(rows, 0, self.GRID_H - 1)
-                c_clip = np.clip(cols, 0, self.GRID_W - 1)
-                sub = f.grid[np.ix_(r_clip, c_clip)].copy()
-                if not np.all(valid_r):
-                    sub[~valid_r, :] = 0
-                if not np.all(valid_c):
-                    sub[:, ~valid_c] = 0
 
-            if f.decay_indices > 0:
+                valid_mask = valid_r[:, None] & valid_c[None, :]
+                sub = self._sample_bilinear_smooth(
+                    f.grid, f_rows, f_cols, valid_mask, smooth_contours=True
+                )
+
+            if sub is not None and f.decay_indices > 0:
                 core_mask = sub > 130
                 if np.any(core_mask):
                     sub[core_mask] = np.maximum(
                         126, sub[core_mask].astype(np.int16) - f.decay_indices * 2
                     ).astype(np.uint8)
 
-            if int(sub.max()) < 88:
+            if sub is None or int(sub.max()) < 86:
                 frames_b64[f.frame_id] = ""
             else:
-                padded = np.pad(sub, 1, mode="edge")
-                active_nbrs = (padded >= 88).astype(np.uint8)
-                nbr_sum = (
-                    active_nbrs[:-2, :-2] + active_nbrs[:-2, 1:-1] + active_nbrs[:-2, 2:]
-                    + active_nbrs[1:-1, :-2] + active_nbrs[1:-1, 1:-1] + active_nbrs[1:-1, 2:]
-                    + active_nbrs[2:, :-2] + active_nbrs[2:, 1:-1] + active_nbrs[2:, 2:]
-                )
-                sub = np.where((sub >= 86) & (nbr_sum >= 2), sub, 0)
                 img = Image.fromarray(sub, mode="P")
                 img.putpalette(ZUS_PALETTE_RGB)
                 img.info["transparency"] = ZUS_PALETTE_ALPHA
@@ -1928,7 +2334,7 @@ class DopplerRadarService:
         snap_lat = round(lat * 4.0) / 4.0
         snap_lon = round(lon * 4.0) / 4.0
         live_fid = next((f.frame_id for f in reversed(list(self._frames.values())) if not f.is_future), "latest")
-        cache_key = f"regpack:{live_fid}:{snap_lat:.2f}:{snap_lon:.2f}"
+        cache_key = f"regpack_10h:{live_fid}:{snap_lat:.2f}:{snap_lon:.2f}"
 
         if not hasattr(self, "_regional_pack_cache"):
             self._regional_pack_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
@@ -1937,7 +2343,7 @@ class DopplerRadarService:
             self._regional_pack_cache.move_to_end(cache_key)
             return self._regional_pack_cache[cache_key]
 
-        pack = await asyncio.to_thread(self._build_regional_pack_sync, snap_lat, snap_lon, 560)
+        pack = await asyncio.to_thread(self._build_regional_pack_sync, snap_lat, snap_lon, 768)
         self._regional_pack_cache[cache_key] = pack
         if len(self._regional_pack_cache) > 40:
             self._regional_pack_cache.popitem(last=False)
@@ -1949,7 +2355,7 @@ class DopplerRadarService:
         """
         Returns a single-request atomic tile bundle containing all viewport WebMercator tiles
         across all timeline frames in RAM (encoded as base64 PNG strings, or "" for empty tiles).
-        Eliminates 140+ sequential HTTP tile requests and guarantees 0-flicker instant playback.
+        Eliminates sequential HTTP tile requests and guarantees 0-flicker instant playback.
         """
         if not self._frames:
             await self.refresh_dataset()
@@ -1960,16 +2366,33 @@ class DopplerRadarService:
             for alias_id, off in [
                 ("past_45m", -45),
                 ("past_30m", -30),
+                ("past_20m", -20),
                 ("past_15m", -15),
+                ("past_10m", -10),
+                ("past_5m", -5),
                 ("latest", 0),
                 ("nowcast_p15m", 15),
                 ("nowcast_p30m", 30),
                 ("nowcast_p45m", 45),
                 ("nowcast_p60m", 60),
-                ("nowcast_p75m", 75),
                 ("nowcast_p90m", 90),
-                ("nowcast_p105m", 105),
                 ("nowcast_p120m", 120),
+                ("nowcast_p150m", 150),
+                ("nowcast_p180m", 180),
+                ("nowcast_p210m", 210),
+                ("nowcast_p240m", 240),
+                ("nowcast_p270m", 270),
+                ("nowcast_p300m", 300),
+                ("nowcast_p330m", 330),
+                ("nowcast_p360m", 360),
+                ("nowcast_p390m", 390),
+                ("nowcast_p420m", 420),
+                ("nowcast_p450m", 450),
+                ("nowcast_p480m", 480),
+                ("nowcast_p510m", 510),
+                ("nowcast_p540m", 540),
+                ("nowcast_p570m", 570),
+                ("nowcast_p600m", 600),
             ]:
                 best_f = min(self._frames.values(), key=lambda f: abs(f.offset_minutes - off))
                 aliases[alias_id] = best_f.frame_id
@@ -2027,7 +2450,7 @@ class DopplerRadarService:
                     label=f.label,
                     offsetMinutes=f.offset_minutes,
                     isFuture=f.is_future,
-                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=9",
+                    tileUrlTemplate=f"{prefix}/api/v1/radar/tiles/{f.frame_id}/{{z}}/{{x}}/{{y}}.png?v=11",
                 )
             )
 

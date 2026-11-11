@@ -1,6 +1,15 @@
 # Changelog
 
-All notable changes to `ZusAPI` will be documented in this file.
+All notable changes to this service will be documented in this file.
+
+## [v1.5.0] - 2026-11-11
+
+### Surface-Calibrated 2-Minute HD Radar & 10-Hour Forecast Horizon
+- **Surface-Verified 2-Minute Precipitation Radar**:
+  - Upgraded radar ingestion to a 2-minute refresh cadence with surface-level precipitation verification, eliminating high-altitude evaporating virga and false echoes over dry ground.
+  - Added sub-pixel contour anti-aliasing across regional radar packs for smooth, organic precipitation boundaries.
+- **Extended 10-Hour Future Radar Timeline**:
+  - Expanded the radar timeline to 28 frames (`-45m` to `+10h`), seamlessly blending short-range storm motion into extended-range high-resolution simulated precipitation out to 10 hours.
 
 ## [v1.4.2] - 2026-11-11
 

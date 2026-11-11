@@ -14,14 +14,17 @@ from app.services.http_client import http_pool
 
 async def _background_doppler_loop():
     """
-    Refreshes the CONUS 1km Master Doppler Reflectivity Grid & +30m Nowcast Cube every 5 minutes,
-    and automatically detects & backfills any historical gaps from when the server was offline.
+    Refreshes the CONUS 1km MRMS Surface-QC Doppler Grid & +2h Nowcast Cube every 2 minutes,
+    and periodically detects & backfills historical gaps from when the server was offline.
     """
     await asyncio.sleep(1)
+    cycle = 0
     while True:
         try:
             await doppler_service.refresh_dataset()
-            await doppler_service.backfill_offline_gaps(lookback_hours=24, max_batch=16)
+            if cycle % 3 == 0:
+                await doppler_service.backfill_offline_gaps(lookback_hours=24, max_batch=16)
+            cycle += 1
             # Phase 3: Spatial push notification evaluation & anti-spam dispatch
             try:
                 from app.services.push_worker import push_worker
@@ -32,7 +35,7 @@ async def _background_doppler_loop():
             break
         except Exception as e:
             print(f"⚠️ Doppler ingestion/backfill loop warning: {e}")
-        await asyncio.sleep(300)
+        await asyncio.sleep(120)
 
 
 async def _background_verification_loop():
