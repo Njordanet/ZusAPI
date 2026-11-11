@@ -83,34 +83,36 @@ EMPTY_TILE_PNG: bytes = _create_empty_transparent_tile()
 
 
 def _dbz_from_index(idx: int) -> float:
-    if idx < 72:
+    if idx < 92:
         return 0.0
     return round(-32.5 + (idx * 0.5), 1)
 
 
 def _mmhr_from_dbz(dbz: float) -> float:
     """
-    Composite Z-R relationship blending cool-season stratiform/drizzle (Z = 130 * R^1.5)
-    at low reflectivity (8..20 dBZ) with standard Marshall-Palmer (Z = 200 * R^1.6) for >= 20 dBZ.
+    Standard Marshall-Palmer Z-R relationship (Z = 200 * R^1.6) with a clean
+    15.0 dBZ precipitation floor so clear-air boundary-layer returns and non-precipitating
+    high/mid-level cloud echoes (<15 dBZ) never produce false surface rain.
     """
-    if dbz < 8.0:
+    if dbz < 15.0:
         return 0.0
     z_linear = 10.0 ** (dbz / 10.0)
-    if dbz < 20.0:
-        r = (z_linear / 140.0) ** (1.0 / 1.5)
-    else:
-        r = (z_linear / 200.0) ** (1.0 / 1.6)
+    r = (z_linear / 200.0) ** (1.0 / 1.6)
+    if dbz < 18.0:
+        # Smooth ramp across 15..18 dBZ to prevent marginal cloud/virga fringes from spiking
+        ramp = (dbz - 14.5) / 3.5
+        r *= max(0.35, min(1.0, ramp))
     return round(min(100.0, max(0.0, r)), 2)
 
 
 def _classify_dbz(dbz: float) -> str:
-    if dbz < 8.0:
-        return "Clear"
     if dbz < 15.0:
+        return "Clear"
+    if dbz < 20.0:
         return "Light Drizzle"
-    if dbz < 25.0:
+    if dbz < 28.0:
         return "Light Rain"
-    if dbz < 35.0:
+    if dbz < 36.0:
         return "Moderate Rain"
     if dbz < 46.0:
         return "Heavy Storm"
@@ -248,27 +250,37 @@ class DopplerRadarService:
             p10 = arr[1:h2:2, 0:w2:2]
             p11 = arr[1:h2:2, 1:w2:2]
 
-            # Require at least 2 of 4 500m sub-pixels to exceed +7.5 dBZ (idx 80)
-            # to reject single-pixel NEXRAD clear-air/AP ground clutter while preserving light rain/drizzle
+            # Require at least 2 of 4 500m sub-pixels to exceed +13.5 dBZ (idx 92)
+            # to reject NEXRAD clear-air/AP ground clutter and high-cloud static
             active_sub = (
-                (p00 >= 80).astype(np.uint8)
-                + (p01 >= 80).astype(np.uint8)
-                + (p10 >= 80).astype(np.uint8)
-                + (p11 >= 80).astype(np.uint8)
+                (p00 >= 92).astype(np.uint8)
+                + (p01 >= 92).astype(np.uint8)
+                + (p10 >= 92).astype(np.uint8)
+                + (p11 >= 92).astype(np.uint8)
             )
             pooled = np.maximum(np.maximum(p00, p01), np.maximum(p10, p11))
             pooled[active_sub < 2] = 0
-            pooled[pooled < 80] = 0
+            pooled[pooled < 92] = 0
 
-            # 3x3 morphological despeckle: reject isolated 1km clutter specks (nbr_count < 2)
-            mask = (pooled >= 80).astype(np.uint8)
+            # 3x3 morphological despeckle: reject isolated 1km clutter specks (nbr_count < 3)
+            mask = (pooled >= 92).astype(np.uint8)
             pad_m = np.pad(mask, 1, mode="constant", constant_values=0)
             nbr_count = (
                 pad_m[:-2, :-2] + pad_m[:-2, 1:-1] + pad_m[:-2, 2:]
                 + pad_m[1:-1, :-2] + pad_m[1:-1, 1:-1] + pad_m[1:-1, 2:]
                 + pad_m[2:, :-2] + pad_m[2:, 1:-1] + pad_m[2:, 2:]
             )
-            pooled[nbr_count < 2] = 0
+            pooled[nbr_count < 3] = 0
+
+            # 5x5 spatial continuity filter: reject 2-7 pixel urban skyscraper/tower/wind-farm AP clutter islands
+            mask5 = (pooled >= 92).astype(np.uint8)
+            pad5 = np.pad(mask5, 2, mode="constant", constant_values=0)
+            nbr5_count = sum(
+                pad5[dr : dr + mask5.shape[0], dc : dc + mask5.shape[1]]
+                for dr in range(5)
+                for dc in range(5)
+            )
+            pooled[nbr5_count < 8] = 0
             return pooled
 
     @staticmethod
@@ -1381,6 +1393,9 @@ class DopplerRadarService:
         dewpoint_c: Optional[float] = None,
         station_wet: bool = False,
         radar_zr_factor: float = 1.0,
+        station_checked: bool = False,
+        cloud_cover_low: Optional[float] = None,
+        nwp_precip_active: bool = True,
     ) -> RadarLocalTelemetry:
         """
         O(1) in-memory radar nowcast alias for get_point_telemetry.
@@ -1392,6 +1407,9 @@ class DopplerRadarService:
             dewpoint_c=dewpoint_c,
             station_wet=station_wet,
             radar_zr_factor=radar_zr_factor,
+            station_checked=station_checked,
+            cloud_cover_low=cloud_cover_low,
+            nwp_precip_active=nwp_precip_active,
         )
 
     async def get_point_telemetry(
@@ -1402,6 +1420,9 @@ class DopplerRadarService:
         dewpoint_c: Optional[float] = None,
         station_wet: bool = False,
         radar_zr_factor: float = 1.0,
+        station_checked: bool = False,
+        cloud_cover_low: Optional[float] = None,
+        nwp_precip_active: bool = True,
     ) -> RadarLocalTelemetry:
         """
         Dark Sky-grade 1-minute sub-pixel Lagrangian CONUS 1km Doppler ray-caster:
@@ -1449,14 +1470,23 @@ class DopplerRadarService:
         col = max(0, min(self.GRID_W - 1, int(round(f_col))))
         cos_lat = math.cos(math.radians(lat))
 
-        # Sub-cloud Dewpoint Depression (LCL) Virga Filter:
-        # When T - Td > 9.0C (cloud base > ~1.1km) and no surface station reports rain, weak radar echoes (<24 dBZ) partially evaporate
+        # Sub-cloud Dewpoint Depression (LCL) & Ground-Truth METAR/Ceiling Virga Filter:
         virga_factor = max(0.45, min(1.50, float(radar_zr_factor or 1.0)))
         if not station_wet and temp_c is not None and dewpoint_c is not None:
             dp_spread = max(0.0, float(temp_c) - float(dewpoint_c))
-            if dp_spread > 9.0:
-                evap_mult = max(0.25, min(1.0, 1.0 - 0.055 * (dp_spread - 9.0)))
+            if dp_spread > 6.0:
+                evap_mult = max(0.20, min(1.0, 1.0 - 0.065 * (dp_spread - 6.0)))
                 virga_factor = round(virga_factor * evap_mult, 3)
+
+        # When a nearby airport METAR station explicitly reports dry conditions and models show no active rain
+        # (or no low-level rain clouds), suppress weak/moderate virga & clear-air clutter echoes (<22 dBZ).
+        dry_ground_truth_gate = bool(
+            station_checked
+            and not station_wet
+            and (not nwp_precip_active or (cloud_cover_low is not None and cloud_cover_low < 35.0))
+        )
+        if dry_ground_truth_gate:
+            virga_factor = round(min(virga_factor, 0.30 if (cloud_cover_low is not None and cloud_cover_low < 35.0) else 0.45), 3)
 
         # 1. Local distance-attenuated 9x9 neighborhood (~4.5km wind-drift & beam-overshoot kernel)
         k_rad = 4
@@ -1486,36 +1516,61 @@ class DopplerRadarService:
             cc = int(round(c_flt))
             if k_rad <= cr < self.GRID_H - k_rad and k_rad <= cc < self.GRID_W - k_rad:
                 patch = target_grid[cr - k_rad : cr + k_rad + 1, cc - k_rad : cc + k_rad + 1].astype(np.int32)
+                active_patch_px = int((patch >= 92).sum())
+                # Reject isolated urban/tower AP clutter islands (<14 active pixels out of 81 in 9x9km patch)
+                if active_patch_px < 14:
+                    return 0.0
                 # Cone widens gently with lead_min (reduces distance penalty slightly at 30-60m so narrow bands don't alias)
                 cone_relax = min(1.4, lead_min * 0.025)
-                eff_idx = int(np.where(patch >= 72, patch - np.maximum(0, idx_penalty - int(round(cone_relax * 2))), 0).max())
+                eff_idx = int(np.where(patch >= 92, patch - np.maximum(0, idx_penalty - int(round(cone_relax * 2))), 0).max())
                 cone_max_dbz = _dbz_from_index(eff_idx)
                 # Blend razor-sharp bilinear center (65% at t=0 -> 40% at t=60m) with uncertainty cone envelope
                 alpha_bilin = max(0.40, 0.65 - (lead_min / 60.0) * 0.25)
-                if bilin_dbz >= 7.5:
+                if bilin_dbz >= 13.5:
                     return round(alpha_bilin * bilin_dbz + (1.0 - alpha_bilin) * cone_max_dbz, 1)
-                return round(cone_max_dbz * 0.88, 1)
+                if active_patch_px >= 24 and (lead_min >= 10 or cone_max_dbz >= 26.0):
+                    return round(cone_max_dbz * 0.85, 1)
+                return 0.0
             return round(bilin_dbz, 1)
 
         current_dbz = _sample_cone_dbz(grid, f_row, f_col, lead_min=0)
+        if dry_ground_truth_gate and current_dbz < 26.0:
+            current_dbz = 0.0
         raw_curr_mmhr = _mmhr_from_dbz(current_dbz)
         current_mmhr = round(raw_curr_mmhr * (virga_factor if current_dbz < 26.0 else max(0.75, virga_factor)), 2)
 
-        # 2. Regional 35km radius box (35 pixels in each direction)
+        # 2. Regional 35km radius box (35 pixels in each direction) with 5x5 clutter rejection
         rad = 35
         br0, br1 = max(0, row - rad), min(self.GRID_H, row + rad + 1)
         bc0, bc1 = max(0, col - rad), min(self.GRID_W, col + rad + 1)
-        box = grid[br0:br1, bc0:bc1]
+        raw_box = grid[br0:br1, bc0:bc1]
+        if raw_box.size > 0:
+            b_mask = (raw_box >= 95).astype(np.uint8)
+            b_pad = np.pad(b_mask, 2, mode="constant", constant_values=0)
+            b_nbr5 = sum(
+                b_pad[dr : dr + b_mask.shape[0], dc : dc + b_mask.shape[1]]
+                for dr in range(5)
+                for dc in range(5)
+            )
+            box = np.where(b_nbr5 >= 10, raw_box, 0)
+        else:
+            box = raw_box
 
         max_box_idx = int(box.max()) if box.size else 0
         max_dbz_nearby = _dbz_from_index(max_box_idx)
-        active_echoes = box >= 80  # >= 7.5 dBZ
+        active_echoes = box >= 95  # >= 15.0 dBZ
         coverage_pct = round(float(active_echoes.sum()) / max(1, box.size) * 100.0, 1)
 
-        # 3. Find nearest significant precipitation echo (>= 10 dBZ -> idx >= 85)
+        # Suppress isolated wind-farm / bridge AP clusters (< 2% regional coverage, or < 8% when METAR+NWP are dry)
+        min_regional_coverage = 8.0 if dry_ground_truth_gate else 2.0
+        if coverage_pct < min_regional_coverage:
+            max_dbz_nearby = 0.0
+            coverage_pct = 0.0
+
+        # 3. Find nearest significant precipitation echo (>= 15 dBZ -> idx >= 95)
         nearest_km: Optional[float] = None
         nearest_compass: Optional[str] = None
-        sig_rows, sig_cols = np.where(box >= 85)
+        sig_rows, sig_cols = np.where(box >= 95) if coverage_pct >= min_regional_coverage else (np.array([]), np.array([]))
         if sig_rows.size > 0:
             dy_km = (sig_rows - (row - br0)) * 1.11  # positive = south
             dx_km = (sig_cols - (col - bc0)) * (1.11 * cos_lat)  # positive = east
@@ -1611,11 +1666,14 @@ class DopplerRadarService:
                         proj_dbz = max(0.0, min(65.0, live_dbz + delta_dbz))
 
                 # Apply HRRR reflectivity trend (with distance dampening) on active echoes before Z-R conversion
-                if proj_dbz >= 7.5 and abs(trend_t) > 1e-4:
+                if proj_dbz >= 13.5 and abs(trend_t) > 1e-4:
                     dist_km = math.hypot(-dr_t * 1.11, dc_t * 1.11 * cos_lat)
                     damp_factor = 1.0 / (1.0 + (dist_km / 60.0))
                     eff_hrrr_dbz = (trend_t * 0.5) * damp_factor
                     proj_dbz = max(0.0, min(65.0, proj_dbz + eff_hrrr_dbz))
+
+                if dry_ground_truth_gate and proj_dbz < 26.0:
+                    proj_dbz = 0.0
 
                 raw_rate = _mmhr_from_dbz(proj_dbz)
                 eff_vf = virga_factor if proj_dbz < 26.0 else max(0.75, virga_factor)
@@ -1641,7 +1699,7 @@ class DopplerRadarService:
             currentDbz=current_dbz,
             maxDbzNearby=max_dbz_nearby,
             precipRateMmHr=current_mmhr,
-            intensityCategory=_classify_dbz(max(current_dbz, max_dbz_nearby if (nearest_km or 99) < 8.0 else 0.0)),
+            intensityCategory=_classify_dbz(current_dbz if current_mmhr >= 0.08 else 0.0),
             echoCoveragePercent=coverage_pct,
             nearestEchoKm=nearest_km,
             nearestEchoCompass=nearest_compass,

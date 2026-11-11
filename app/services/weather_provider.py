@@ -415,6 +415,11 @@ class WeatherProviderService:
             if (station_composite and (station_composite.get("wx_station_dist_km") or 99.0) <= 25.0)
             else 0.0
         )
+        station_checked_dry = bool(
+            station_composite
+            and (station_composite.get("closest_distance_km") or 99.0) <= 35.0
+            and station_composite.get("wx_condition") is None
+        )
 
         # Build 61 1-minute fused precipitation rates (0..60m) combining 1km Lagrangian Doppler + METAR + NWP
         has_conus_doppler = bool(doppler and doppler.inConusGrid and len(doppler.minuteByMinuteRates) >= 61)
@@ -434,9 +439,13 @@ class WeatherProviderService:
                 rad_mmhr = max(rad_mmhr, round(station_mmhr * st_decay, 2))
 
             if has_conus_doppler:
-                # Radar dominates minutes 0..35 (88%), gradually giving NWP more weight by minute 60 (72% radar / 28% NWP)
-                w_rad = 0.88 - 0.16 * (t_min / 60.0)
-                blended = max(rad_mmhr, rad_mmhr * w_rad + nwp_mmhr * (1.0 - w_rad))
+                if station_checked_dry and nwp_mmhr < 0.08 and (not doppler or doppler.currentDbz < 22.0):
+                    # Nearby METAR station & NWP both report dry; suppress weak uncorroborated radar clutter/virga
+                    blended = rad_mmhr * 0.35 if rad_mmhr >= 0.35 else 0.0
+                else:
+                    # Radar dominates minutes 0..35 (88%), gradually giving NWP more weight by minute 60 (72% radar / 28% NWP)
+                    w_rad = 0.88 - 0.16 * (t_min / 60.0)
+                    blended = max(rad_mmhr, rad_mmhr * w_rad + nwp_mmhr * (1.0 - w_rad))
             else:
                 blended = max(rad_mmhr, nwp_mmhr)
             fused_61.append(round(blended, 2) if blended >= 0.04 else 0.0)
@@ -776,7 +785,24 @@ class WeatherProviderService:
                 if station_composite and station_composite.get("dewpoint_c") is not None
                 else float(current_raw.get("dew_point_2m") or current_raw.get("dew_point_2m_best_match") or (est_temp_now - 4.0))
             )
+            st_checked_now = bool(
+                station_composite and (station_composite.get("closest_distance_km") or 99.0) <= 35.0
+            )
             st_wet_now = bool(station_composite and station_composite.get("wx_condition") is not None)
+            est_cclow_now = (
+                float(cclow_hourly_arr[start_idx])
+                if (start_idx < len(cclow_hourly_arr) and cclow_hourly_arr[start_idx] is not None)
+                else None
+            )
+            nwp_precip_now = any(
+                (
+                    s[0].get("precip_mm", 0.0) >= 0.1
+                    or s[0].get("precip_prob", 0) >= 25
+                    or s[0].get("wmo_code", 0) >= 51
+                )
+                for s in model_hourly_streams.values()
+                if s
+            )
             doppler_telemetry = await doppler_service.get_point_telemetry(
                 latitude,
                 longitude,
@@ -784,6 +810,9 @@ class WeatherProviderService:
                 dewpoint_c=est_dewp_now,
                 station_wet=st_wet_now,
                 radar_zr_factor=float(rls_meta.get("radar_zr_factor") or 1.0),
+                station_checked=st_checked_now,
+                cloud_cover_low=est_cclow_now,
+                nwp_precip_active=nwp_precip_now,
             )
 
             # 4. Schedule or Run RLS Verification & Snapshot Persistence
@@ -826,7 +855,11 @@ class WeatherProviderService:
             )
             ground_truth_precip_active = bool(
                 (station_composite and station_composite.get("wx_condition") is not None)
-                or (doppler_telemetry and doppler_telemetry.currentDbz >= 15.0)
+                or (
+                    doppler_telemetry
+                    and doppler_telemetry.currentDbz >= (24.0 if (st_checked_now and not st_wet_now) else 18.0)
+                    and doppler_telemetry.precipRateMmHr >= 0.15
+                )
             )
 
             if sync_verify:
@@ -1137,11 +1170,16 @@ class WeatherProviderService:
 
                 # Assimilate live ground-truth METAR / 1km Doppler radar into hour 0
                 if h_offset == 0:
+                    min_doppler_dbz = 24.0 if (st_checked_now and not st_wet_now) else 18.0
                     if station_composite and station_composite.get("wx_wmo"):
                         top_code = int(station_composite["wx_wmo"])
                         final_h_precip = max(final_h_precip, 85)
                         final_h_pr_mm = max(final_h_pr_mm, float(station_composite.get("precip_mmhr") or 0.5))
-                    elif doppler_telemetry and doppler_telemetry.currentDbz >= 15.0:
+                    elif (
+                        doppler_telemetry
+                        and doppler_telemetry.currentDbz >= min_doppler_dbz
+                        and doppler_telemetry.precipRateMmHr >= 0.15
+                    ):
                         top_code = 65 if doppler_telemetry.currentDbz >= 35.0 else (61 if doppler_telemetry.currentDbz >= 20.0 else 51)
                         if final_h_temp <= 0.5:
                             top_code = 71
@@ -1288,10 +1326,15 @@ class WeatherProviderService:
             dewpoint_c = round(float(raw_dewp), 1)
             comfort_label = classify_dewpoint_comfort(dewpoint_c)
 
+            min_curr_doppler_dbz = 24.0 if (st_checked_now and not st_wet_now) else 18.0
             if station_composite and station_composite.get("wx_condition") is not None:
                 current_condition = station_composite["wx_condition"]
                 observed_wmo = int(station_composite.get("wx_wmo") or 61)
-            elif doppler_telemetry and doppler_telemetry.currentDbz >= 15.0:
+            elif (
+                doppler_telemetry
+                and doppler_telemetry.currentDbz >= min_curr_doppler_dbz
+                and doppler_telemetry.precipRateMmHr >= 0.15
+            ):
                 if final_current_temp <= 0.5:
                     current_condition = WeatherCondition.SNOW
                     observed_wmo = 71

@@ -2,6 +2,14 @@
 
 All notable changes to `ZusAPI` will be documented in this file.
 
+## [v1.4.2] - 2026-11-11
+
+### Clear-Air Radar Static & Urban Clutter Suppression
+- **Radar Reflectivity & Spatial Continuity Filtering**:
+  - Raised the minimum precipitation reflectivity floor and added a 5×5 km spatial continuity filter to reject non-precipitating high-cloud echoes and isolated urban building, bridge, and wind-turbine reflections during morning temperature inversions.
+- **Surface Station & Cloud Ceiling Cross-Checking**:
+  - Cross-checks weak radar returns against nearby airport surface observations, low-level cloud cover, and forecast models so dry overcast skies are never misclassified as light rain.
+
 ## [v1.4.1] - 2026-11-09
 
 ### Location-Local Sunrise/Sunset Ephemeris & Extended Atmospheric Telemetry (`app/models/weather.py` & `app/services/weather_provider.py`)
