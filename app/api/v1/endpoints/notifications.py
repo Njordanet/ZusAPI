@@ -36,7 +36,7 @@ def _wmo_to_base_symbol(code: int, is_day: bool) -> str:
 
 
 def _compute_rain_strings(rates: List[float]) -> tuple[str, str, str]:
-    threshold = 0.08
+    threshold = 0.12
     first_idx = next((i for i, r in enumerate(rates) if r >= threshold), -1)
     if first_idx > 0:
         last_idx = first_idx
@@ -62,10 +62,14 @@ def _compute_rain_strings(rates: List[float]) -> tuple[str, str, str]:
             f"Stopping in {stop_idx} min",
         )
     return (
-        "Rain in 16 min",
-        "Rain starting in 16 min",
-        "Light rain stopping 28 min later",
+        "No precip (1h)",
+        "No precipitation expected",
+        "Dry conditions for the next hour",
     )
+
+
+def _loc_cache_key(lat: float, lon: float, unit: str) -> str:
+    return f"loc:{lat:.2f}:{lon:.2f}:{unit.upper()}"
 
 
 async def _refresh_stale_widget_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -85,6 +89,36 @@ async def _refresh_stale_widget_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     is_day = cur.isDay if cur.isDay is not None else (6 <= now_local.hour < 20)
     wmo = cur.observedWeatherCode if cur.observedWeatherCode is not None else 0
     cond_label = str(cur.condition.value if hasattr(cur.condition, "value") else cur.condition)
+
+    minute_rates: List[float] = [0.0] * 61
+    if wx.dopplerTelemetry and len(wx.dopplerTelemetry.minuteByMinuteRates) >= 61:
+        minute_rates = list(wx.dopplerTelemetry.minuteByMinuteRates[:61])
+
+    # Ground-truth clutter suppression matching the mobile app's buildSixtyMinuteNowcast:
+    # prevent weak overcast virga / ground clutter (< 20 dBZ, < 0.35 mm/hr) from hijacking dry skies.
+    h0 = wx.hourly[0] if wx.hourly else None
+    h0_wmo = int(h0.wmoCode) if (h0 and h0.wmoCode is not None) else wmo
+    h0_pop = int(h0.precipitationChance or 0) if h0 else 0
+    cur_precip = float(cur.precipIntensityMmHr or 0.0)
+    cur_dbz = float(wx.dopplerTelemetry.currentDbz or 0.0) if wx.dopplerTelemetry else 0.0
+    max_rate = max(minute_rates) if minute_rates else 0.0
+
+    if wmo < 51 and h0_wmo < 51 and cur_precip < 0.12 and cur_dbz < 20.0 and max_rate < 0.35:
+        minute_rates = [0.0] * 61
+        max_rate = 0.0
+
+    # Downgrade uncorroborated NWP light-drizzle bias under dry overcast cloud decks
+    if (
+        wmo in (51, 53)
+        and cur.localStationWx is None
+        and cur_precip < 0.08
+        and max_rate < 0.12
+        and cur_dbz < 18.0
+        and h0_pop < 30
+    ):
+        wmo = 3
+        cond_label = "Overcast"
+
     cond_sym = _wmo_to_base_symbol(wmo, is_day)
 
     cur_temp = conv(cur.temperature)
@@ -92,11 +126,9 @@ async def _refresh_stale_widget_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     high_temp = conv(cur.tempMax)
     low_temp = conv(cur.tempMin)
 
-    minute_rates: List[float] = [0.0] * 61
-    if wx.dopplerTelemetry and len(wx.dopplerTelemetry.minuteByMinuteRates) >= 61:
-        minute_rates = list(wx.dopplerTelemetry.minuteByMinuteRates[:61])
-
-    is_precip_soon = any(r >= 0.08 for r in minute_rates) or (wmo >= 51)
+    # Only activate the 60-minute precipitation curve UI when meaningful rates exist on the curve
+    wet_minutes = sum(1 for r in minute_rates if r >= 0.12)
+    is_precip_soon = wet_minutes >= 2
     short_rain, start_line, stop_line = _compute_rain_strings(minute_rates)
 
     hourly_items: List[Dict[str, Any]] = []
@@ -107,17 +139,25 @@ async def _refresh_stale_widget_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         ampm = "P" if h_num >= 12 else "A"
         label = "NOW" if idx == 0 else f"{h12}{ampm}"
         hr_day = hr.isDay if hr.isDay is not None else (6 <= h_num < 20)
+        hr_wmo = wmo if idx == 0 else hr.wmoCode
+        hr_cond_label = (
+            cond_label
+            if idx == 0
+            else str(hr.condition.value if hasattr(hr.condition, "value") else hr.condition)
+        )
         hourly_items.append(
             {
                 "label": label,
                 "temp": conv(hr.temperature),
-                "symbolName": _wmo_to_base_symbol(hr.wmoCode, hr_day),
-                "isRain": hr.wmoCode >= 51,
+                "symbolName": _wmo_to_base_symbol(hr_wmo, hr_day),
+                "isRain": hr_wmo >= 51,
+                "precipProb": int(hr.precipitationChance or 0),
+                "conditionLabel": hr_cond_label,
             }
         )
 
     daily_items: List[Dict[str, Any]] = []
-    for idx, day in enumerate(wx.daily[:3]):
+    for idx, day in enumerate(wx.daily[:7]):
         day_dt = day.date.astimezone(tz) if day.date.tzinfo else day.date
         d_label = "TODAY" if idx == 0 else day_dt.strftime("%a").upper()
         daily_items.append(
@@ -249,11 +289,25 @@ async def post_widget_sync(
     }
     _WIDGET_SYNC_CACHE[client_ip] = entry
     _WIDGET_SYNC_CACHE["__latest__"] = entry
+
+    dev_id = str(payload.get("deviceId") or "").strip()
+    if dev_id:
+        _WIDGET_SYNC_CACHE[f"dev:{dev_id}"] = entry
+
+    try:
+        p_lat = float(payload["latitude"])
+        p_lon = float(payload["longitude"])
+        p_unit = str(payload.get("unitSymbol") or "F")
+        _WIDGET_SYNC_CACHE[_loc_cache_key(p_lat, p_lon, p_unit)] = entry
+    except (KeyError, TypeError, ValueError):
+        pass
+
     # Prune if > 500 entries to conserve memory
-    if len(_WIDGET_SYNC_CACHE) > 500:
-        oldest_key = next(iter(_WIDGET_SYNC_CACHE))
-        if oldest_key != "__latest__":
-            _WIDGET_SYNC_CACHE.pop(oldest_key, None)
+    while len(_WIDGET_SYNC_CACHE) > 500:
+        oldest_key = next((k for k in _WIDGET_SYNC_CACHE if k != "__latest__"), None)
+        if not oldest_key:
+            break
+        _WIDGET_SYNC_CACHE.pop(oldest_key, None)
     return {"status": "ok", "client_ip": client_ip}
 
 
@@ -261,10 +315,48 @@ async def post_widget_sync(
     "/widget-sync",
     summary="Retrieve active weather telemetry snapshot for iOS WidgetKit extension",
 )
-async def get_widget_sync(request: Request) -> Dict[str, Any]:
+async def get_widget_sync(
+    request: Request,
+    device_id: Optional[str] = Query(None),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    unit: Optional[str] = Query(None),
+    location_name: Optional[str] = Query(None),
+) -> Dict[str, Any]:
     client_ip = _extract_client_ip(request)
-    cache_key = client_ip if client_ip in _WIDGET_SYNC_CACHE else "__latest__"
-    entry = _WIDGET_SYNC_CACHE.get(cache_key)
+    cache_key: Optional[str] = None
+    entry: Optional[Dict[str, Any]] = None
+
+    if device_id and f"dev:{device_id.strip()}" in _WIDGET_SYNC_CACHE:
+        cache_key = f"dev:{device_id.strip()}"
+        entry = _WIDGET_SYNC_CACHE[cache_key]
+    elif lat is not None and lon is not None:
+        loc_key = _loc_cache_key(lat, lon, unit or "F")
+        if loc_key in _WIDGET_SYNC_CACHE:
+            cache_key = loc_key
+            entry = _WIDGET_SYNC_CACHE[loc_key]
+        elif client_ip in _WIDGET_SYNC_CACHE:
+            ip_entry = _WIDGET_SYNC_CACHE[client_ip]
+            if (
+                abs(float(ip_entry.get("latitude", 0.0)) - lat) <= 0.05
+                and abs(float(ip_entry.get("longitude", 0.0)) - lon) <= 0.05
+            ):
+                cache_key = client_ip
+                entry = ip_entry
+        if not entry:
+            seed = {
+                "latitude": lat,
+                "longitude": lon,
+                "unitSymbol": (unit or "F").upper(),
+                "locationName": location_name or "Current Location",
+            }
+            refreshed = await _refresh_stale_widget_entry(seed)
+            _WIDGET_SYNC_CACHE[loc_key] = refreshed
+            return refreshed
+    else:
+        cache_key = client_ip if client_ip in _WIDGET_SYNC_CACHE else "__latest__"
+        entry = _WIDGET_SYNC_CACHE.get(cache_key)
+
     if not entry:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No widget snapshot synced yet")
 
@@ -273,8 +365,20 @@ async def get_widget_sync(request: Request) -> Dict[str, Any]:
     if now_ms - entry_ts > _WIDGET_STALE_REFRESH_MS:
         try:
             refreshed = await _refresh_stale_widget_entry(entry)
-            _WIDGET_SYNC_CACHE[cache_key] = refreshed
-            _WIDGET_SYNC_CACHE["__latest__"] = refreshed
+            if cache_key:
+                _WIDGET_SYNC_CACHE[cache_key] = refreshed
+            try:
+                _WIDGET_SYNC_CACHE[
+                    _loc_cache_key(
+                        float(refreshed["latitude"]),
+                        float(refreshed["longitude"]),
+                        str(refreshed.get("unitSymbol") or "F"),
+                    )
+                ] = refreshed
+            except (KeyError, TypeError, ValueError):
+                pass
+            if cache_key == "__latest__" or cache_key == client_ip:
+                _WIDGET_SYNC_CACHE["__latest__"] = refreshed
             return refreshed
         except Exception:
             pass

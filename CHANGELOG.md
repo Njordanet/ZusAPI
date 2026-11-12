@@ -2,6 +2,15 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.5.2] - 2026-11-11
+
+### Widget Background Refresh Parity & Overcast Clutter Suppression
+- **Overcast Ground-Truth Alignment for Background Widget Refreshes**:
+  - Applied surface ground-truth precipitation filtering during background widget snapshot refreshes so weak overcast cloud echoes and uncorroborated drizzle signals never misclassify dry overcast conditions as rain.
+  - Replaced legacy wet fallback strings on dry curves with explicit dry-hour labels and expanded refreshed widget payloads to include the full 7-day forecast and hourly condition labels.
+- **Device & Location-Scoped Widget Snapshot Caching**:
+  - Scoped synced widget snapshots by device identifier and coordinate cell so Wi-Fi-to-cellular network handoffs always preserve each user's active location and unit preferences.
+
 ## [v1.5.1] - 2026-11-11
 
 ### Local Calendar-Day High/Low & Precipitation Alignment
