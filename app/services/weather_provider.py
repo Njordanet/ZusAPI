@@ -251,11 +251,10 @@ class WeatherProviderService:
             ),
             "models": "best_match,ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless",
             "timezone": "UTC",
+            "past_hours": 24,
             "forecast_days": 10,
             "forecast_minutely_15": 8,  # Next 2 hours in 15-min intervals
         }
-        if include_past_24h:
-            params["past_hours"] = 24
         resp = await client.get(settings.open_meteo_forecast_url, params=params)
         resp.raise_for_status()
         return resp.json()
@@ -1527,10 +1526,41 @@ class WeatherProviderService:
             local_now = now + tz_delta
             utc_offset_hrs = int(round(utc_offset_sec / 3600.0))
 
+            hourly_by_local_date: Dict[str, List[HourlyForecastModel]] = {}
+            for h_m in hourly_models:
+                h_loc_key = (h_m.time + tz_delta).strftime("%Y-%m-%d")
+                hourly_by_local_date.setdefault(h_loc_key, []).append(h_m)
+
+            raw_hours_by_local_date: Dict[str, List[tuple[int, int]]] = {}
+            for r_idx, t_str in enumerate(times_list):
+                try:
+                    dt_u = datetime.strptime(str(t_str)[:16], "%Y-%m-%dT%H:%M")
+                    loc_k = (dt_u + tz_delta).strftime("%Y-%m-%d")
+                    raw_hours_by_local_date.setdefault(loc_k, []).append((r_idx, dt_u.hour))
+                except Exception:
+                    pass
+
+            daily_idx_by_date: Dict[str, int] = {
+                str(t_d)[:10]: idx_d for idx_d, t_d in enumerate(daily_times)
+            }
+
             for d_idx in range(day_limit):
-                dt = now + timedelta(days=d_idx)
                 local_day_dt = local_now + timedelta(days=d_idx)
                 local_date_key = local_day_dt.strftime("%Y-%m-%d")
+                day_date_utc = datetime(
+                    local_day_dt.year,
+                    local_day_dt.month,
+                    local_day_dt.day,
+                    12,
+                    0,
+                    0,
+                    tzinfo=timezone.utc,
+                )
+                raw_d_idx = daily_idx_by_date.get(
+                    local_date_key,
+                    min(d_idx, max(0, len(daily_times) - 1)),
+                )
+                loc_raw_hours = raw_hours_by_local_date.get(local_date_key, [])
                 min_t_blend = 0.0
                 max_t_blend = 0.0
                 precip_blend = 0.0
@@ -1557,6 +1587,51 @@ class WeatherProviderService:
                     b0 = float(w_info.get("bias_temp_c") or 0.0)
                     bsin = float(w_info.get("bias_sin_c") or 0.0)
                     bcos = float(w_info.get("bias_cos_c") or 0.0)
+
+                    h_t_arr = hourly_raw.get(f"temperature_2m_{suffix}") or hourly_raw.get("temperature_2m") or []
+                    h_p_arr = hourly_raw.get(f"precipitation_probability_{suffix}") or hourly_raw.get("precipitation_probability") or []
+                    h_pr_arr = hourly_raw.get(f"precipitation_{suffix}") or hourly_raw.get("precipitation") or []
+                    h_w_arr = hourly_raw.get(f"wind_speed_10m_{suffix}") or hourly_raw.get("wind_speed_10m") or []
+                    h_c_arr = hourly_raw.get(f"weather_code_{suffix}") or hourly_raw.get("weather_code") or []
+
+                    loc_adj_temps = [
+                        float(h_t_arr[ri]) - eval_diurnal_bias(b0, bsin, bcos, uh)
+                        for ri, uh in loc_raw_hours
+                        if ri < len(h_t_arr) and h_t_arr[ri] is not None
+                    ]
+                    if len(loc_adj_temps) >= 12:
+                        max_t_blend += max(loc_adj_temps) * w
+                        min_t_blend += min(loc_adj_temps) * w
+                        pop_vals = [
+                            float(h_p_arr[ri])
+                            for ri, _ in loc_raw_hours
+                            if ri < len(h_p_arr) and h_p_arr[ri] is not None
+                        ]
+                        pr_vals = [
+                            float(h_pr_arr[ri])
+                            for ri, _ in loc_raw_hours
+                            if ri < len(h_pr_arr) and h_pr_arr[ri] is not None
+                        ]
+                        w_vals = [
+                            float(h_w_arr[ri])
+                            for ri, _ in loc_raw_hours
+                            if ri < len(h_w_arr) and h_w_arr[ri] is not None
+                        ]
+                        c_vals = [
+                            int(h_c_arr[ri])
+                            for ri, _ in loc_raw_hours
+                            if ri < len(h_c_arr) and h_c_arr[ri] is not None
+                        ]
+                        precip_blend += (max(pop_vals) if pop_vals else 0.0) * w
+                        psum_blend += (sum(pr_vals) if pr_vals else 0.0) * w
+                        wmax_blend += (max(w_vals) if w_vals else 12.0) * w
+                        w_total += w
+                        if w > best_w and c_vals:
+                            best_w = w
+                            wet_c = [cv for cv in c_vals if cv >= 51]
+                            day_code = max(wet_c) if (wet_c and (max(pop_vals or [0.0]) >= 35 or sum(pr_vals or [0.0]) >= 0.4)) else max(c_vals)
+                        continue
+
                     bias_max = eval_diurnal_bias(b0, bsin, bcos, afternoon_utc_h)
                     bias_min = eval_diurnal_bias(b0, bsin, bcos, dawn_utc_h)
 
@@ -1579,19 +1654,24 @@ class WeatherProviderService:
                     )
                     d_code_arr = daily_raw.get(f"weather_code_{suffix}") or daily_raw.get("weather_code") or []
 
-                    if d_idx < len(d_max_arr) and d_max_arr[d_idx] is not None and d_idx < len(d_min_arr) and d_min_arr[d_idx] is not None:
-                        max_t_blend += (float(d_max_arr[d_idx]) - bias_max) * w
-                        min_t_blend += (float(d_min_arr[d_idx]) - bias_min) * w
-                        pop_val = float(d_pop_arr[d_idx]) if d_idx < len(d_pop_arr) and d_pop_arr[d_idx] is not None else 0.0
-                        psum_val = float(d_psum_arr[d_idx]) if d_idx < len(d_psum_arr) and d_psum_arr[d_idx] is not None else 0.0
-                        wmax_val = float(d_wmax_arr[d_idx]) if d_idx < len(d_wmax_arr) and d_wmax_arr[d_idx] is not None else 12.0
+                    if (
+                        raw_d_idx < len(d_max_arr)
+                        and d_max_arr[raw_d_idx] is not None
+                        and raw_d_idx < len(d_min_arr)
+                        and d_min_arr[raw_d_idx] is not None
+                    ):
+                        max_t_blend += (float(d_max_arr[raw_d_idx]) - bias_max) * w
+                        min_t_blend += (float(d_min_arr[raw_d_idx]) - bias_min) * w
+                        pop_val = float(d_pop_arr[raw_d_idx]) if raw_d_idx < len(d_pop_arr) and d_pop_arr[raw_d_idx] is not None else 0.0
+                        psum_val = float(d_psum_arr[raw_d_idx]) if raw_d_idx < len(d_psum_arr) and d_psum_arr[raw_d_idx] is not None else 0.0
+                        wmax_val = float(d_wmax_arr[raw_d_idx]) if raw_d_idx < len(d_wmax_arr) and d_wmax_arr[raw_d_idx] is not None else 12.0
                         precip_blend += pop_val * w
                         psum_blend += psum_val * w
                         wmax_blend += wmax_val * w
                         w_total += w
-                        if w > best_w and d_idx < len(d_code_arr) and d_code_arr[d_idx] is not None:
+                        if w > best_w and raw_d_idx < len(d_code_arr) and d_code_arr[raw_d_idx] is not None:
                             best_w = w
-                            day_code = int(d_code_arr[d_idx])
+                            day_code = int(d_code_arr[raw_d_idx])
 
                 if w_total > 0:
                     d_min = round(min_t_blend / w_total, 1)
@@ -1607,8 +1687,8 @@ class WeatherProviderService:
                     or daily_raw.get("wind_direction_10m_dominant")
                     or []
                 )
-                d_wdir = int(d_wdir_arr[d_idx]) if d_idx < len(d_wdir_arr) and d_wdir_arr[d_idx] is not None else 180
-                d_uv = float(d_uv_arr[d_idx]) if d_idx < len(d_uv_arr) and d_uv_arr[d_idx] is not None else 5.0
+                d_wdir = int(d_wdir_arr[raw_d_idx]) if raw_d_idx < len(d_wdir_arr) and d_wdir_arr[raw_d_idx] is not None else 180
+                d_uv = float(d_uv_arr[raw_d_idx]) if raw_d_idx < len(d_uv_arr) and d_uv_arr[raw_d_idx] is not None else 5.0
                 astro_sr, astro_ss = calc_local_sunrise_sunset_iso(
                     latitude, longitude, local_day_dt, utc_offset_sec
                 )
@@ -1617,7 +1697,7 @@ class WeatherProviderService:
                 if d_ss <= d_sr:
                     d_sr, d_ss = astro_sr, astro_ss
 
-                day_slice = hourly_models[d_idx * 24 : (d_idx + 1) * 24]
+                day_slice = hourly_by_local_date.get(local_date_key, [])
                 if day_slice:
                     slice_temps = [h.temperature for h in day_slice]
                     if d_idx == 0:
@@ -1626,6 +1706,10 @@ class WeatherProviderService:
                     else:
                         d_min = round(min(d_min, min(slice_temps)), 1)
                         d_max = round(max(d_max, max(slice_temps)), 1)
+
+                    slice_pops = [int(h.precipitationChance) for h in day_slice if h.precipitationChance is not None]
+                    if slice_pops:
+                        d_pop = max(d_pop, max(slice_pops))
 
                     slice_uvs = [float(h.uvIndex) for h in day_slice if h.uvIndex is not None]
                     if slice_uvs:
@@ -1664,6 +1748,13 @@ class WeatherProviderService:
                         d_slr = round(d_snow_accum * 10.0 / d_psum, 1)
                     else:
                         d_slr = calc_snow_liquid_ratio((d_min + d_max) / 2.0, d_pt)
+                elif d_idx == 0:
+                    d_min = round(min(d_min, final_current_temp), 1)
+                    d_max = round(max(d_max, final_current_temp), 1)
+                    d_mid = (d_min + d_max) / 2.0
+                    d_pt = classify_precip_type(temp_c=d_mid, wmo_code=day_code)
+                    d_slr = calc_snow_liquid_ratio(d_mid, d_pt)
+                    d_snow_accum = round((d_psum / 10.0) * d_slr, 2) if (d_pt in ("snow", "sleet") and d_psum > 0) else 0.0
                 else:
                     d_mid = (d_min + d_max) / 2.0
                     d_pt = classify_precip_type(temp_c=d_mid, wmo_code=day_code)
@@ -1672,7 +1763,7 @@ class WeatherProviderService:
 
                 daily_models.append(
                     DailyForecastModel(
-                        date=dt,
+                        date=day_date_utc,
                         condition=WeatherCondition.from_wmo_code(day_code),
                         wmoCode=day_code,
                         minTemperature=d_min,

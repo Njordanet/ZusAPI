@@ -2,6 +2,13 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.5.1] - 2026-11-11
+
+### Local Calendar-Day High/Low & Precipitation Alignment
+- **Location-Local Midnight-to-Midnight Daily Aggregation**:
+  - Updated 10-day daily temperature highs, lows, precipitation probabilities, and totals to aggregate strictly within each location's local calendar day (`00:00–23:59` local time), preventing evening UTC midnight rollovers from shifting daily forecasts by a day.
+  - Anchored daily forecast timestamps to noon on each local calendar date and reconciled daily highs, lows, and precipitation chances against that calendar day's hourly forecast curve and current conditions.
+
 ## [v1.5.0] - 2026-11-11
 
 ### Surface-Calibrated 2-Minute HD Radar & 10-Hour Forecast Horizon
