@@ -23,9 +23,11 @@ rsync -avz --delete \
 # 3. Build & start docker compose
 ssh "${PANDA_HOST}" "cd ${REMOTE_DIR} && docker compose up -d --build"
 
-# 4. Configure systemd --user boot service & 2-minute self-healing watchdog timer
-echo "⚡️ Configuring systemd --user boot persistence & self-healing watchdog on ${PANDA_HOST}..."
-ssh "${PANDA_HOST}" "mkdir -p ~/.config/systemd/user && cat << 'EOF' > ~/.config/systemd/user/zus-stack.service
+# 4. Configure systemd --user boot service, watchdog, and nightly backup timer
+echo "⚡️ Configuring systemd --user boot persistence, watchdog, and nightly backup timer on ${PANDA_HOST}..."
+ssh "${PANDA_HOST}" "mkdir -p ~/.config/systemd/user && chmod +x ${REMOTE_DIR}/scripts/*.sh ${REMOTE_DIR}/scripts/*.py 2>/dev/null || true
+
+cat << 'EOF' > ~/.config/systemd/user/zus-stack.service
 [Unit]
 Description=ZüsAPI & PostGIS Telemetry Stack (Docker Compose)
 Wants=network-online.target
@@ -66,13 +68,38 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+cat << 'EOF' > ~/.config/systemd/user/zus-backup.service
+[Unit]
+Description=ZüsAPI Nightly Database & State Backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/zus-api
+ExecStart=/bin/bash %h/zus-api/scripts/backup_databases.sh
+EOF
+
+cat << 'EOF' > ~/.config/systemd/user/zus-backup.timer
+[Unit]
+Description=Run ZüsAPI Database Backup Nightly at 03:15 UTC
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl --user daemon-reload
-systemctl --user enable --now zus-stack.service zus-watchdog.timer
+systemctl --user enable --now zus-stack.service zus-watchdog.timer zus-backup.timer
 "
 
 # 5. Check status
 echo "⚡️ Checking container & systemd status..."
-ssh "${PANDA_HOST}" "cd ${REMOTE_DIR} && docker compose ps && systemctl --user is-active zus-stack.service zus-watchdog.timer"
+ssh "${PANDA_HOST}" "cd ${REMOTE_DIR} && docker compose ps && systemctl --user is-active zus-stack.service zus-watchdog.timer zus-backup.timer"
 
 echo "⚡️ Verifying health endpoint & triggering initial backfill check..."
 ssh "${PANDA_HOST}" "curl -s http://localhost:8000/api/v1/health | grep healthy && curl -s -X POST 'http://localhost:8000/api/v1/radar/backfill?lookback_hours=24' && echo '' && echo '✅ ZüsAPI is UP, HEALTHY, and PERSISTENT!'"

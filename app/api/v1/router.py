@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import health, weather, lightning, dataset, radar, notifications
+from app.api.v1.endpoints import health, weather, lightning, dataset, radar, notifications, accounts
 
 api_router = APIRouter()
 
@@ -9,4 +9,5 @@ api_router.include_router(radar.router, tags=["Doppler Radar & Nowcast"])
 api_router.include_router(lightning.router, tags=["Lightning Telemetry"])
 api_router.include_router(dataset.router, tags=["Datasets"])
 api_router.include_router(notifications.router)
+api_router.include_router(accounts.router)
 

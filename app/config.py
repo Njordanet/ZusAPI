@@ -35,6 +35,25 @@ class Settings(BaseSettings):
     # Optional Nowcasting API Keys
     pirate_weather_api_key: str = ""
     tomorrow_io_api_key: str = ""
+
+    # Accounts & Authentication (Supabase)
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_service_role_key: str = ""
+    supabase_jwt_secret: str = ""
+    zus_admin_api_key: str = ""
+    founder_auto_cutoff_iso: str = ""
+
+    # StoreKit 2 & App Store Server Notifications
+    apple_bundle_id: str = "com.zuscast.mobile"
+    apple_issuer_id: str = ""
+    apple_key_id: str = ""
+    apple_private_key_pem: str = ""
+
+    # Google Play Billing & Real-Time Developer Notifications
+    google_play_package_name: str = "com.zuscast.mobile"
+    google_service_account_json: str = ""
+    google_rtdn_webhook_token: str = ""
     
     # Cache & Verification Loop Settings
     cache_ttl_seconds: int = 300  # 5 minutes for neighborhood/city cache sharing

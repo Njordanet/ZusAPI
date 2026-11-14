@@ -2,6 +2,16 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.8.0] - 2026-11-14
+
+### Privacy-First Accounts, Direct Store Entitlements & Encrypted Nightly Backups
+- **Privacy-First Account Synchronization & Entitlement Lifecycle**:
+  - Added optional, anonymous cloud account synchronization and subscription tier management (`endpoints/accounts.py`, `services/account_service.py`) collecting zero personal identifying information (no email addresses, names, phone numbers, IP addresses, or GPS coordinates are stored).
+  - Integrated direct App Store and Google Play purchase receipt and purchase-token cryptographic verification with automatic subscription renewal, expiration, and refund webhook synchronization without third-party billing intermediaries.
+  - Implemented single-use and multi-use Founder invitation code generation with rate-limited atomic redemption, automatic early-adopter grandfathering, and instant account deletion support.
+- **Encrypted Nightly Database & State Backups**:
+  - Automated AES-256-CBC encrypted nightly database and notification-state backup pipeline (`scripts/backup_databases.sh`) with SHA-256 checksum verification and 30-day rolling retention.
+
 ## [v1.7.0] - 2026-11-14
 
 ### Current-Location Widget Isolation & Travel-Aware Push Cell Synchronization
@@ -59,7 +69,7 @@ All notable changes to this service will be documented in this file.
 
 ### Location-Local Sunrise/Sunset Ephemeris & Extended Atmospheric Telemetry (`app/models/weather.py` & `app/services/weather_provider.py`)
 - **Location-Local Sunrise/Sunset Conversion & NOAA Ephemeris Fallback (`app/services/weather_provider.py`)**:
-  - Fixed UTC dislocation in daily `sunrise`/`sunset` strings by shifting Open-Meteo UTC timestamps by `utc_offset_seconds` (`dt_utc + timedelta(seconds=utc_offset_sec)`), indexing by local calendar date, and validating/backfilling with `calc_local_sunrise_sunset_iso` (NOAA solar ephemeris equations).
+  - Fixed UTC dislocation in daily `sunrise`/`sunset` strings by shifting upstream model UTC timestamps by `utc_offset_seconds` (`dt_utc + timedelta(seconds=utc_offset_sec)`), indexing by local calendar date, and validating/backfilling with `calc_local_sunrise_sunset_iso` (NOAA solar ephemeris equations).
 - **Extended Current & Hourly Telemetry (`app/models/weather.py` & `app/services/weather_provider.py`)**:
   - Added `isDay`, `shortwaveRadiation`, `vpdKpa`, `cloudCoverLow`, `cloudCoverMid`, `cloudCoverHigh`, `freezingLevelMeters`, `treePollen`, `grassPollen`, and `weedPollen` (CAMS `alder_pollen`, `birch_pollen`, `olive_pollen`, `grass_pollen`, `mugwort_pollen`, `ragweed_pollen`).
 
@@ -67,23 +77,23 @@ All notable changes to this service will be documented in this file.
 
 ### Full End-to-End Recursive Alignment Engine & Per-Model Bias-Corrected Telemetry
 - **Per-Model Current Telemetry in `ModelWeightDetail` (`app/models/weather.py` & `app/services/weather_provider.py`)**:
-  - Added `currentTempCelsius`, `currentPrecipProb`, and `currentWindKmh` (diurnal-bias-corrected per model) to `ModelWeightDetail` so web and mobile clients render model convergence directly from ZüsAPI's RLS ledger.
+  - Added `currentTempCelsius`, `currentPrecipProb`, and `currentWindKmh` (diurnal-bias-corrected per model) to `ModelWeightDetail` so web and mobile clients render model convergence directly from the ensemble RLS ledger.
 - **Full Hourly & Daily RLS Alignment (`app/services/weather_provider.py`)**:
   - Added vector `sin`/`cos` RLS-weighted wind direction averaging, thermodynamically reconciled relative humidity, and RLS-weighted CAPE across hourly forecast horizons.
   - Reconciled dry hourly and daily WMO sky codes (`0` Clear, `2` Partly Cloudy, `3` Overcast) with RLS-blended cloud cover percentages (`0%–35%` Clear, `36%–84%` Partly Cloudy, `85%+` Overcast).
 - **Eliminated Raw `current_raw` Leaks & Anchored `hourly[0]` ("NOW")**:
-  - Removed raw `current_raw["weather_code"]`, `current_raw["apparent_temperature"]`, and `current_raw["cloud_cover"]` overrides so `current` always reflects IDERW station ground-truth + the RLS-blended `hourly[0]` consensus.
+  - Removed raw `current_raw["weather_code"]`, `current_raw["apparent_temperature"]`, and `current_raw["cloud_cover"]` overrides so `current` always reflects calibrated surface station ground-truth + the RLS-blended `hourly[0]` consensus.
   - Anchored `hourly[0]` ("NOW") 100% to the station-assimilated `current` state and smoothly decayed station temperature deltas (`0.55` at `+1h`, `0.25` at `+2h`) into the forward hourly trajectory.
 
 ## [v1.3.1] - 2026-11-09
 
-### iOS WidgetKit Telemetry Sync Relay (`/api/v1/notifications/widget-sync`)
-- Added ultra-low-latency in-memory widget telemetry relay endpoints (`POST /api/v1/notifications/widget-sync` & `GET /api/v1/notifications/widget-sync`) to synchronize active location, temperature unit, and multi-model forecast snapshots between the ZüsCast mobile app and the iOS WidgetKit extension.
+### iOS WidgetKit Telemetry Sync Relay (`/notifications/widget-sync`)
+- Added ultra-low-latency in-memory widget telemetry relay endpoints (`POST /notifications/widget-sync` & `GET /notifications/widget-sync`) to synchronize active location, temperature unit, and multi-model forecast snapshots between the mobile app and the iOS WidgetKit extension.
 
 ## [v1.3.0] - 2026-11-08
 
 ### Spatial Cell (0.05°) Push Notification Engine & DND Hysteresis Worker
-- **Privacy-Preserving Spatial Cell Registration (`POST /api/v1/notifications/register`)**:
+- **Privacy-Preserving Spatial Cell Registration (`POST /notifications/register`)**:
   - Quantizes device locations into anonymous `0.05°` (~5 km) spatial grid cells (`SpatialPushWorker`), avoiding exact coordinate storage.
   - Supports client notification preference configurations (precipitation, severe weather, environmental thresholds, quiet hours, and breakthrough preferences) with token in-place updating and automatic cell migration.
 - **5-Minute O(1) Push Evaluation Cycle (`push_worker.py`)**:
@@ -96,12 +106,12 @@ All notable changes to this service will be documented in this file.
 ## [v1.2.0] - 2026-11-08
 
 ### Single-Request Radar Regional Pack & Viewport Pack Endpoints
-- Added `GET /api/v1/radar/regional_pack` (`doppler_service.get_regional_pack`) to slice all 14 timeline frames (`-45m` through `+2h`) in a single vectorized NumPy pass into continuous `560x560` WebMercator PNG images (`~800 km x 800 km` span) with LRU caching (`_regional_pack_cache`), eliminating multi-tile checkerboard loading flicker.
-- Added `GET /api/v1/radar/viewport_pack` (`doppler_service.get_viewport_tile_pack`) for batched 3x3 tile neighborhood preloading.
+- Added `GET /radar/regional_pack` (`doppler_service.get_regional_pack`) to slice all 14 timeline frames (`-45m` through `+2h`) in a single vectorized NumPy pass into continuous `560x560` WebMercator PNG images (`~800 km x 800 km` span) with LRU caching (`_regional_pack_cache`), eliminating multi-tile checkerboard loading flicker.
+- Added `GET /radar/viewport_pack` (`doppler_service.get_viewport_tile_pack`) for batched 3x3 tile neighborhood preloading.
 - Added semantic `frame_id` resolution (`past_45m`, `past_30m`, `past_15m`, `latest`, `nowcast_p15m`..`nowcast_p120m`) in `get_tile_png`.
 
 ## [v1.1.0] - 2026-11-08
-- RK2 curved point nowcasting, wet-bulb/sleet/Kuchera SLR physics, and Dark Sky v1 parity.
+- High-precision curved point nowcasting, wet-bulb/sleet precipitation-type physics, and snow-liquid-ratio modeling.
 
 ## [v1.0.0] - 2026-11-07
-- Initialized standalone `ZusAPI` repository with semantic versioning.
+- Initialized standalone repository with semantic versioning.
