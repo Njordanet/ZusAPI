@@ -10,7 +10,14 @@ from app.models.notifications import (
     PushSubscriptionRegisterRequest,
     PushSubscriptionResponse,
 )
-from app.models.weather import WeatherAlertModel, RadarLocalTelemetry
+from app.models.weather import (
+    WeatherAlertModel,
+    RadarLocalTelemetry,
+    WeatherResponse,
+    WeatherDataModel,
+    DailyForecastModel,
+    WeatherCondition,
+)
 from app.services.push_worker import (
     PushWorker,
     quantize_cell,
@@ -394,3 +401,226 @@ def test_api_endpoints():
     u_data = u.json()
     assert u_data["unregistered"] is True
     assert u_data["device_id"] == "api_test_dev_99"
+
+
+def test_legacy_nested_payload_normalization():
+    """
+    Verifies that legacy v2.26.4 nested payloads with latitude/longitude/push_token
+    and nested settings dict are properly normalized:
+    - lat/lon mapped from latitude/longitude
+    - non-Expo push_token sanitized to None
+    - Tier A/B settings copied
+    - morning_briefing_enabled / evening_outlook_enabled not inherited (remain False)
+    """
+    client = TestClient(app)
+    legacy_payload = {
+        "device_id": "legacy_dev_001",
+        "latitude": 40.7128,
+        "longitude": -74.0060,
+        "push_token": "zus_device_legacy",
+        "settings": {
+            "notifications_enabled": True,
+            "precip_sensitivity": "heavy",
+            "morning_briefing_enabled": True,
+            "evening_outlook_enabled": True,
+        },
+    }
+    r = client.post("/api/v1/notifications/register", json=legacy_payload)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["device_id"] == "legacy_dev_001"
+    assert data["expo_push_token"] is None
+    assert data["precip_sensitivity"] == "heavy"
+    assert data["morning_briefing_enabled"] is False
+    assert data["evening_outlook_enabled"] is False
+
+    # Cleanup
+    u = client.delete("/api/v1/notifications/unregister?device_id=legacy_dev_001")
+    assert u.status_code == 200
+
+
+class _MockDateTime(datetime):
+    _mock_now = None
+
+    @classmethod
+    def now(cls, tz=None):
+        if cls._mock_now is not None:
+            if tz is not None:
+                return cls._mock_now.astimezone(tz)
+            return cls._mock_now
+        return datetime.now(tz)
+
+
+@pytest.mark.asyncio
+async def test_server_briefings_fahrenheit_celsius_and_deduplication(tmp_path):
+    """
+    Verifies:
+    1. Morning briefing and evening outlook formatting for Fahrenheit and Celsius subscribers.
+    2. Shared forecast fetching (single get_forecast call per cell).
+    3. Strict deduplication across evaluation cycles.
+    4. SQLite dispatched_briefings cleanup when changing briefing times.
+    """
+    worker = PushWorker()
+    worker._db_path = tmp_path / "test_briefings.db"
+    worker._init_sqlite()
+
+    # Register two devices in the same 0.05° cell (NYC: 40.7, -74.0)
+    await worker.register_subscription(
+        PushSubscriptionRegisterRequest(
+            device_id="dev_briefing_f",
+            expo_push_token="ExponentPushToken[mock-f-token]",
+            lat=40.7128,
+            lon=-74.0060,
+            timezone="America/New_York",
+            city="City of New York",
+            temp_unit="F",
+            morning_briefing_enabled=True,
+            morning_briefing_time="07:30",
+            evening_outlook_enabled=True,
+            evening_outlook_time="20:00",
+            notifications_enabled=True,
+            dnd_enabled=False,
+        )
+    )
+    await worker.register_subscription(
+        PushSubscriptionRegisterRequest(
+            device_id="dev_briefing_c",
+            expo_push_token="ExponentPushToken[mock-c-token]",
+            lat=40.7140,
+            lon=-74.0080,
+            timezone="America/New_York",
+            city="City of New York",
+            temp_unit="C",
+            morning_briefing_enabled=True,
+            morning_briefing_time="07:30",
+            evening_outlook_enabled=True,
+            evening_outlook_time="20:00",
+            notifications_enabled=True,
+            dnd_enabled=False,
+        )
+    )
+
+    mock_telemetry_dry = RadarLocalTelemetry(
+        inConusGrid=True,
+        currentDbz=0.0,
+        precipRateMmHr=0.0,
+        minuteByMinuteRates=[0.0] * 61,
+    )
+
+    cur = WeatherDataModel(
+        cityName="City of New York",
+        temperature=5.0,
+        feelsLike=3.0,
+        condition=WeatherCondition.PARTLY_CLOUDY,
+        tempMin=-1.0,
+        tempMax=6.0,
+        humidity=50,
+        windSpeed=10.0,
+        windDirection=180,
+        uvIndex=3.0,
+        airPressure=1013.25,
+    )
+    d1 = DailyForecastModel(
+        date=datetime(2026, 11, 14, 0, 0, tzinfo=timezone.utc),
+        condition=WeatherCondition.PARTLY_CLOUDY,
+        minTemperature=-1.0,
+        maxTemperature=6.0,
+        precipitationChance=10,
+    )
+    d2 = DailyForecastModel(
+        date=datetime(2026, 11, 15, 0, 0, tzinfo=timezone.utc),
+        condition=WeatherCondition.CLEAR,
+        minTemperature=2.0,
+        maxTemperature=12.0,
+        precipitationChance=5,
+    )
+    mock_wx = WeatherResponse(current=cur, hourly=[], daily=[d1, d2])
+
+    captured_batches = []
+
+    async def mock_dispatch(client, payloads):
+        captured_batches.extend(payloads)
+
+    worker._dispatch_expo_batches = AsyncMock(side_effect=mock_dispatch)
+
+    # 1. First cycle at 07:32 America/New_York (morning briefing due)
+    _MockDateTime._mock_now = datetime(2026, 11, 14, 7, 32, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+    mock_get_forecast = AsyncMock(return_value=mock_wx)
+
+    with patch("app.services.push_worker.datetime", _MockDateTime), \
+         patch("app.services.push_worker.doppler_service.get_point_nowcast", new=AsyncMock(return_value=mock_telemetry_dry)), \
+         patch("app.services.push_worker.weather_service._fetch_nws_polygon_alerts", new=AsyncMock(return_value=[])), \
+         patch("app.services.push_worker.weather_service.get_forecast", mock_get_forecast):
+
+        res1 = await worker.evaluate_and_dispatch()
+        assert mock_get_forecast.await_count == 1
+        assert res1["briefing_dispatches"] == 2
+        assert len(captured_batches) == 2
+
+        f_msg = next(m for m in captured_batches if m["to"] == "ExponentPushToken[mock-f-token]")
+        assert f_msg["title"] == "☀️ Morning Briefing • City of New York"
+        assert f_msg["body"] == "Today: Partly Cloudy. High 43°F / Low 30°F. Dry atmospheric conditions."
+        assert "Tomorrow:" not in f_msg["body"]
+        assert "6°" not in f_msg["body"]
+        assert "-1°" not in f_msg["body"]
+
+        c_msg = next(m for m in captured_batches if m["to"] == "ExponentPushToken[mock-c-token]")
+        assert c_msg["title"] == "☀️ Morning Briefing • City of New York"
+        assert c_msg["body"] == "Today: Partly Cloudy. High 6°C / Low -1°C. Dry atmospheric conditions."
+
+        # 2. Deduplication cycle at 07:35 America/New_York
+        _MockDateTime._mock_now = datetime(2026, 11, 14, 7, 35, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+        mock_get_forecast.reset_mock()
+        captured_batches.clear()
+        res2 = await worker.evaluate_and_dispatch()
+        assert res2["dispatched"] == 0
+        assert res2["briefing_dispatches"] == 0
+        assert mock_get_forecast.await_count == 0
+        assert len(captured_batches) == 0
+
+        # 3. Evening outlook cycle at 20:02 America/New_York
+        _MockDateTime._mock_now = datetime(2026, 11, 14, 20, 2, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+        mock_get_forecast.reset_mock()
+        captured_batches.clear()
+        res3 = await worker.evaluate_and_dispatch()
+        assert mock_get_forecast.await_count == 1
+        assert res3["briefing_dispatches"] == 2
+        assert len(captured_batches) == 2
+
+        f_eve = next(m for m in captured_batches if m["to"] == "ExponentPushToken[mock-f-token]")
+        assert f_eve["title"] == "🌙 Evening Outlook • City of New York"
+        assert f_eve["body"] == "Tomorrow's Outlook: Clear. High 54°F / Low 36°F."
+
+        c_eve = next(m for m in captured_batches if m["to"] == "ExponentPushToken[mock-c-token]")
+        assert c_eve["title"] == "🌙 Evening Outlook • City of New York"
+        assert c_eve["body"] == "Tomorrow's Outlook: Clear. High 12°C / Low 2°C."
+
+        # 4. Updating morning_briefing_time to 07:40
+        await worker.register_subscription(
+            PushSubscriptionRegisterRequest(
+                device_id="dev_briefing_f",
+                expo_push_token="ExponentPushToken[mock-f-token]",
+                lat=40.7128,
+                lon=-74.0060,
+                timezone="America/New_York",
+                city="City of New York",
+                temp_unit="F",
+                morning_briefing_enabled=True,
+                morning_briefing_time="07:40",
+                evening_outlook_enabled=True,
+                evening_outlook_time="20:00",
+                notifications_enabled=True,
+                dnd_enabled=False,
+            )
+        )
+
+        with worker._get_connection() as conn:
+            m_count = conn.execute(
+                "SELECT COUNT(*) as c FROM dispatched_briefings WHERE device_id = 'dev_briefing_f' AND briefing_type = 'morning'"
+            ).fetchone()["c"]
+            e_count = conn.execute(
+                "SELECT COUNT(*) as c FROM dispatched_briefings WHERE device_id = 'dev_briefing_f' AND briefing_type = 'evening'"
+            ).fetchone()["c"]
+            assert m_count == 0
+            assert e_count == 1
+

@@ -2,6 +2,16 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.6.0] - 2026-11-14
+
+### Live Scheduled Daily Briefings, Unit-Aware Push Formatting & Legacy Payload Normalization
+- **Timezone-Aware Spatial-Cell Morning Briefings & Evening Outlooks**:
+  - Added scheduled Morning Briefing and Evening Outlook push evaluation grouped by `0.05°` (~5 km) spatial cells so forecast lookups run at most once per active cell when subscribers enter their local briefing window.
+  - Formatted briefing highs and lows in each subscriber's preferred temperature unit (`°F` or `°C`) with delivery-accurate labels (`Today:` for morning briefings and `Tomorrow's Outlook:` for evening outlooks), quiet-hours suppression, and per-day SQLite deduplication (`dispatched_briefings`) with 10-day retention pruning.
+- **Extended Subscription Schema & Backward-Compatible Registration**:
+  - Added subscriber `city`, `temp_unit`, `wind_unit`, daily briefing schedules, and ambient alert preferences with automatic SQLite `ALTER TABLE` column migration and `server_briefings_supported` capability signaling.
+  - Added request normalization for legacy nested registration payloads and push-token validation while keeping legacy clients opted out of server-dispatched briefings to prevent duplicate notifications.
+
 ## [v1.5.2] - 2026-11-11
 
 ### Widget Background Refresh Parity & Overcast Clutter Suppression
