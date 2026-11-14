@@ -624,3 +624,194 @@ async def test_server_briefings_fahrenheit_celsius_and_deduplication(tmp_path):
             assert m_count == 0
             assert e_count == 1
 
+
+@pytest.mark.asyncio
+async def test_update_subscription_location_if_moved(tmp_path):
+    """
+    Verifies that push subscription coordinates, cell quantization, and city name
+    update in-place if and only if the device moves into a different 0.05° spatial cell.
+    """
+    worker = PushWorker()
+    worker._db_path = tmp_path / "test_moved.db"
+    worker._init_sqlite()
+
+    # Register subscription dev_move_1 at Boston (42.3601, -71.0589, city="Boston")
+    await worker.register_subscription(
+        PushSubscriptionRegisterRequest(
+            device_id="dev_move_1",
+            lat=42.3601,
+            lon=-71.0589,
+            city="Boston",
+            expo_push_token="ExponentPushToken[test-move-token]",
+        )
+    )
+
+    # Move slightly within same 0.05° cell -> returns False, cell stays (42.35, -71.05)
+    moved_slight = await worker.update_subscription_location_if_moved(
+        "dev_move_1", 42.3580, -71.0550, city="Boston"
+    )
+    assert moved_slight is False
+    with worker._get_connection() as conn:
+        row = conn.execute(
+            "SELECT cell_lat, cell_lon, city FROM push_subscriptions WHERE device_id = 'dev_move_1'"
+        ).fetchone()
+        assert abs(float(row["cell_lat"]) - 42.35) < 1e-4
+        assert abs(float(row["cell_lon"]) - (-71.05)) < 1e-4
+        assert row["city"] == "Boston"
+
+    # Move to Providence (41.8240, -71.4128, city="Providence") -> returns True, cell becomes (41.8, -71.4)
+    moved_prov = await worker.update_subscription_location_if_moved(
+        "dev_move_1", 41.8240, -71.4128, city="Providence"
+    )
+    assert moved_prov is True
+    with worker._get_connection() as conn:
+        row = conn.execute(
+            "SELECT cell_lat, cell_lon, city FROM push_subscriptions WHERE device_id = 'dev_move_1'"
+        ).fetchone()
+        assert abs(float(row["cell_lat"]) - 41.8) < 1e-4
+        assert abs(float(row["cell_lon"]) - (-71.4)) < 1e-4
+        assert row["city"] == "Providence"
+
+    # Move slightly within Providence cell with city=None -> returns False (same cell)
+    moved_same = await worker.update_subscription_location_if_moved(
+        "dev_move_1", 41.8250, -71.4100, city=None
+    )
+    assert moved_same is False
+
+    # Move to NYC with city=None -> returns True and city == "Current Location" (never retains stale "Providence")
+    moved_nyc = await worker.update_subscription_location_if_moved(
+        "dev_move_1", 40.7128, -74.0060, city=None
+    )
+    assert moved_nyc is True
+    with worker._get_connection() as conn:
+        row = conn.execute(
+            "SELECT cell_lat, cell_lon, city FROM push_subscriptions WHERE device_id = 'dev_move_1'"
+        ).fetchone()
+        assert abs(float(row["cell_lat"]) - 40.7) < 1e-4
+        assert abs(float(row["cell_lon"]) - (-74.0)) < 1e-4
+        assert row["city"] == "Current Location"
+
+    # Call on unknown device -> returns False
+    moved_unknown = await worker.update_subscription_location_if_moved(
+        "unknown_dev", 40.7128, -74.0060
+    )
+    assert moved_unknown is False
+
+
+@pytest.mark.asyncio
+async def test_widget_sync_location_required_and_live_gps_override(tmp_path):
+    """
+    Verifies:
+    A. locationRequired=True in widget sync returns immediately without triggering forecast re-fetches.
+    B. gps_live=true overrides widget snapshot location, refreshes forecast data, and in-place
+       updates the device's push subscription spatial cell.
+    """
+    from app.api.v1.endpoints.notifications import _WIDGET_SYNC_CACHE
+
+    _WIDGET_SYNC_CACHE.clear()
+
+    test_worker = PushWorker()
+    test_worker._db_path = tmp_path / "test_widget_worker.db"
+    test_worker._init_sqlite()
+
+    client = TestClient(app)
+    mock_get_forecast = AsyncMock()
+
+    try:
+        with patch("app.api.v1.endpoints.notifications.push_worker", test_worker), \
+             patch("app.api.v1.endpoints.notifications.weather_service.get_forecast", mock_get_forecast):
+
+            # Test A: POST with locationRequired=True -> GET returns 200 with locationRequired is True and no get_forecast call
+            post_a = client.post(
+                "/api/v1/notifications/widget-sync",
+                json={
+                    "deviceId": "wdev_1",
+                    "pushDeviceId": "pdev_1",
+                    "unitSymbol": "F",
+                    "locationRequired": True,
+                },
+            )
+            assert post_a.status_code == 200
+
+            get_a = client.get("/api/v1/notifications/widget-sync?device_id=wdev_1")
+            assert get_a.status_code == 200
+            data_a = get_a.json()
+            assert data_a.get("locationRequired") is True
+            assert mock_get_forecast.await_count == 0
+
+            # Test B: Register subscription pdev_1 in Boston, post Boston snapshot, then live GPS override to Providence
+            await test_worker.register_subscription(
+                PushSubscriptionRegisterRequest(
+                    device_id="pdev_1",
+                    lat=42.3601,
+                    lon=-71.0589,
+                    city="Boston",
+                    expo_push_token="ExponentPushToken[pdev_1_tok]",
+                )
+            )
+
+            client.post(
+                "/api/v1/notifications/widget-sync",
+                json={
+                    "deviceId": "wdev_1",
+                    "pushDeviceId": "pdev_1",
+                    "latitude": 42.3601,
+                    "longitude": -71.0589,
+                    "unitSymbol": "F",
+                    "locationName": "Boston",
+                    "locationRequired": False,
+                },
+            )
+
+            cur_prov = WeatherDataModel(
+                cityName="Providence",
+                temperature=14.0,
+                feelsLike=14.0,
+                condition=WeatherCondition.CLEAR,
+                tempMin=10.0,
+                tempMax=18.0,
+                humidity=55,
+                windSpeed=8.0,
+                windDirection=200,
+                uvIndex=4.0,
+                airPressure=1015.0,
+            )
+            d_prov = DailyForecastModel(
+                date=datetime(2026, 11, 14, 0, 0, tzinfo=timezone.utc),
+                condition=WeatherCondition.CLEAR,
+                minTemperature=10.0,
+                maxTemperature=18.0,
+                precipitationChance=0,
+            )
+            prov_wx = WeatherResponse(current=cur_prov, hourly=[], daily=[d_prov])
+            mock_get_forecast.return_value = prov_wx
+
+            get_prov = client.get(
+                "/api/v1/notifications/widget-sync",
+                params={
+                    "device_id": "wdev_1",
+                    "push_device_id": "pdev_1",
+                    "lat": 41.8240,
+                    "lon": -71.4128,
+                    "location_name": "Providence",
+                    "gps_live": "true",
+                },
+            )
+            assert get_prov.status_code == 200
+            data_prov = get_prov.json()
+            assert data_prov.get("locationRequired") is False
+            assert data_prov.get("locationName") == "Providence"
+            assert data_prov.get("latitude") == 41.8240
+            assert data_prov.get("longitude") == -71.4128
+
+            with test_worker._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT cell_lat, cell_lon, city FROM push_subscriptions WHERE device_id = 'pdev_1'"
+                ).fetchone()
+                assert abs(float(row["cell_lat"]) - 41.8) < 1e-4
+                assert abs(float(row["cell_lon"]) - (-71.4)) < 1e-4
+                assert row["city"] == "Providence"
+
+    finally:
+        _WIDGET_SYNC_CACHE.clear()
+

@@ -288,23 +288,23 @@ async def post_widget_sync(
         "syncedAtMs": time.time() * 1000.0,
     }
     _WIDGET_SYNC_CACHE[client_ip] = entry
-    _WIDGET_SYNC_CACHE["__latest__"] = entry
 
     dev_id = str(payload.get("deviceId") or "").strip()
     if dev_id:
         _WIDGET_SYNC_CACHE[f"dev:{dev_id}"] = entry
 
-    try:
-        p_lat = float(payload["latitude"])
-        p_lon = float(payload["longitude"])
-        p_unit = str(payload.get("unitSymbol") or "F")
-        _WIDGET_SYNC_CACHE[_loc_cache_key(p_lat, p_lon, p_unit)] = entry
-    except (KeyError, TypeError, ValueError):
-        pass
+    if not bool(payload.get("locationRequired")):
+        try:
+            p_lat = float(payload["latitude"])
+            p_lon = float(payload["longitude"])
+            p_unit = str(payload.get("unitSymbol") or "F")
+            _WIDGET_SYNC_CACHE[_loc_cache_key(p_lat, p_lon, p_unit)] = entry
+        except (KeyError, TypeError, ValueError):
+            pass
 
     # Prune if > 500 entries to conserve memory
     while len(_WIDGET_SYNC_CACHE) > 500:
-        oldest_key = next((k for k in _WIDGET_SYNC_CACHE if k != "__latest__"), None)
+        oldest_key = next(iter(_WIDGET_SYNC_CACHE), None)
         if not oldest_key:
             break
         _WIDGET_SYNC_CACHE.pop(oldest_key, None)
@@ -318,10 +318,12 @@ async def post_widget_sync(
 async def get_widget_sync(
     request: Request,
     device_id: Optional[str] = Query(None),
+    push_device_id: Optional[str] = Query(None),
     lat: Optional[float] = Query(None),
     lon: Optional[float] = Query(None),
     unit: Optional[str] = Query(None),
     location_name: Optional[str] = Query(None),
+    gps_live: bool = Query(False),
 ) -> Dict[str, Any]:
     client_ip = _extract_client_ip(request)
     cache_key: Optional[str] = None
@@ -330,7 +332,7 @@ async def get_widget_sync(
     if device_id and f"dev:{device_id.strip()}" in _WIDGET_SYNC_CACHE:
         cache_key = f"dev:{device_id.strip()}"
         entry = _WIDGET_SYNC_CACHE[cache_key]
-    elif lat is not None and lon is not None:
+    elif lat is not None and lon is not None and not gps_live:
         loc_key = _loc_cache_key(lat, lon, unit or "F")
         if loc_key in _WIDGET_SYNC_CACHE:
             cache_key = loc_key
@@ -338,24 +340,77 @@ async def get_widget_sync(
         elif client_ip in _WIDGET_SYNC_CACHE:
             ip_entry = _WIDGET_SYNC_CACHE[client_ip]
             if (
-                abs(float(ip_entry.get("latitude", 0.0)) - lat) <= 0.05
-                and abs(float(ip_entry.get("longitude", 0.0)) - lon) <= 0.05
+                ip_entry.get("locationRequired") is True
+                or (
+                    abs(float(ip_entry.get("latitude", 0.0)) - lat) <= 0.05
+                    and abs(float(ip_entry.get("longitude", 0.0)) - lon) <= 0.05
+                )
             ):
                 cache_key = client_ip
                 entry = ip_entry
-        if not entry:
+    elif client_ip in _WIDGET_SYNC_CACHE:
+        cache_key = client_ip
+        entry = _WIDGET_SYNC_CACHE[client_ip]
+
+    if gps_live and lat is not None and lon is not None:
+        target_push_id = (
+            (push_device_id or "").strip()
+            or str((entry or {}).get("pushDeviceId") or "").strip()
+        )
+        if target_push_id:
+            await push_worker.update_subscription_location_if_moved(
+                target_push_id, lat, lon, city=location_name
+            )
+
+        effective_unit = (unit or str((entry or {}).get("unitSymbol") or "F")).upper()
+        moved = (
+            (entry is None)
+            or bool(entry.get("locationRequired"))
+            or abs(float(entry.get("latitude", 0.0)) - lat) > 0.02
+            or abs(float(entry.get("longitude", 0.0)) - lon) > 0.02
+        )
+        if moved:
+            loc_label = (location_name or "").strip()
+            if not loc_label:
+                loc_label = "Current Location"
             seed = {
+                **(entry or {}),
                 "latitude": lat,
                 "longitude": lon,
-                "unitSymbol": (unit or "F").upper(),
-                "locationName": location_name or "Current Location",
+                "unitSymbol": effective_unit,
+                "locationName": loc_label,
+                "locationRequired": False,
             }
+            if device_id and device_id.strip():
+                seed["deviceId"] = device_id.strip()
+            if target_push_id:
+                seed["pushDeviceId"] = target_push_id
+
             refreshed = await _refresh_stale_widget_entry(seed)
-            _WIDGET_SYNC_CACHE[loc_key] = refreshed
+            if seed.get("deviceId"):
+                _WIDGET_SYNC_CACHE[f"dev:{seed['deviceId']}"] = refreshed
+            _WIDGET_SYNC_CACHE[_loc_cache_key(lat, lon, effective_unit)] = refreshed
+            _WIDGET_SYNC_CACHE[client_ip] = refreshed
             return refreshed
-    else:
-        cache_key = client_ip if client_ip in _WIDGET_SYNC_CACHE else "__latest__"
-        entry = _WIDGET_SYNC_CACHE.get(cache_key)
+        else:
+            if target_push_id and entry and not entry.get("pushDeviceId"):
+                entry["pushDeviceId"] = target_push_id
+
+    if entry and entry.get("locationRequired") is True:
+        return entry
+
+    if not entry and lat is not None and lon is not None:
+        seed = {
+            "latitude": lat,
+            "longitude": lon,
+            "unitSymbol": (unit or "F").upper(),
+            "locationName": location_name or "Current Location",
+        }
+        if device_id and device_id.strip():
+            seed["deviceId"] = device_id.strip()
+        refreshed = await _refresh_stale_widget_entry(seed)
+        _WIDGET_SYNC_CACHE[_loc_cache_key(lat, lon, unit or "F")] = refreshed
+        return refreshed
 
     if not entry:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No widget snapshot synced yet")
@@ -367,6 +422,9 @@ async def get_widget_sync(
             refreshed = await _refresh_stale_widget_entry(entry)
             if cache_key:
                 _WIDGET_SYNC_CACHE[cache_key] = refreshed
+            dev_id = str(refreshed.get("deviceId") or "").strip()
+            if dev_id:
+                _WIDGET_SYNC_CACHE[f"dev:{dev_id}"] = refreshed
             try:
                 _WIDGET_SYNC_CACHE[
                     _loc_cache_key(
@@ -377,8 +435,7 @@ async def get_widget_sync(
                 ] = refreshed
             except (KeyError, TypeError, ValueError):
                 pass
-            if cache_key == "__latest__" or cache_key == client_ip:
-                _WIDGET_SYNC_CACHE["__latest__"] = refreshed
+            _WIDGET_SYNC_CACHE[client_ip] = refreshed
             return refreshed
         except Exception:
             pass

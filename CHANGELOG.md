@@ -2,6 +2,16 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.7.0] - 2026-11-14
+
+### Current-Location Widget Isolation & Travel-Aware Push Cell Synchronization
+- **Travel-Aware Push Subscription Cell Updates**:
+  - Added in-place spatial-cell coordinate and city updates when live background widget location refreshes detect subscriber movement into a new `0.05°` (~5 km) cell, keeping precipitation alerts, severe weather warnings, and scheduled daily briefings aligned with the user's physical location while traveling without requiring an app launch.
+  - Preserved strict opt-in semantics so background widget refreshes never recreate subscriptions for paused or unsubscribed devices.
+- **Strict Device-Scoped Widget Snapshot Isolation & Location-Required State**:
+  - Removed cross-device fallback snapshot lookups so background widget refreshes remain strictly isolated per device installation.
+  - Added explicit `locationRequired` state handling so devices with Location Services turned off preserve their prompt state cleanly without falling back to stale or default coordinates.
+
 ## [v1.6.0] - 2026-11-14
 
 ### Live Scheduled Daily Briefings, Unit-Aware Push Formatting & Legacy Payload Normalization

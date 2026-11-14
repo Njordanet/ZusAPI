@@ -520,6 +520,68 @@ class PushWorker:
 
         return await asyncio.to_thread(_do_delete)
 
+    async def update_subscription_location_if_moved(
+        self,
+        device_id: str,
+        lat: float,
+        lon: float,
+        city: Optional[str] = None,
+    ) -> bool:
+        """
+        Updates an existing device push subscription's coordinates, 0.05° spatial cell,
+        and optional city label in-place ONLY if the device moved into a different spatial cell.
+        Never creates a new subscription if device_id is not registered.
+        """
+        clean_id = (device_id or "").strip()
+        if not clean_id:
+            return False
+
+        new_cell_lat, new_cell_lon = quantize_cell(lat, lon)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        incoming_city = (city or "").strip()
+
+        def _do_update() -> bool:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT cell_lat, cell_lon, city FROM push_subscriptions WHERE device_id = ?",
+                    (clean_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+
+                same_cell = (
+                    abs(float(row["cell_lat"]) - new_cell_lat) < 1e-4
+                    and abs(float(row["cell_lon"]) - new_cell_lon) < 1e-4
+                )
+                if same_cell:
+                    return False
+
+                if incoming_city and incoming_city != "Current Location":
+                    resolved_city = incoming_city
+                else:
+                    resolved_city = "Current Location"
+
+                conn.execute(
+                    """
+                    UPDATE push_subscriptions
+                    SET lat = ?, lon = ?, cell_lat = ?, cell_lon = ?, city = ?, updated_at = ?
+                    WHERE device_id = ?
+                    """,
+                    (
+                        lat,
+                        lon,
+                        new_cell_lat,
+                        new_cell_lon,
+                        resolved_city,
+                        now_iso,
+                        clean_id,
+                    ),
+                )
+                conn.commit()
+                return True
+
+        return await asyncio.to_thread(_do_update)
+
     async def get_stats(self) -> NotificationStatsResponse:
         """
         Returns real-time diagnostics and subscription statistics.

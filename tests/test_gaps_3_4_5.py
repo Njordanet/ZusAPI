@@ -44,7 +44,7 @@ async def test_gap3_point_telemetry_curved_fields():
     svc = DopplerRadarService()
     # Create fake frames
     now = datetime.now(timezone.utc)
-    dummy_grid = np.full((svc.GRID_H, svc.GRID_W), 90, dtype=np.uint8)  # ~12.5 dBZ echo
+    dummy_grid = np.full((svc.GRID_H, svc.GRID_W), 100, dtype=np.uint8)  # ~17.5 dBZ echo
     live_frame = DopplerGridFrame(
         frame_id="live_0",
         dt=now,
