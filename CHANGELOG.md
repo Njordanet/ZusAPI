@@ -2,6 +2,14 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.8.1] - 2026-11-15
+
+### Non-Mainland Precipitation Consistency & Light-Rain Threshold Alignment
+- **Global & Regional Next-Hour Precipitation Alignment**:
+  - Improved minute-by-minute precipitation nowcasting for non-mainland regions and island territories, ensuring high-resolution next-hour curves are consistently populated from regional observation networks.
+- **Light Rain & Drizzle Threshold Calibration**:
+  - Calibrated current condition thresholds for light drizzle and light rain to ensure condition indicators match ground-level precipitation rates and eliminate conflicting dry and wet reports.
+
 ## [v1.8.0] - 2026-11-14
 
 ### Privacy-First Accounts, Direct Store Entitlements & Encrypted Nightly Backups

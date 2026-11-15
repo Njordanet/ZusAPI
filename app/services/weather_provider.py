@@ -449,10 +449,10 @@ class WeatherProviderService:
                 blended = max(rad_mmhr, nwp_mmhr)
             fused_61.append(round(blended, 2) if blended >= 0.04 else 0.0)
 
-        if doppler and doppler.inConusGrid:
+        if doppler:
             doppler.minuteByMinuteRates = fused_61
             doppler.minuteRates60m = [fused_61[t] for t in range(0, 61, 5)]
-            if station_mmhr > 0.0 and doppler.currentDbz < 18.0:
+            if (doppler.inConusGrid or station_mmhr > 0.0) and station_mmhr > 0.0 and doppler.currentDbz < 18.0:
                 doppler.currentDbz = 19.5 if station_mmhr >= 1.0 else 15.0
                 doppler.precipRateMmHr = max(doppler.precipRateMmHr, station_mmhr)
                 doppler.intensityCategory = "Light Rain" if station_mmhr >= 0.8 else "Light Drizzle"
@@ -1156,7 +1156,11 @@ class WeatherProviderService:
                         else 0.0
                     )
 
-                if top_wet_code >= 51 and (wet_w >= 0.32 or final_h_precip >= 40 or final_h_pr_mm >= 0.1):
+                if top_wet_code >= 51 and (
+                    (wet_w >= 0.32 and (final_h_precip >= 20 or final_h_pr_mm >= 0.08))
+                    or final_h_precip >= 40
+                    or final_h_pr_mm >= 0.12
+                ):
                     top_code = top_wet_code
                 elif top_code < 45:
                     # Reconcile sky condition code with RLS-blended cloud cover
