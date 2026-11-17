@@ -139,6 +139,214 @@ def classify_precip_type(
         return "rain"
 
 
+def calc_horizon_bias_scales(lead_hours: float) -> Tuple[float, float]:
+    """
+    Returns (mean_scale, harmonic_amp_scale) for learned station diurnal bias.
+    Keeps 100% strength inside 0-36h, then tapers smoothly over 36-96h so a calm
+    short-range regime bias does not distort Days 4-10 airmass shifts.
+    """
+    if lead_hours <= 36.0:
+        return 1.0, 1.0
+    if lead_hours >= 96.0:
+        return 0.15, 0.0
+    t = (lead_hours - 36.0) / 60.0
+    return round(1.0 - 0.85 * t, 4), round(1.0 - t, 4)
+
+
+def eval_decayed_diurnal_bias(
+    b0: float, bsin: float, bcos: float, utc_hour: int, lead_hours: float
+) -> float:
+    mean_s, amp_s = calc_horizon_bias_scales(lead_hours)
+    return eval_diurnal_bias(b0 * mean_s, bsin * amp_s, bcos * amp_s, utc_hour)
+
+
+def _raw_model_series(
+    raw_map: Dict[str, Any], key_base: str, suffix: str
+) -> List[Any]:
+    """Fetch a model-specific Open-Meteo series without falling back across models."""
+    suffixed_key = f"{key_base}_{suffix}"
+    if suffixed_key in raw_map:
+        return raw_map.get(suffixed_key) or []
+    if suffix == "best_match":
+        return raw_map.get(key_base) or []
+    return []
+
+
+def blend_hourly_precip_and_snow(
+    model_entries: List[Dict[str, Any]],
+    total_w: float,
+    blended_temp_c: float,
+    blended_rh: float,
+    blended_pop: int,
+    top_code: int,
+    lead_hours: float,
+) -> Tuple[str, float]:
+    """
+    Compute hourly precip type and snow accumulation inside each individual model
+    using its own bias-corrected T/RH before blending, eliminating cross-model artifacts.
+    """
+    blended_snow_cm = 0.0
+    snow_model_w = 0.0
+    sleet_model_w = 0.0
+    rain_model_w = 0.0
+
+    for entry in model_entries:
+        w = float(entry["weight"])
+        m_temp = float(entry["temp_c"])
+        m_dew = float(entry["dew_c"])
+        m_pr = float(entry["precip_mm"])
+        m_pop = int(entry["precip_prob"])
+        m_code = int(entry["wmo_code"])
+        m_rh = (
+            int(round(float(entry["rh_pct"])))
+            if entry.get("rh_pct") is not None
+            else calc_relative_humidity(m_temp, m_dew)
+        )
+        m_wb = calc_wet_bulb_c(m_temp, m_rh)
+        m_pt = classify_precip_type(
+            temp_c=m_temp, rh_pct=float(m_rh), wet_bulb_c=m_wb, wmo_code=m_code
+        )
+        m_slr = calc_snow_liquid_ratio(m_temp, m_pt)
+        m_snow_cm = (m_pr / 10.0) * m_slr if (m_pt in ("snow", "sleet") and m_pr > 0.0) else 0.0
+        blended_snow_cm += m_snow_cm * w
+
+        if m_pr >= 0.05 or m_pop >= 25:
+            if m_pt == "sleet":
+                sleet_model_w += w
+            elif m_pt == "snow":
+                snow_model_w += w
+            else:
+                rain_model_w += w
+
+    h_wb = calc_wet_bulb_c(blended_temp_c, blended_rh)
+    if (snow_model_w + sleet_model_w + rain_model_w) > 0:
+        if sleet_model_w >= snow_model_w and sleet_model_w >= rain_model_w:
+            h_pt = "sleet"
+        elif (
+            snow_model_w > 0
+            and rain_model_w > 0
+            and total_w > 0
+            and snow_model_w >= 0.20 * total_w
+            and rain_model_w >= 0.20 * total_w
+        ):
+            h_pt = "sleet"
+        elif snow_model_w > rain_model_w:
+            h_pt = "snow"
+        else:
+            h_pt = "rain"
+    else:
+        h_pt = classify_precip_type(
+            temp_c=blended_temp_c,
+            rh_pct=float(blended_rh),
+            wet_bulb_c=h_wb,
+            wmo_code=top_code,
+        )
+
+    h_snow_cm = round(blended_snow_cm / total_w, 2) if total_w > 0 else 0.0
+    if lead_hours > 48.0 and blended_pop < 22 and (snow_model_w + sleet_model_w) < 0.25 * max(total_w, 1e-6):
+        h_snow_cm = 0.0
+
+    return h_pt, h_snow_cm
+
+
+def reconcile_daily_condition_and_snow(
+    day_slice: List[HourlyForecastModel],
+    d_idx: int,
+    d_pop: int,
+    d_psum: float,
+    d_min: float,
+    d_max: float,
+    initial_day_code: int,
+    tz_delta: timedelta,
+) -> Tuple[int, str, float, float]:
+    """
+    Reconcile daily sky/precip condition code, precip type, confidence-gated snow
+    accumulation, and SLR from the blended hourly slice for a single calendar day.
+    """
+    raw_snow_accum = round(sum((h.snowAccumulationCm or 0.0) for h in day_slice), 2)
+    snow_allowed = (d_idx == 0 and (d_pop >= 20 or raw_snow_accum >= 0.25)) or (d_pop >= 25)
+    d_snow_accum = raw_snow_accum if snow_allowed else 0.0
+
+    sig_hours = [
+        h
+        for h in day_slice
+        if (h.precipMm or 0.0) >= 0.08 or (h.precipitationChance or 0) >= 25
+    ]
+    sleet_h = sum(1 for h in sig_hours if h.precipType == "sleet")
+    snow_h = sum(
+        1
+        for h in sig_hours
+        if h.precipType == "snow" or (h.snowAccumulationCm or 0.0) >= 0.05
+    )
+    rain_h = sum(
+        1
+        for h in sig_hours
+        if h.precipType == "rain" and (h.snowAccumulationCm or 0.0) < 0.05
+    )
+
+    if d_snow_accum >= 0.25:
+        if sleet_h > snow_h or (rain_h >= 2 and snow_h >= 1):
+            d_pt = "sleet"
+        else:
+            d_pt = "snow"
+    elif sleet_h > 0 and d_pop >= 30:
+        d_pt = "sleet"
+    else:
+        d_pt = "rain"
+
+    wet_hours = [h.wmoCode for h in day_slice if h.wmoCode >= 51]
+    allow_wet_icon = (d_pop >= 30) or (d_idx == 0 and d_pop >= 25 and len(wet_hours) >= 2)
+    day_code = initial_day_code
+
+    if allow_wet_icon and (wet_hours or initial_day_code >= 51):
+        thunder_codes = [c for c in wet_hours if c >= 95]
+        if thunder_codes and d_pop >= 40:
+            day_code = max(thunder_codes)
+        elif d_pt == "sleet":
+            day_code = 67 if d_psum >= 5.0 else 66
+        elif d_pt == "snow":
+            day_code = 75 if d_snow_accum >= 8.0 else (73 if d_snow_accum >= 2.0 else 71)
+        else:
+            if d_psum >= 12.0:
+                day_code = 65
+            elif d_psum >= 4.0:
+                day_code = 63
+            elif d_psum >= 1.0 or d_pop >= 45:
+                day_code = 61
+            else:
+                day_code = 51
+    else:
+        fog_hours = [h.wmoCode for h in day_slice if h.wmoCode in (45, 48)]
+        if d_idx <= 1 and initial_day_code in (45, 48) and len(fog_hours) >= 3:
+            day_code = max(fog_hours)
+        else:
+            cw_sum = 0.0
+            cw_tot = 0.0
+            for h in day_slice:
+                is_daylight = (
+                    h.isDay
+                    if h.isDay is not None
+                    else (7 <= (h.time + tz_delta).hour <= 17)
+                )
+                hw = 2.5 if is_daylight else 0.5
+                cw_sum += float(h.cloudCover or 0) * hw
+                cw_tot += hw
+            eff_day_cloud = (cw_sum / cw_tot) if cw_tot > 0 else 0.0
+            if eff_day_cloud >= 78.0:
+                day_code = 3
+            elif eff_day_cloud >= 26.0:
+                day_code = 2
+            else:
+                day_code = 0
+
+    if d_psum > 0 and d_snow_accum > 0:
+        d_slr = round(d_snow_accum * 10.0 / d_psum, 1)
+    else:
+        d_slr = calc_snow_liquid_ratio((d_min + d_max) / 2.0, d_pt)
+
+    return day_code, d_pt, d_snow_accum, d_slr
+
+
 def calc_dobson_units(lat: float, surface_ozone_ugm3: Optional[float] = None) -> float:
     """
     Computes total column ozone in Dobson Units (DU), blending a latitude and
@@ -227,6 +435,12 @@ class WeatherProviderService:
         lon: float,
         include_past_24h: bool = False,
     ) -> Dict[str, Any]:
+        in_conus = db_manager.is_conus_region(lat, lon)
+        models_csv = (
+            "best_match,ecmwf_ifs025,ncep_nbm_conus,gfs_seamless,icon_seamless,gem_seamless"
+            if in_conus
+            else "best_match,ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless"
+        )
         params: Dict[str, Any] = {
             "latitude": lat,
             "longitude": lon,
@@ -249,7 +463,7 @@ class WeatherProviderService:
                 "precipitation_sum,uv_index_max,wind_speed_10m_max,wind_direction_10m_dominant,"
                 "sunrise,sunset"
             ),
-            "models": "best_match,ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless",
+            "models": models_csv,
             "timezone": "UTC",
             "past_hours": 24,
             "forecast_days": 10,
@@ -583,6 +797,7 @@ class WeatherProviderService:
                     return response.model_copy(update={"cached": True})
 
             is_us = db_manager.is_us_region(latitude, longitude)
+            in_conus = db_manager.is_conus_region(latitude, longitude)
             region_mode = "US_HYPERLOCAL" if is_us else "GLOBAL_ENSEMBLE"
             cell_id = db_manager.make_cell_id(latitude, longitude)
 
@@ -645,6 +860,10 @@ class WeatherProviderService:
             }
             if not is_us:
                 model_suffixes.pop("HRRR", None)
+            if in_conus and any(
+                v is not None for v in (hourly_raw.get("temperature_2m_ncep_nbm_conus") or [])
+            ):
+                model_suffixes["NBM"] = "ncep_nbm_conus"
 
             times_list = hourly_raw.get("time", [])
             current_hour_str = now.strftime("%Y-%m-%dT%H:00")
@@ -719,21 +938,21 @@ class WeatherProviderService:
 
             model_hourly_streams: Dict[str, List[Dict[str, Any]]] = {}
             for m_name, suffix in model_suffixes.items():
-                t_arr = hourly_raw.get(f"temperature_2m_{suffix}") or hourly_raw.get("temperature_2m") or []
-                fl_arr = hourly_raw.get(f"apparent_temperature_{suffix}") or hourly_raw.get("apparent_temperature") or []
-                p_arr = hourly_raw.get(f"precipitation_probability_{suffix}") or hourly_raw.get("precipitation_probability") or []
-                pr_arr = hourly_raw.get(f"precipitation_{suffix}") or hourly_raw.get("precipitation") or []
-                w_arr = hourly_raw.get(f"wind_speed_10m_{suffix}") or hourly_raw.get("wind_speed_10m") or []
-                wdir_arr = hourly_raw.get(f"wind_direction_10m_{suffix}") or hourly_raw.get("wind_direction_10m") or []
-                wg_arr = hourly_raw.get(f"wind_gusts_10m_{suffix}") or hourly_raw.get("wind_gusts_10m") or []
-                uv_arr = hourly_raw.get(f"uv_index_{suffix}") or hourly_raw.get("uv_index") or []
-                dp_arr = hourly_raw.get(f"dew_point_2m_{suffix}") or hourly_raw.get("dew_point_2m") or []
-                rh_arr = hourly_raw.get(f"relative_humidity_2m_{suffix}") or hourly_raw.get("relative_humidity_2m") or []
-                cc_arr = hourly_raw.get(f"cloud_cover_{suffix}") or hourly_raw.get("cloud_cover") or []
-                vis_arr = hourly_raw.get(f"visibility_{suffix}") or hourly_raw.get("visibility") or []
-                pr_msl_arr = hourly_raw.get(f"pressure_msl_{suffix}") or hourly_raw.get("pressure_msl") or []
-                cape_arr = hourly_raw.get(f"cape_{suffix}") or hourly_raw.get("cape") or []
-                c_arr = hourly_raw.get(f"weather_code_{suffix}") or hourly_raw.get("weather_code") or []
+                t_arr = _raw_model_series(hourly_raw, "temperature_2m", suffix)
+                fl_arr = _raw_model_series(hourly_raw, "apparent_temperature", suffix)
+                p_arr = _raw_model_series(hourly_raw, "precipitation_probability", suffix)
+                pr_arr = _raw_model_series(hourly_raw, "precipitation", suffix)
+                w_arr = _raw_model_series(hourly_raw, "wind_speed_10m", suffix)
+                wdir_arr = _raw_model_series(hourly_raw, "wind_direction_10m", suffix)
+                wg_arr = _raw_model_series(hourly_raw, "wind_gusts_10m", suffix)
+                uv_arr = _raw_model_series(hourly_raw, "uv_index", suffix)
+                dp_arr = _raw_model_series(hourly_raw, "dew_point_2m", suffix)
+                rh_arr = _raw_model_series(hourly_raw, "relative_humidity_2m", suffix)
+                cc_arr = _raw_model_series(hourly_raw, "cloud_cover", suffix)
+                vis_arr = _raw_model_series(hourly_raw, "visibility", suffix)
+                pr_msl_arr = _raw_model_series(hourly_raw, "pressure_msl", suffix)
+                cape_arr = _raw_model_series(hourly_raw, "cape", suffix)
+                c_arr = _raw_model_series(hourly_raw, "weather_code", suffix)
 
                 stream: List[Dict[str, Any]] = []
                 max_offsets = max(25, len(times_list) - start_idx)
@@ -760,7 +979,7 @@ class WeatherProviderService:
                             "rh_pct": float(rh_arr[idx]) if idx < len(rh_arr) and rh_arr[idx] is not None else None,
                             "cloud_pct": int(cc_arr[idx]) if idx < len(cc_arr) and cc_arr[idx] is not None else 0,
                             "vis_km": round(float(vis_arr[idx]) / 1000.0, 2) if idx < len(vis_arr) and vis_arr[idx] is not None else None,
-                            "press_hpa": float(pr_msl_arr[idx]) if idx < len(pr_msl_arr) and pr_msl_arr[idx] is not None else 1013.25,
+                            "press_hpa": float(pr_msl_arr[idx]) if idx < len(pr_msl_arr) and pr_msl_arr[idx] is not None else None,
                             "cape_jkg": float(cape_arr[idx]) if idx < len(cape_arr) and cape_arr[idx] is not None else None,
                             "wmo_code": int(c_arr[idx]) if idx < len(c_arr) and c_arr[idx] is not None else 0,
                         }
@@ -977,6 +1196,20 @@ class WeatherProviderService:
                 for m in weights_map:
                     weights_map[m][norm_key] = float(weights_map[m].get(bucket_key) or weights_map[m]["dynamic_weight"]) / b_sum
 
+            # Cap secondary global models in extended range when primary extended guidance is present
+            if len(weights_map) >= 4 and ("ECMWF" in weights_map or "NBM" in weights_map):
+                ext_cap = 0.12
+                capped_models = [m for m in ("GEM", "ICON") if m in weights_map and weights_map[m]["norm_ext"] > ext_cap]
+                if capped_models:
+                    excess_ext = sum(weights_map[m]["norm_ext"] - ext_cap for m in capped_models)
+                    for m in capped_models:
+                        weights_map[m]["norm_ext"] = ext_cap
+                    uncapped_models = [m for m in weights_map if m not in ("GEM", "ICON")]
+                    uncapped_sum = sum(weights_map[m]["norm_ext"] for m in uncapped_models)
+                    if uncapped_sum > 0 and excess_ext > 0:
+                        for m in uncapped_models:
+                            weights_map[m]["norm_ext"] += excess_ext * (weights_map[m]["norm_ext"] / uncapped_sum)
+
             # 6. Compute Horizon-Weighted & Diurnal-Bias-Corrected Multi-Model Hourly Blend + Oracle Consensus Score
             hourly_models: List[HourlyForecastModel] = []
             hourly_spreads: List[float] = []
@@ -1001,6 +1234,7 @@ class WeatherProviderService:
                 blended_vis = 0.0
                 vis_w_total = 0.0
                 blended_press = 0.0
+                press_w_total = 0.0
                 blended_cape = 0.0
                 cape_w_total = 0.0
                 total_w = 0.0
@@ -1016,12 +1250,14 @@ class WeatherProviderService:
                 hour_clouds: List[int] = []
                 hour_vis: List[float] = []
                 hour_press: List[float] = []
+                hour_model_entries: List[Dict[str, Any]] = []
                 top_code = 0
                 top_w = -1.0
                 top_wet_code = 0
                 top_wet_w = -1.0
                 dt = now + timedelta(hours=h_offset)
                 target_utc_hour = dt.hour
+                _, wind_bias_scale = calc_horizon_bias_scales(float(h_offset))
 
                 for m_name, stream in model_hourly_streams.items():
                     if h_offset < len(stream) and m_name in weights_map:
@@ -1038,13 +1274,14 @@ class WeatherProviderService:
                         else:
                             w = w_info["norm_ext"]
 
-                        bias = eval_diurnal_bias(
+                        bias = eval_decayed_diurnal_bias(
                             float(w_info.get("bias_temp_c") or 0.0),
                             float(w_info.get("bias_sin_c") or 0.0),
                             float(w_info.get("bias_cos_c") or 0.0),
                             target_utc_hour,
+                            float(h_offset),
                         )
-                        wind_bias = float(w_info.get("bias_wind_kmh") or 0.0) * 0.4
+                        wind_bias = float(w_info.get("bias_wind_kmh") or 0.0) * 0.4 * wind_bias_scale
                         bias_corrected_t = pt["temp_c"] - bias
                         bias_corrected_fl = pt.get("feels_c", pt["temp_c"]) - bias
                         bias_corrected_dew = pt.get("dew_c", pt["temp_c"] - 4.0) - bias
@@ -1053,7 +1290,7 @@ class WeatherProviderService:
                         w_val = max(0.0, float(pt.get("wind_kmh", 0.0)) - wind_bias)
                         g_val = max(w_val, float(pt.get("gust_kmh", round(w_val * 1.3, 1))) - wind_bias)
                         c_val = int(pt.get("cloud_pct", 0))
-                        p_val = float(pt.get("press_hpa", 1013.25))
+                        code = int(pt["wmo_code"])
 
                         blended_t += bias_corrected_t * w
                         blended_fl += bias_corrected_fl * w
@@ -1063,7 +1300,6 @@ class WeatherProviderService:
                         blended_gust += g_val * w
                         blended_dew += bias_corrected_dew * w
                         blended_cloud += c_val * w
-                        blended_press += p_val * w
                         total_w += w
 
                         hour_temps.append(bias_corrected_t)
@@ -1074,7 +1310,23 @@ class WeatherProviderService:
                         hour_gusts.append(g_val)
                         hour_dews.append(bias_corrected_dew)
                         hour_clouds.append(c_val)
-                        hour_press.append(p_val)
+                        hour_model_entries.append(
+                            {
+                                "weight": w,
+                                "temp_c": bias_corrected_t,
+                                "dew_c": bias_corrected_dew,
+                                "rh_pct": pt.get("rh_pct"),
+                                "precip_mm": pr_mm_val,
+                                "precip_prob": pop_val,
+                                "wmo_code": code,
+                            }
+                        )
+
+                        if pt.get("press_hpa") is not None:
+                            p_val = float(pt["press_hpa"])
+                            blended_press += p_val * w
+                            press_w_total += w
+                            hour_press.append(p_val)
 
                         if pt.get("wind_dir") is not None:
                             wd_rad = math.radians(float(pt["wind_dir"]))
@@ -1102,7 +1354,6 @@ class WeatherProviderService:
                             vis_w_total += w
                             hour_vis.append(vis_v)
 
-                        code = int(pt["wmo_code"])
                         if w > top_w:
                             top_w = w
                             top_code = code
@@ -1122,7 +1373,7 @@ class WeatherProviderService:
                     final_h_gust = round(blended_gust / total_w, 1)
                     final_h_dew = round(blended_dew / total_w, 1)
                     final_h_cloud = int(round(blended_cloud / total_w))
-                    final_h_press = round(blended_press / total_w, 1)
+                    final_h_press = round(blended_press / press_w_total, 1) if press_w_total > 0 else 1013.2
                 else:
                     final_h_temp, final_h_feels, final_h_precip, final_h_pr_mm, final_h_wind = 0.0, 0.0, 0, 0.0, 0.0
                     final_h_gust, final_h_dew, final_h_cloud, final_h_press = 0.0, 0.0, 0, 1013.2
@@ -1164,20 +1415,22 @@ class WeatherProviderService:
                     top_code = top_wet_code
                 elif top_code < 45:
                     # Reconcile sky condition code with RLS-blended cloud cover
-                    if final_h_cloud >= 85:
+                    if final_h_cloud >= 80:
                         top_code = 3
-                    elif final_h_cloud >= 36:
+                    elif final_h_cloud >= 26:
                         top_code = 2
                     else:
                         top_code = 0
 
                 # Assimilate live ground-truth METAR / 1km Doppler radar into hour 0
+                live_wet_override = False
                 if h_offset == 0:
                     min_doppler_dbz = 24.0 if (st_checked_now and not st_wet_now) else 18.0
                     if station_composite and station_composite.get("wx_wmo"):
                         top_code = int(station_composite["wx_wmo"])
                         final_h_precip = max(final_h_precip, 85)
                         final_h_pr_mm = max(final_h_pr_mm, float(station_composite.get("precip_mmhr") or 0.5))
+                        live_wet_override = top_code >= 51
                     elif (
                         doppler_telemetry
                         and doppler_telemetry.currentDbz >= min_doppler_dbz
@@ -1188,14 +1441,31 @@ class WeatherProviderService:
                             top_code = 71
                         final_h_precip = max(final_h_precip, 75)
                         final_h_pr_mm = max(final_h_pr_mm, doppler_telemetry.precipRateMmHr)
+                        live_wet_override = True
 
                 if len(hour_temps) >= 2:
                     hourly_spreads.append(statistics.pstdev(hour_temps))
 
                 h_wb = calc_wet_bulb_c(final_h_temp, h_rh)
-                h_pt = classify_precip_type(temp_c=final_h_temp, rh_pct=float(h_rh), wet_bulb_c=h_wb, wmo_code=top_code)
-                h_slr = calc_snow_liquid_ratio(final_h_temp, h_pt)
-                h_snow_cm = round((final_h_pr_mm / 10.0) * h_slr, 2) if (h_pt in ("snow", "sleet") and final_h_pr_mm > 0) else 0.0
+                h_pt, h_snow_cm = blend_hourly_precip_and_snow(
+                    model_entries=hour_model_entries,
+                    total_w=total_w,
+                    blended_temp_c=final_h_temp,
+                    blended_rh=float(h_rh),
+                    blended_pop=final_h_precip,
+                    top_code=top_code,
+                    lead_hours=float(h_offset),
+                )
+                if h_offset == 0 and live_wet_override:
+                    live_pt = classify_precip_type(
+                        temp_c=final_h_temp, rh_pct=float(h_rh), wet_bulb_c=h_wb, wmo_code=top_code
+                    )
+                    if live_pt in ("snow", "sleet"):
+                        h_pt = live_pt
+                        h_snow_cm = max(
+                            h_snow_cm,
+                            round((final_h_pr_mm / 10.0) * calc_snow_liquid_ratio(final_h_temp, live_pt), 2),
+                        )
 
                 h_sw = (
                     round(float(sw_hourly_arr[raw_idx]), 1)
@@ -1571,8 +1841,11 @@ class WeatherProviderService:
                 psum_blend = 0.0
                 wmax_blend = 0.0
                 w_total = 0.0
+                wet_day_w = 0.0
+                mod_wet_w = 0.0
                 day_code = 0
                 best_w = -1.0
+                day_lead_h = float(d_idx * 24 + 12)
 
                 afternoon_utc_h = (15 - utc_offset_hrs) % 24
                 dawn_utc_h = (5 - utc_offset_hrs) % 24
@@ -1592,14 +1865,14 @@ class WeatherProviderService:
                     bsin = float(w_info.get("bias_sin_c") or 0.0)
                     bcos = float(w_info.get("bias_cos_c") or 0.0)
 
-                    h_t_arr = hourly_raw.get(f"temperature_2m_{suffix}") or hourly_raw.get("temperature_2m") or []
-                    h_p_arr = hourly_raw.get(f"precipitation_probability_{suffix}") or hourly_raw.get("precipitation_probability") or []
-                    h_pr_arr = hourly_raw.get(f"precipitation_{suffix}") or hourly_raw.get("precipitation") or []
-                    h_w_arr = hourly_raw.get(f"wind_speed_10m_{suffix}") or hourly_raw.get("wind_speed_10m") or []
-                    h_c_arr = hourly_raw.get(f"weather_code_{suffix}") or hourly_raw.get("weather_code") or []
+                    h_t_arr = _raw_model_series(hourly_raw, "temperature_2m", suffix)
+                    h_p_arr = _raw_model_series(hourly_raw, "precipitation_probability", suffix)
+                    h_pr_arr = _raw_model_series(hourly_raw, "precipitation", suffix)
+                    h_w_arr = _raw_model_series(hourly_raw, "wind_speed_10m", suffix)
+                    h_c_arr = _raw_model_series(hourly_raw, "weather_code", suffix)
 
                     loc_adj_temps = [
-                        float(h_t_arr[ri]) - eval_diurnal_bias(b0, bsin, bcos, uh)
+                        float(h_t_arr[ri]) - eval_decayed_diurnal_bias(b0, bsin, bcos, uh, max(0.0, float(ri - start_idx)))
                         for ri, uh in loc_raw_hours
                         if ri < len(h_t_arr) and h_t_arr[ri] is not None
                     ]
@@ -1626,37 +1899,34 @@ class WeatherProviderService:
                             for ri, _ in loc_raw_hours
                             if ri < len(h_c_arr) and h_c_arr[ri] is not None
                         ]
+                        m_psum = sum(pr_vals) if pr_vals else 0.0
                         precip_blend += (max(pop_vals) if pop_vals else 0.0) * w
-                        psum_blend += (sum(pr_vals) if pr_vals else 0.0) * w
+                        psum_blend += m_psum * w
                         wmax_blend += (max(w_vals) if w_vals else 12.0) * w
                         w_total += w
+                        if m_psum >= 1.0:
+                            wet_day_w += w
+                        if m_psum >= 2.5:
+                            mod_wet_w += w
                         if w > best_w and c_vals:
                             best_w = w
                             wet_c = [cv for cv in c_vals if cv >= 51]
-                            day_code = max(wet_c) if (wet_c and (max(pop_vals or [0.0]) >= 35 or sum(pr_vals or [0.0]) >= 0.4)) else max(c_vals)
+                            if wet_c and max(pop_vals or [0.0]) >= 30:
+                                day_code = max(wet_c)
+                            else:
+                                dry_c = [cv for cv in c_vals if cv < 51]
+                                day_code = max(dry_c) if dry_c else 2
                         continue
 
-                    bias_max = eval_diurnal_bias(b0, bsin, bcos, afternoon_utc_h)
-                    bias_min = eval_diurnal_bias(b0, bsin, bcos, dawn_utc_h)
+                    bias_max = eval_decayed_diurnal_bias(b0, bsin, bcos, afternoon_utc_h, day_lead_h)
+                    bias_min = eval_decayed_diurnal_bias(b0, bsin, bcos, dawn_utc_h, max(0.0, day_lead_h - 6.0))
 
-                    d_max_arr = daily_raw.get(f"temperature_2m_max_{suffix}") or daily_raw.get("temperature_2m_max") or []
-                    d_min_arr = daily_raw.get(f"temperature_2m_min_{suffix}") or daily_raw.get("temperature_2m_min") or []
-                    d_pop_arr = (
-                        daily_raw.get(f"precipitation_probability_max_{suffix}")
-                        or daily_raw.get("precipitation_probability_max")
-                        or []
-                    )
-                    d_psum_arr = (
-                        daily_raw.get(f"precipitation_sum_{suffix}")
-                        or daily_raw.get("precipitation_sum")
-                        or []
-                    )
-                    d_wmax_arr = (
-                        daily_raw.get(f"wind_speed_10m_max_{suffix}")
-                        or daily_raw.get("wind_speed_10m_max")
-                        or []
-                    )
-                    d_code_arr = daily_raw.get(f"weather_code_{suffix}") or daily_raw.get("weather_code") or []
+                    d_max_arr = _raw_model_series(daily_raw, "temperature_2m_max", suffix)
+                    d_min_arr = _raw_model_series(daily_raw, "temperature_2m_min", suffix)
+                    d_pop_arr = _raw_model_series(daily_raw, "precipitation_probability_max", suffix)
+                    d_psum_arr = _raw_model_series(daily_raw, "precipitation_sum", suffix)
+                    d_wmax_arr = _raw_model_series(daily_raw, "wind_speed_10m_max", suffix)
+                    d_code_arr = _raw_model_series(daily_raw, "weather_code", suffix)
 
                     if (
                         raw_d_idx < len(d_max_arr)
@@ -1673,14 +1943,25 @@ class WeatherProviderService:
                         psum_blend += psum_val * w
                         wmax_blend += wmax_val * w
                         w_total += w
+                        if psum_val >= 1.0:
+                            wet_day_w += w
+                        if psum_val >= 2.5:
+                            mod_wet_w += w
                         if w > best_w and raw_d_idx < len(d_code_arr) and d_code_arr[raw_d_idx] is not None:
                             best_w = w
-                            day_code = int(d_code_arr[raw_d_idx])
+                            raw_dc = int(d_code_arr[raw_d_idx])
+                            day_code = 2 if (pop_val < 30 and raw_dc >= 51) else raw_dc
 
                 if w_total > 0:
                     d_min = round(min_t_blend / w_total, 1)
                     d_max = round(max_t_blend / w_total, 1)
-                    d_pop = int(round(precip_blend / w_total))
+                    base_d_pop = precip_blend / w_total
+                    agree_frac = wet_day_w / w_total
+                    mod_agree_frac = mod_wet_w / w_total
+                    if agree_frac >= 0.60 and base_d_pop >= 25.0:
+                        d_pop = int(min(90, round(base_d_pop + 22.0 * (agree_frac - 0.45) + 12.0 * mod_agree_frac)))
+                    else:
+                        d_pop = int(round(base_d_pop))
                     d_psum = round(psum_blend / w_total, 2)
                     d_wmax = round(wmax_blend / w_total, 1)
                 else:
@@ -1724,46 +2005,33 @@ class WeatherProviderService:
                     if abs(sin_sum) > 1e-6 or abs(cos_sum) > 1e-6:
                         d_wdir = int(round(math.degrees(math.atan2(sin_sum, cos_sum)))) % 360
 
-                    # Reconcile daily WMO code with RLS-blended hourly conditions
-                    wet_hours = [h.wmoCode for h in day_slice if h.wmoCode >= 51]
-                    if wet_hours and (d_pop >= 35 or d_psum >= 0.4 or len(wet_hours) >= 3):
-                        day_code = max(wet_hours)
-                    elif day_code < 45:
-                        avg_day_cloud = sum((h.cloudCover or 0) for h in day_slice) / len(day_slice)
-                        if avg_day_cloud >= 82:
-                            day_code = 3
-                        elif avg_day_cloud >= 36:
-                            day_code = 2
-                        else:
-                            day_code = 0
-
-                    d_snow_accum = round(sum((h.snowAccumulationCm or 0.0) for h in day_slice), 2)
-                    d_wet_snow_hours = [h for h in day_slice if h.precipType in ("snow", "sleet") and (h.precipMm or 0.0) > 0]
-                    if d_wet_snow_hours:
-                        sleet_count = sum(1 for h in d_wet_snow_hours if h.precipType == "sleet")
-                        snow_count = sum(1 for h in d_wet_snow_hours if h.precipType == "snow")
-                        d_pt = "sleet" if sleet_count > snow_count else "snow"
-                    elif any((h.precipMm or 0.0) > 0 for h in day_slice):
-                        d_pt = "rain"
-                    else:
-                        d_pt = classify_precip_type(temp_c=(d_min + d_max) / 2.0, wmo_code=day_code)
-
-                    if d_psum > 0 and d_snow_accum > 0:
-                        d_slr = round(d_snow_accum * 10.0 / d_psum, 1)
-                    else:
-                        d_slr = calc_snow_liquid_ratio((d_min + d_max) / 2.0, d_pt)
+                    day_code, d_pt, d_snow_accum, d_slr = reconcile_daily_condition_and_snow(
+                        day_slice=day_slice,
+                        d_idx=d_idx,
+                        d_pop=d_pop,
+                        d_psum=d_psum,
+                        d_min=d_min,
+                        d_max=d_max,
+                        initial_day_code=day_code,
+                        tz_delta=tz_delta,
+                    )
                 elif d_idx == 0:
                     d_min = round(min(d_min, final_current_temp), 1)
                     d_max = round(max(d_max, final_current_temp), 1)
                     d_mid = (d_min + d_max) / 2.0
                     d_pt = classify_precip_type(temp_c=d_mid, wmo_code=day_code)
                     d_slr = calc_snow_liquid_ratio(d_mid, d_pt)
-                    d_snow_accum = round((d_psum / 10.0) * d_slr, 2) if (d_pt in ("snow", "sleet") and d_psum > 0) else 0.0
+                    raw_snow_accum = round((d_psum / 10.0) * d_slr, 2) if (d_pt in ("snow", "sleet") and d_psum > 0) else 0.0
+                    d_snow_accum = raw_snow_accum if (d_pop >= 20 or raw_snow_accum >= 0.25) else 0.0
+                    if d_pop < 25 and day_code >= 51:
+                        day_code = 2
                 else:
                     d_mid = (d_min + d_max) / 2.0
                     d_pt = classify_precip_type(temp_c=d_mid, wmo_code=day_code)
                     d_slr = calc_snow_liquid_ratio(d_mid, d_pt)
-                    d_snow_accum = round((d_psum / 10.0) * d_slr, 2) if (d_pt in ("snow", "sleet") and d_psum > 0) else 0.0
+                    d_snow_accum = round((d_psum / 10.0) * d_slr, 2) if (d_pt in ("snow", "sleet") and d_psum > 0 and d_pop >= 25) else 0.0
+                    if d_pop < 30 and day_code >= 51:
+                        day_code = 2
 
                 daily_models.append(
                     DailyForecastModel(

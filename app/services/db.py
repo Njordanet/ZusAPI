@@ -333,6 +333,11 @@ class DatabaseManager:
         in_hawaii = (18.5 <= lat <= 22.5) and (-160.5 <= lon <= -154.5)
         return in_conus or in_alaska or in_hawaii
 
+    @staticmethod
+    def is_conus_region(lat: float, lon: float) -> bool:
+        """Return True when coordinates lie inside the contiguous US (CONUS)."""
+        return (24.0 <= lat <= 50.0) and (-125.5 <= lon <= -66.5)
+
     async def register_active_cell(
         self,
         lat: float,
@@ -342,6 +347,7 @@ class DatabaseManager:
         is_coastal: bool = False,
     ) -> str:
         cell_id = self.make_cell_id(lat, lon)
+        in_conus = self.is_conus_region(lat, lon)
         region_mode = "US_HYPERLOCAL" if self.is_us_region(lat, lon) else "GLOBAL_ENSEMBLE"
 
         if not self.pool:
@@ -374,14 +380,24 @@ class DatabaseManager:
             )
             if existing == 0:
                 if region_mode == "US_HYPERLOCAL":
-                    # (model, mae_t, bias_t, brier, w_comp, w_short, w_med, w_ext, acc_pct)
-                    priors = [
-                        ("HRRR", 0.85, 0.0, 0.08, 0.34, 0.44, 0.32, 0.18, 96.4),
-                        ("ECMWF", 0.92, -0.1, 0.09, 0.30, 0.24, 0.32, 0.42, 95.8),
-                        ("GFS", 1.25, 0.2, 0.13, 0.16, 0.14, 0.16, 0.18, 92.5),
-                        ("ICON", 1.15, -0.1, 0.11, 0.12, 0.10, 0.12, 0.14, 93.4),
-                        ("GEM", 1.35, 0.1, 0.14, 0.08, 0.08, 0.08, 0.08, 91.2),
-                    ]
+                    if in_conus:
+                        # (model, mae_t, bias_t, brier, w_comp, w_short, w_med, w_ext, acc_pct)
+                        priors = [
+                            ("HRRR", 0.85, 0.0, 0.08, 0.28, 0.38, 0.24, 0.12, 96.4),
+                            ("ECMWF", 0.92, -0.1, 0.09, 0.26, 0.20, 0.26, 0.34, 95.8),
+                            ("NBM", 0.88, 0.0, 0.08, 0.24, 0.20, 0.26, 0.30, 96.0),
+                            ("GFS", 1.25, 0.2, 0.13, 0.10, 0.10, 0.10, 0.12, 92.5),
+                            ("ICON", 1.15, -0.1, 0.11, 0.07, 0.07, 0.08, 0.07, 93.4),
+                            ("GEM", 1.35, 0.1, 0.14, 0.05, 0.05, 0.06, 0.05, 91.2),
+                        ]
+                    else:
+                        priors = [
+                            ("HRRR", 0.85, 0.0, 0.08, 0.34, 0.44, 0.32, 0.18, 96.4),
+                            ("ECMWF", 0.92, -0.1, 0.09, 0.30, 0.24, 0.32, 0.42, 95.8),
+                            ("GFS", 1.25, 0.2, 0.13, 0.16, 0.14, 0.16, 0.18, 92.5),
+                            ("ICON", 1.15, -0.1, 0.11, 0.12, 0.10, 0.12, 0.14, 93.4),
+                            ("GEM", 1.35, 0.1, 0.14, 0.08, 0.08, 0.08, 0.08, 91.2),
+                        ]
                 else:
                     priors = [
                         ("ECMWF", 0.88, 0.0, 0.08, 0.38, 0.36, 0.38, 0.42, 96.2),
@@ -409,6 +425,17 @@ class DatabaseManager:
                         w_e,
                         acc,
                     )
+            elif in_conus:
+                await conn.execute(
+                    """
+                    INSERT INTO model_accuracy_weights
+                        (cell_id, model_name, mae_temp_c, bias_temp_c, brier_precip,
+                         dynamic_weight, weight_short, weight_med, weight_ext, accuracy_pct, samples_verified)
+                    VALUES ($1, 'NBM', 0.88, 0.0, 0.08, 0.24, 0.20, 0.26, 0.30, 96.0, 12)
+                    ON CONFLICT (cell_id, model_name) DO NOTHING;
+                    """,
+                    cell_id,
+                )
 
             # Ensure cell_rls_state row exists with initial diagonal covariance matrices
             rls_exists = await conn.fetchval(
@@ -416,11 +443,12 @@ class DatabaseManager:
                 cell_id,
             )
             if not rls_exists:
-                model_order = (
-                    ["HRRR", "ECMWF", "GFS", "ICON", "GEM"]
-                    if region_mode == "US_HYPERLOCAL"
-                    else ["ECMWF", "ICON", "GFS", "GEM"]
-                )
+                if in_conus:
+                    model_order = ["HRRR", "ECMWF", "NBM", "GFS", "ICON", "GEM"]
+                elif region_mode == "US_HYPERLOCAL":
+                    model_order = ["HRRR", "ECMWF", "GFS", "ICON", "GEM"]
+                else:
+                    model_order = ["ECMWF", "ICON", "GFS", "GEM"]
                 init_cov = _init_identity_cov(len(model_order), diag_val=0.35)
                 await conn.execute(
                     """
@@ -433,6 +461,15 @@ class DatabaseManager:
                     init_cov,
                     init_cov,
                     init_cov,
+                )
+            elif in_conus:
+                await conn.execute(
+                    """
+                    UPDATE cell_rls_state
+                    SET model_order = array_append(model_order, 'NBM')
+                    WHERE cell_id = $1 AND NOT ('NBM' = ANY(model_order));
+                    """,
+                    cell_id,
                 )
 
         return cell_id

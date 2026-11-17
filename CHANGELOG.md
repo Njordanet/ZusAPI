@@ -2,6 +2,16 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.8.2] - 2026-11-17
+
+### 10-Day Temperature Calibration, Snow Physics & Daily Icon Accuracy
+- **Extended-Range Temperature & Precipitation Calibration**:
+  - Added horizon-aware temperature bias tapering beyond 36 hours so short-range morning microclimate precision stays intact while late-week pattern shifts track warmer or cooler airmass changes accurately.
+  - Expanded contiguous US multi-guidance blending and balanced extended-range weighting alongside whole-day frontal rain agreement calibration.
+- **Per-Stream Winter Precipitation Physics & Daily Icon Consistency**:
+  - Computed winter precipitation phase and snow accumulation per individual guidance stream prior to blending, eliminating artificial cross-stream snow totals on split rain/cold patterns.
+  - Gated low-probability extended-range snow amounts, prioritized daylight cloud cover for dry daily sky icons, and aligned mixed rain/snow icons to avoid conflicting precipitation badges.
+
 ## [v1.8.1] - 2026-11-15
 
 ### Non-Mainland Precipitation Consistency & Light-Rain Threshold Alignment
