@@ -1,9 +1,11 @@
 import asyncio
 import math
+import re
 import statistics
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 import httpx
 from app.config import settings
 from app.models.weather import (
@@ -418,6 +420,66 @@ def calc_local_sunrise_sunset_iso(
     return sr_str, ss_str
 
 
+_CARDINAL_DEGREES = {
+    "N": 0, "NNE": 23, "NE": 45, "ENE": 68,
+    "E": 90, "ESE": 113, "SE": 135, "SSE": 158,
+    "S": 180, "SSW": 203, "SW": 225, "WSW": 248,
+    "W": 270, "WNW": 293, "NW": 315, "NNW": 338,
+}
+
+
+def _nws_short_forecast_to_wmo(short_forecast: Optional[str]) -> int:
+    sf = str(short_forecast or "").lower()
+    if "thunder" in sf:
+        return 95
+    if "heavy rain" in sf:
+        return 65
+    if any(tok in sf for tok in ("freezing", "sleet", "ice")):
+        return 66
+    if any(tok in sf for tok in ("snow", "flurr", "blizzard")):
+        return 71
+    if any(tok in sf for tok in ("rain", "shower")):
+        return 61
+    if "drizzle" in sf:
+        return 51
+    if any(tok in sf for tok in ("fog", "mist")):
+        return 45
+    if ("overcast" in sf or "cloudy" in sf) and "partly" not in sf:
+        return 3
+    if any(tok in sf for tok in ("partly", "mostly sunny", "mostly clear")):
+        return 2
+    return 0
+
+
+def _parse_nws_wind_kmh(wind_str: Optional[str]) -> Tuple[float, float]:
+    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", str(wind_str or ""))]
+    if not nums:
+        return 10.0, 14.0
+    factor = 1.0 if "km" in str(wind_str or "").lower() else 1.60934
+    speed_kmh = round((sum(nums) / len(nums)) * factor, 1)
+    max_kmh = round(max(nums) * factor, 1)
+    gust_kmh = round(max(max_kmh * 1.25, speed_kmh * 1.35), 1)
+    return speed_kmh, gust_kmh
+
+
+def _calc_feels_like_c(temp_c: float, rh_pct: float, wind_kmh: float) -> float:
+    if temp_c <= 10.0 and wind_kmh > 4.8:
+        v_pow = wind_kmh ** 0.16
+        wc = 13.12 + 0.6215 * temp_c - 11.37 * v_pow + 0.3965 * temp_c * v_pow
+        return round(wc, 1)
+    if temp_c >= 26.7 and rh_pct >= 40.0:
+        t_f = temp_c * 9.0 / 5.0 + 32.0
+        r = rh_pct
+        hi_f = (
+            -42.379 + 2.04901523 * t_f + 10.14333127 * r
+            - 0.22475541 * t_f * r - 0.00683783 * t_f * t_f
+            - 0.05481717 * r * r + 0.00122874 * t_f * t_f * r
+            + 0.00085282 * t_f * r * r - 0.00000199 * t_f * t_f * r * r
+        )
+        return round((hi_f - 32.0) * 5.0 / 9.0, 1)
+    return round(temp_c, 1)
+
+
 class WeatherProviderService:
     def __init__(self):
         self._cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
@@ -441,7 +503,23 @@ class WeatherProviderService:
             if in_conus
             else "best_match,ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless"
         )
-        params: Dict[str, Any] = {
+        ensemble_params: Dict[str, Any] = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": (
+                "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation_probability,"
+                "precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,"
+                "uv_index,dew_point_2m,cloud_cover,visibility,pressure_msl,cape"
+            ),
+            "daily": (
+                "weather_code,temperature_2m_max,temperature_2m_min,"
+                "precipitation_probability_max,precipitation_sum,wind_speed_10m_max"
+            ),
+            "models": models_csv,
+            "timezone": "UTC",
+            "forecast_days": 10,
+        }
+        single_params: Dict[str, Any] = {
             "latitude": lat,
             "longitude": lon,
             "current": (
@@ -452,26 +530,41 @@ class WeatherProviderService:
             ),
             "minutely_15": "precipitation,weather_code",
             "hourly": (
-                "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation_probability,"
-                "precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,"
-                "uv_index,dew_point_2m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,"
-                "visibility,pressure_msl,cape,lifted_index,shortwave_radiation,"
-                "vapour_pressure_deficit,freezing_level_height,is_day"
+                "cloud_cover_low,cloud_cover_mid,cloud_cover_high,lifted_index,"
+                "shortwave_radiation,vapour_pressure_deficit,freezing_level_height,is_day"
             ),
-            "daily": (
-                "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,"
-                "precipitation_sum,uv_index_max,wind_speed_10m_max,wind_direction_10m_dominant,"
-                "sunrise,sunset"
-            ),
-            "models": models_csv,
+            "daily": "uv_index_max,wind_direction_10m_dominant,sunrise,sunset",
             "timezone": "UTC",
-            "past_hours": 24,
             "forecast_days": 10,
             "forecast_minutely_15": 8,  # Next 2 hours in 15-min intervals
         }
-        resp = await client.get(settings.open_meteo_forecast_url, params=params)
-        resp.raise_for_status()
-        return resp.json()
+        if include_past_24h:
+            ensemble_params["past_hours"] = 24
+            single_params["past_hours"] = 24
+
+        resp_ensemble, resp_single = await asyncio.gather(
+            client.get(settings.open_meteo_forecast_url, params=ensemble_params),
+            client.get(settings.open_meteo_forecast_url, params=single_params),
+        )
+        resp_ensemble.raise_for_status()
+        raw_data = resp_ensemble.json()
+
+        if resp_single.status_code == 200:
+            single_data = resp_single.json()
+            raw_data["current"] = single_data.get("current", {})
+            raw_data["minutely_15"] = single_data.get("minutely_15", {})
+
+            ens_hourly = raw_data.setdefault("hourly", {})
+            for h_key, h_val in (single_data.get("hourly") or {}).items():
+                if h_key != "time" or "time" not in ens_hourly:
+                    ens_hourly[h_key] = h_val
+
+            ens_daily = raw_data.setdefault("daily", {})
+            for d_key, d_val in (single_data.get("daily") or {}).items():
+                if d_key != "time" or "time" not in ens_daily:
+                    ens_daily[d_key] = d_val
+
+        return raw_data
 
     async def _fetch_air_quality_and_tz(
         self, client: httpx.AsyncClient, lat: float, lon: float
@@ -762,6 +855,630 @@ class WeatherProviderService:
             points=points,
         )
 
+    async def _assimilate_fallback_telemetry(
+        self,
+        latitude: float,
+        longitude: float,
+        now: datetime,
+        cell_id: str,
+        hourly_models: List[HourlyForecastModel],
+        current_model: WeatherDataModel,
+        station_composite: Optional[Dict[str, Any]],
+        us_aqi: Optional[int],
+        pm25_val: Optional[float],
+        ozone_val: Optional[float],
+        tree_pollen_val: Optional[float],
+        grass_pollen_val: Optional[float],
+        weed_pollen_val: Optional[float],
+    ) -> Tuple[Optional[RadarLocalTelemetry], NowcastSummary]:
+        rls_meta: Dict[str, Any] = {}
+        try:
+            rls_meta = await db_manager.get_cell_rls_metadata(cell_id)
+        except Exception:
+            rls_meta = {}
+
+        h0 = hourly_models[0] if hourly_models else None
+        est_temp_now = (
+            float(station_composite["temperature_c"])
+            if (station_composite and station_composite.get("temperature_c") is not None)
+            else (h0.temperature if h0 else current_model.temperature)
+        )
+        est_dewp_now = (
+            float(station_composite["dewpoint_c"])
+            if (station_composite and station_composite.get("dewpoint_c") is not None)
+            else (h0.dewPoint if (h0 and h0.dewPoint is not None) else (est_temp_now - 4.0))
+        )
+        st_checked_now = bool(
+            station_composite and (station_composite.get("closest_distance_km") or 99.0) <= 35.0
+        )
+        st_wet_now = bool(station_composite and station_composite.get("wx_condition") is not None)
+        nwp_precip_now = bool(
+            h0
+            and (
+                (h0.precipMm or 0.0) >= 0.1
+                or (h0.precipitationChance or 0) >= 25
+                or h0.wmoCode >= 51
+            )
+        )
+        radar_zr_factor = float(rls_meta.get("radar_zr_factor") or 1.0)
+        doppler_telemetry = await doppler_service.get_point_telemetry(
+            latitude,
+            longitude,
+            temp_c=est_temp_now,
+            dewpoint_c=est_dewp_now,
+            station_wet=st_wet_now,
+            radar_zr_factor=radar_zr_factor,
+            station_checked=st_checked_now,
+            cloud_cover_low=(float(h0.cloudCoverLow) if (h0 and h0.cloudCoverLow is not None) else None),
+            nwp_precip_active=nwp_precip_now,
+        )
+        nowcast_obj = self._build_nowcast(
+            {"minutely_15": {}},
+            doppler_telemetry,
+            station_composite,
+            radar_zr_factor=radar_zr_factor,
+        )
+
+        ensemble_temp = h0.temperature if h0 else current_model.temperature
+        if station_composite and station_composite["closest_distance_km"] <= 35.0:
+            dist = station_composite["closest_distance_km"]
+            station_weight = max(0.35, min(0.75, 1.0 - (dist / 50.0)))
+            final_temp = round(
+                station_composite["temperature_c"] * station_weight
+                + ensemble_temp * (1.0 - station_weight),
+                1,
+            )
+            current_model.localStationName = station_composite["closest_station_name"]
+            current_model.localStationDistanceKm = dist
+            current_model.localStationWx = station_composite.get("wx_string")
+        else:
+            final_temp = round(ensemble_temp, 1)
+
+        temp_delta_now = round(final_temp - ensemble_temp, 2)
+        base_feels = (h0.feelsLike if (h0 and h0.feelsLike is not None) else current_model.feelsLike)
+        final_feels = round(float(base_feels) + temp_delta_now, 1)
+        dewpoint_c = round(float(est_dewp_now), 1)
+        comfort_label = classify_dewpoint_comfort(dewpoint_c)
+
+        min_curr_doppler_dbz = 24.0 if (st_checked_now and not st_wet_now) else 18.0
+        if station_composite and station_composite.get("wx_condition") is not None:
+            observed_cond = station_composite["wx_condition"]
+            observed_wmo = int(station_composite.get("wx_wmo") or 61)
+        elif (
+            doppler_telemetry
+            and doppler_telemetry.currentDbz >= min_curr_doppler_dbz
+            and doppler_telemetry.precipRateMmHr >= 0.15
+        ):
+            if final_temp <= 0.5:
+                observed_cond = WeatherCondition.SNOW
+                observed_wmo = 71
+            elif doppler_telemetry.currentDbz >= 35.0:
+                observed_cond = WeatherCondition.HEAVY_RAIN
+                observed_wmo = 65
+            elif doppler_telemetry.currentDbz >= 20.0:
+                observed_cond = WeatherCondition.RAIN
+                observed_wmo = 61
+            else:
+                observed_cond = WeatherCondition.DRIZZLE
+                observed_wmo = 51
+        elif h0 is not None:
+            observed_cond = h0.condition
+            observed_wmo = h0.wmoCode
+        else:
+            observed_cond = current_model.condition
+            observed_wmo = current_model.observedWeatherCode or 0
+
+        wind_kmh = float(
+            station_composite["wind_kmh"]
+            if (station_composite and station_composite.get("wind_kmh") is not None)
+            else (h0.windSpeed if h0 else current_model.windSpeed)
+        )
+        gust_kmh = float(
+            station_composite["gust_kmh"]
+            if (station_composite and station_composite.get("gust_kmh") is not None)
+            else (h0.windGusts if (h0 and h0.windGusts is not None) else round(wind_kmh * 1.25, 1))
+        )
+        wind_dir = int(
+            station_composite["wind_dir"]
+            if (station_composite and station_composite.get("wind_dir") is not None)
+            else (h0.windDirection if (h0 and h0.windDirection is not None) else current_model.windDirection)
+        )
+        msl_pressure = (
+            (station_composite and station_composite.get("pressure_hpa"))
+            or (h0.pressure if (h0 and h0.pressure is not None) else None)
+            or current_model.airPressure
+        )
+        visibility_km = float(
+            station_composite["visibility_km"]
+            if (station_composite and station_composite.get("visibility_km") is not None)
+            else (h0.visibilityKm if (h0 and h0.visibilityKm is not None) else current_model.visibility)
+        )
+        curr_hum = int(
+            station_composite["humidity"]
+            if (station_composite and station_composite.get("humidity") is not None)
+            else (h0.humidity if (h0 and h0.humidity is not None) else calc_relative_humidity(final_temp, dewpoint_c))
+        )
+        curr_precip_mmhr = float(
+            max(
+                nowcast_obj.points[0].precipIntensityMmHr if nowcast_obj.points else 0.0,
+                doppler_telemetry.precipRateMmHr if doppler_telemetry else 0.0,
+                float(station_composite.get("precip_mmhr") or 0.0) if station_composite else 0.0,
+            )
+        )
+        curr_wb = calc_wet_bulb_c(final_temp, float(curr_hum))
+        curr_pt = classify_precip_type(
+            temp_c=final_temp,
+            rh_pct=float(curr_hum),
+            wet_bulb_c=curr_wb,
+            wmo_code=observed_wmo,
+            metar_wx=current_model.localStationWx,
+        )
+
+        current_model.temperature = final_temp
+        current_model.feelsLike = final_feels
+        current_model.condition = observed_cond
+        current_model.observedWeatherCode = observed_wmo
+        current_model.tempMin = min(current_model.tempMin, final_temp)
+        current_model.tempMax = max(current_model.tempMax, final_temp)
+        current_model.humidity = curr_hum
+        current_model.windSpeed = round(wind_kmh, 1)
+        current_model.windGust = round(gust_kmh, 1)
+        current_model.windDirection = wind_dir
+        current_model.airPressure = round(float(msl_pressure), 1)
+        current_model.visibility = round(visibility_km, 1)
+        current_model.dewPoint = dewpoint_c
+        current_model.comfortLevel = comfort_label
+        current_model.precipIntensityMmHr = round(curr_precip_mmhr, 2)
+        current_model.wetBulbTemperature = curr_wb
+        current_model.precipType = curr_pt
+        current_model.nowcastSummary = nowcast_obj.summaryText
+        current_model.timestamp = now
+        if us_aqi is not None:
+            current_model.usAqi = us_aqi
+            current_model.aqiCategory = classify_aqi(us_aqi)
+        if pm25_val is not None:
+            current_model.pm25 = pm25_val
+        if ozone_val is not None:
+            current_model.ozone = ozone_val
+        if tree_pollen_val is not None:
+            current_model.treePollen = tree_pollen_val
+        if grass_pollen_val is not None:
+            current_model.grassPollen = grass_pollen_val
+        if weed_pollen_val is not None:
+            current_model.weedPollen = weed_pollen_val
+
+        if h0 is not None:
+            h0.temperature = final_temp
+            h0.tempMin = min(h0.tempMin if h0.tempMin is not None else final_temp, final_temp)
+            h0.tempMax = max(h0.tempMax if h0.tempMax is not None else final_temp, final_temp)
+            h0.feelsLike = final_feels
+            h0.wmoCode = observed_wmo
+            h0.condition = observed_cond
+            h0.humidity = curr_hum
+            h0.dewPoint = dewpoint_c
+            h0.windSpeed = round(wind_kmh, 1)
+            h0.windGusts = round(gust_kmh, 1)
+            h0.windDirection = wind_dir
+            h0.pressure = round(float(msl_pressure), 1)
+            h0.visibilityKm = round(visibility_km, 2)
+            h0.wetBulbTemperature = curr_wb
+            h0.precipType = curr_pt
+            if abs(temp_delta_now) >= 0.1:
+                for decay_idx, decay_factor in ((1, 0.55), (2, 0.25)):
+                    if decay_idx < len(hourly_models):
+                        hk = hourly_models[decay_idx]
+                        adj_delta = round(temp_delta_now * decay_factor, 1)
+                        hk.temperature = round(hk.temperature + adj_delta, 1)
+                        if hk.feelsLike is not None:
+                            hk.feelsLike = round(hk.feelsLike + adj_delta, 1)
+
+        return doppler_telemetry, nowcast_obj
+
+    async def _refresh_cached_fallback(
+        self,
+        key: str,
+        latitude: float,
+        longitude: float,
+        city_name: str,
+        cell_id: str,
+        now: datetime,
+        station_composite: Optional[Dict[str, Any]],
+        nearby_stations: List[Any],
+        active_alerts: List[WeatherAlertModel],
+        us_aqi: Optional[int],
+        pm25_val: Optional[float],
+        ozone_val: Optional[float],
+        tree_pollen_val: Optional[float],
+        grass_pollen_val: Optional[float],
+        weed_pollen_val: Optional[float],
+    ) -> Optional[WeatherResponse]:
+        entry = self._cache.get(key)
+        if not entry or (now - entry["cached_at"]).total_seconds() > 10800:
+            return None
+
+        cached_resp: WeatherResponse = entry["data"].model_copy(deep=True)
+        now_hour = now.replace(minute=0, second=0, microsecond=0)
+        future_hourly = [
+            h
+            for h in cached_resp.hourly
+            if (h.time.astimezone(timezone.utc) if h.time.tzinfo else h.time.replace(tzinfo=timezone.utc)) >= now_hour
+        ]
+        if not future_hourly:
+            return None
+        cached_resp.hourly = future_hourly
+
+        tz_delta = timedelta(seconds=cached_resp.utcOffsetSeconds or 0)
+        local_today = (now + tz_delta).date()
+        future_daily = [
+            d
+            for d in cached_resp.daily
+            if ((d.date.astimezone(timezone.utc) if d.date.tzinfo else d.date.replace(tzinfo=timezone.utc)) + tz_delta).date() >= local_today
+        ]
+        if future_daily:
+            cached_resp.daily = future_daily
+
+        if city_name and city_name != "Unknown Location":
+            cached_resp.current.cityName = city_name
+
+        doppler_telemetry, nowcast_obj = await self._assimilate_fallback_telemetry(
+            latitude=latitude,
+            longitude=longitude,
+            now=now,
+            cell_id=cell_id,
+            hourly_models=cached_resp.hourly,
+            current_model=cached_resp.current,
+            station_composite=station_composite,
+            us_aqi=us_aqi,
+            pm25_val=pm25_val,
+            ozone_val=ozone_val,
+            tree_pollen_val=tree_pollen_val,
+            grass_pollen_val=grass_pollen_val,
+            weed_pollen_val=weed_pollen_val,
+        )
+        cached_resp.nearbyStations = nearby_stations
+        cached_resp.alerts = active_alerts
+        cached_resp.dopplerTelemetry = doppler_telemetry
+        cached_resp.nowcast = nowcast_obj
+        cached_resp.generatedAt = now
+        cached_resp.cached = True
+        return cached_resp
+
+    async def _fetch_nws_fallback_forecast(
+        self,
+        client: httpx.AsyncClient,
+        key: str,
+        latitude: float,
+        longitude: float,
+        city_name: str,
+        cell_id: str,
+        now: datetime,
+        tz_name: str,
+        utc_offset_sec: int,
+        nearby_stations: List[Any],
+        station_composite: Optional[Dict[str, Any]],
+        active_alerts: List[WeatherAlertModel],
+        us_aqi: Optional[int],
+        pm25_val: Optional[float],
+        ozone_val: Optional[float],
+        tree_pollen_val: Optional[float],
+        grass_pollen_val: Optional[float],
+        weed_pollen_val: Optional[float],
+    ) -> WeatherResponse:
+        nws_headers = {"Accept": "application/geo+json"}
+        pts_resp = await client.get(
+            f"{settings.nws_base_url}/points/{latitude:.4f},{longitude:.4f}",
+            headers=nws_headers,
+            timeout=6.0,
+        )
+        pts_resp.raise_for_status()
+        pts_props = pts_resp.json().get("properties", {})
+        hourly_url = pts_props.get("forecastHourly")
+        daily_url = pts_props.get("forecast")
+        if not hourly_url:
+            raise RuntimeError("NWS gridpoint forecastHourly URL unavailable")
+
+        eff_tz = str(pts_props.get("timeZone") or tz_name or "UTC")
+        eff_offset = utc_offset_sec
+        try:
+            tz_obj = ZoneInfo(eff_tz)
+            off = datetime.now(tz_obj).utcoffset()
+            if off is not None:
+                eff_offset = int(off.total_seconds())
+        except Exception:
+            tz_obj = timezone(timedelta(seconds=eff_offset))
+
+        async def _safe_daily_get() -> Optional[Dict[str, Any]]:
+            if not daily_url:
+                return None
+            try:
+                r = await client.get(daily_url, headers=nws_headers, timeout=6.5)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                pass
+            return None
+
+        hourly_resp, daily_json = await asyncio.gather(
+            client.get(hourly_url, headers=nws_headers, timeout=6.5),
+            _safe_daily_get(),
+        )
+        hourly_resp.raise_for_status()
+        hourly_json = hourly_resp.json()
+        hourly_props = hourly_json.get("properties", {})
+        periods = hourly_props.get("periods") or []
+        if not periods:
+            raise RuntimeError("NWS forecastHourly returned zero periods")
+
+        elev_val = (hourly_props.get("elevation") or {}).get("value")
+        target_elevation = float(elev_val) if elev_val is not None else 0.0
+        if target_elevation > 5.0 and nearby_stations:
+            nearby_stations, station_composite = await station_service.fetch_nearby_stations(
+                lat=latitude,
+                lon=longitude,
+                target_elev_m=target_elevation,
+            )
+
+        now_hour_utc = now.replace(minute=0, second=0, microsecond=0)
+        parsed_periods: List[Tuple[datetime, Dict[str, Any]]] = []
+        for p in periods:
+            raw_start = p.get("startTime")
+            if not raw_start:
+                continue
+            try:
+                p_dt = datetime.fromisoformat(str(raw_start))
+                if p_dt.tzinfo is None:
+                    p_dt = p_dt.replace(tzinfo=tz_obj)
+                p_utc = p_dt.astimezone(timezone.utc)
+                if p_utc >= now_hour_utc:
+                    parsed_periods.append((p_utc, p))
+            except Exception:
+                continue
+        if not parsed_periods and periods:
+            last_p = periods[-1]
+            parsed_periods.append((now_hour_utc, last_p))
+
+        hourly_models: List[HourlyForecastModel] = []
+        for p_utc, p in parsed_periods[:156]:
+            raw_t = p.get("temperature")
+            t_unit = str(p.get("temperatureUnit") or "F").upper()
+            temp_c = (
+                round((float(raw_t) - 32.0) * 5.0 / 9.0, 1)
+                if (raw_t is not None and t_unit == "F")
+                else round(float(raw_t if raw_t is not None else 15.0), 1)
+            )
+            pop_val = int((p.get("probabilityOfPrecipitation") or {}).get("value") or 0)
+            dew_raw = (p.get("dewpoint") or {}).get("value")
+            dew_c = round(float(dew_raw), 1) if dew_raw is not None else round(temp_c - 4.0, 1)
+            rh_raw = (p.get("relativeHumidity") or {}).get("value")
+            rh_pct = int(round(float(rh_raw))) if rh_raw is not None else calc_relative_humidity(temp_c, dew_c)
+            wind_kmh, gust_kmh = _parse_nws_wind_kmh(p.get("windSpeed"))
+            wdir_deg = _CARDINAL_DEGREES.get(str(p.get("windDirection") or "").upper(), 180)
+            wmo_code = _nws_short_forecast_to_wmo(p.get("shortForecast"))
+            if wmo_code >= 51 and pop_val < 20:
+                pop_val = 30
+            is_day_flag = bool(p.get("isDaytime")) if p.get("isDaytime") is not None else (6 <= (p_utc + timedelta(seconds=eff_offset)).hour < 20)
+            cloud_cov = 90 if wmo_code >= 51 else (95 if wmo_code in (45, 48) else (88 if wmo_code == 3 else (45 if wmo_code == 2 else 10)))
+            feels_c = _calc_feels_like_c(temp_c, float(rh_pct), wind_kmh)
+            est_pr_mm = round(max(0.0, (pop_val / 100.0) * (1.2 if wmo_code >= 61 else 0.3)), 2) if wmo_code >= 51 else 0.0
+            h_wb = calc_wet_bulb_c(temp_c, float(rh_pct))
+            h_pt = classify_precip_type(temp_c=temp_c, rh_pct=float(rh_pct), wet_bulb_c=h_wb, wmo_code=wmo_code)
+            h_snow_cm = round((est_pr_mm / 10.0) * calc_snow_liquid_ratio(temp_c, h_pt), 2) if (h_pt in ("snow", "sleet") and est_pr_mm > 0.0) else 0.0
+
+            hourly_models.append(
+                HourlyForecastModel(
+                    time=p_utc,
+                    temperature=temp_c,
+                    tempMin=temp_c,
+                    tempMax=temp_c,
+                    feelsLike=feels_c,
+                    feelsMin=feels_c,
+                    feelsMax=feels_c,
+                    condition=WeatherCondition.from_wmo_code(wmo_code),
+                    wmoCode=wmo_code,
+                    precipitationChance=max(0, min(100, pop_val)),
+                    precipMm=est_pr_mm,
+                    windSpeed=wind_kmh,
+                    windGusts=gust_kmh,
+                    windDirection=wdir_deg,
+                    humidity=max(5, min(100, rh_pct)),
+                    uvIndex=2.0 if is_day_flag else 0.0,
+                    dewPoint=dew_c,
+                    cloudCover=cloud_cov,
+                    visibilityKm=16.0,
+                    pressure=1013.2,
+                    wetBulbTemperature=h_wb,
+                    precipType=h_pt,
+                    snowAccumulationCm=h_snow_cm,
+                    isDay=is_day_flag,
+                )
+            )
+
+        h0 = hourly_models[0]
+        current_model = WeatherDataModel(
+            cityName=city_name,
+            temperature=h0.temperature,
+            feelsLike=h0.feelsLike or h0.temperature,
+            condition=h0.condition,
+            tempMin=h0.temperature,
+            tempMax=h0.temperature,
+            humidity=h0.humidity or 65,
+            windSpeed=h0.windSpeed,
+            windGust=h0.windGusts,
+            windDirection=h0.windDirection or 180,
+            uvIndex=h0.uvIndex or 0.0,
+            airPressure=h0.pressure or 1013.2,
+            visibility=h0.visibilityKm or 16.0,
+            timestamp=now,
+            consensusScore=88,
+            dominantModel="Regional Consensus",
+            elevationMeters=round(target_elevation, 1),
+            usAqi=us_aqi,
+            aqiCategory=classify_aqi(us_aqi),
+            pm25=pm25_val,
+            dewPoint=h0.dewPoint,
+            comfortLevel=classify_dewpoint_comfort(h0.dewPoint if h0.dewPoint is not None else h0.temperature - 4.0),
+            cloudCover=h0.cloudCover,
+            observedWeatherCode=h0.wmoCode,
+            wetBulbTemperature=h0.wetBulbTemperature,
+            precipType=h0.precipType,
+            ozone=ozone_val,
+            isDay=h0.isDay,
+            treePollen=tree_pollen_val,
+            grassPollen=grass_pollen_val,
+            weedPollen=weed_pollen_val,
+        )
+
+        doppler_telemetry, nowcast_obj = await self._assimilate_fallback_telemetry(
+            latitude=latitude,
+            longitude=longitude,
+            now=now,
+            cell_id=cell_id,
+            hourly_models=hourly_models,
+            current_model=current_model,
+            station_composite=station_composite,
+            us_aqi=us_aqi,
+            pm25_val=pm25_val,
+            ozone_val=ozone_val,
+            tree_pollen_val=tree_pollen_val,
+            grass_pollen_val=grass_pollen_val,
+            weed_pollen_val=weed_pollen_val,
+        )
+
+        tz_delta = timedelta(seconds=eff_offset)
+        hourly_by_local_date: Dict[str, List[HourlyForecastModel]] = {}
+        for hm in hourly_models:
+            lk = (hm.time + tz_delta).strftime("%Y-%m-%d")
+            hourly_by_local_date.setdefault(lk, []).append(hm)
+
+        nws_daily_by_date: Dict[str, List[Dict[str, Any]]] = {}
+        for dp in ((daily_json or {}).get("properties") or {}).get("periods") or []:
+            raw_s = dp.get("startTime")
+            if not raw_s:
+                continue
+            try:
+                dt_d = datetime.fromisoformat(str(raw_s))
+                if dt_d.tzinfo is None:
+                    dt_d = dt_d.replace(tzinfo=tz_obj)
+                lk = dt_d.astimezone(tz_obj).strftime("%Y-%m-%d")
+                nws_daily_by_date.setdefault(lk, []).append(dp)
+            except Exception:
+                continue
+
+        local_now = now + tz_delta
+        daily_models: List[DailyForecastModel] = []
+        for d_idx in range(7):
+            local_day_dt = local_now + timedelta(days=d_idx)
+            local_date_key = local_day_dt.strftime("%Y-%m-%d")
+            day_date_utc = datetime(
+                local_day_dt.year,
+                local_day_dt.month,
+                local_day_dt.day,
+                12,
+                0,
+                0,
+                tzinfo=timezone.utc,
+            )
+            day_slice = hourly_by_local_date.get(local_date_key, [])
+            nws_day_periods = nws_daily_by_date.get(local_date_key, [])
+            if not day_slice and not nws_day_periods:
+                continue
+
+            slice_temps = [h.temperature for h in day_slice]
+            period_temps: List[float] = []
+            period_pops: List[int] = []
+            period_winds: List[float] = []
+            period_codes: List[int] = []
+            for np_item in nws_day_periods:
+                nt = np_item.get("temperature")
+                if nt is not None:
+                    nu = str(np_item.get("temperatureUnit") or "F").upper()
+                    period_temps.append(round((float(nt) - 32.0) * 5.0 / 9.0, 1) if nu == "F" else round(float(nt), 1))
+                npop = (np_item.get("probabilityOfPrecipitation") or {}).get("value")
+                if npop is not None:
+                    period_pops.append(int(npop))
+                nw_kmh, _ = _parse_nws_wind_kmh(np_item.get("windSpeed"))
+                period_winds.append(nw_kmh)
+                period_codes.append(_nws_short_forecast_to_wmo(np_item.get("shortForecast")))
+
+            all_temps = slice_temps + ([current_model.temperature] if d_idx == 0 else []) + (period_temps if not slice_temps else [])
+            if d_idx == 0 and period_temps:
+                all_temps.extend(period_temps)
+            d_min = round(min(all_temps), 1) if all_temps else current_model.temperature
+            d_max = round(max(all_temps), 1) if all_temps else current_model.temperature
+            d_pop = max([int(h.precipitationChance) for h in day_slice] + period_pops + [0])
+            d_psum = round(sum((h.precipMm or 0.0) for h in day_slice), 2)
+            d_wmax = round(max([h.windSpeed for h in day_slice] + period_winds + [10.0]), 1)
+            d_wdir = day_slice[0].windDirection if (day_slice and day_slice[0].windDirection is not None) else current_model.windDirection
+            initial_code = max([h.wmoCode for h in day_slice] + period_codes + [current_model.observedWeatherCode or 0])
+
+            if day_slice:
+                day_code, d_pt, d_snow_accum, d_slr = reconcile_daily_condition_and_snow(
+                    day_slice=day_slice,
+                    d_idx=d_idx,
+                    d_pop=d_pop,
+                    d_psum=d_psum,
+                    d_min=d_min,
+                    d_max=d_max,
+                    initial_day_code=initial_code,
+                    tz_delta=tz_delta,
+                )
+            else:
+                day_code = initial_code if d_pop >= 30 or initial_code < 51 else 2
+                d_pt = classify_precip_type(temp_c=(d_min + d_max) / 2.0, wmo_code=day_code)
+                d_slr = calc_snow_liquid_ratio((d_min + d_max) / 2.0, d_pt)
+                d_snow_accum = 0.0
+
+            astro_sr, astro_ss = calc_local_sunrise_sunset_iso(
+                latitude, longitude, local_day_dt, eff_offset
+            )
+            daily_models.append(
+                DailyForecastModel(
+                    date=day_date_utc,
+                    condition=WeatherCondition.from_wmo_code(day_code),
+                    wmoCode=day_code,
+                    minTemperature=d_min,
+                    maxTemperature=max(d_min, d_max),
+                    precipitationChance=max(0, min(100, d_pop)),
+                    precipSumMm=d_psum,
+                    uvIndexMax=5.0,
+                    windSpeedMax=d_wmax,
+                    windDirectionDominant=d_wdir,
+                    sunrise=astro_sr,
+                    sunset=astro_ss,
+                    precipType=d_pt,
+                    snowAccumulationCm=d_snow_accum,
+                    snowToLiquidRatio=d_slr,
+                )
+            )
+
+        if daily_models:
+            current_model.tempMin = min(daily_models[0].minTemperature, current_model.temperature)
+            current_model.tempMax = max(daily_models[0].maxTemperature, current_model.temperature)
+
+        result = WeatherResponse(
+            current=current_model,
+            hourly=hourly_models,
+            daily=daily_models,
+            modelWeights=[],
+            nearbyStations=nearby_stations,
+            alerts=active_alerts,
+            nowcast=nowcast_obj,
+            dopplerTelemetry=doppler_telemetry,
+            regionMode="US_HYPERLOCAL",
+            timezone=eff_tz,
+            utcOffsetSeconds=eff_offset,
+            source="ZüsAPI (Regional Consensus)",
+            cached=False,
+            generatedAt=now,
+        )
+        self._cache[key] = {
+            "cached_at": now,
+            "data": result,
+        }
+        while len(self._cache) > self._max_cache_entries:
+            self._cache.popitem(last=False)
+        return result
+
     async def get_forecast(
         self,
         latitude: float,
@@ -806,9 +1523,17 @@ class WeatherProviderService:
 
             # 1. Execute ALL upstream queries in parallel (Ensemble + AQI/TZ + NWS Alerts + Nearby METAR/PWS Stations)
             client = http_pool.get_client()
-            ensemble_task = self._fetch_open_meteo_ensemble(
-                client, latitude, longitude, include_past_24h=need_past_24h
-            )
+
+            async def _safe_ensemble() -> Tuple[Optional[Dict[str, Any]], Optional[Exception]]:
+                try:
+                    data = await self._fetch_open_meteo_ensemble(
+                        client, latitude, longitude, include_past_24h=need_past_24h
+                    )
+                    return data, None
+                except Exception as exc:
+                    return None, exc
+
+            ensemble_task = _safe_ensemble()
             aqi_task = self._fetch_air_quality_and_tz(client, latitude, longitude)
             alerts_task = self._fetch_nws_polygon_alerts(client, latitude, longitude)
             stations_task = station_service.fetch_nearby_stations(
@@ -819,7 +1544,7 @@ class WeatherProviderService:
             )
 
             (
-                raw_data,
+                (raw_data, ensemble_err),
                 (
                     us_aqi,
                     pm25_val,
@@ -836,6 +1561,58 @@ class WeatherProviderService:
             ) = await asyncio.gather(
                 ensemble_task, aqi_task, alerts_task, stations_task, cell_reg_task
             )
+
+            if raw_data is None:
+                # Fallback Tier 1: Recent In-Memory Cache (<= 3 hours) enriched with live station + 1km Doppler radar
+                cached_fallback = await self._refresh_cached_fallback(
+                    key=key,
+                    latitude=latitude,
+                    longitude=longitude,
+                    city_name=city_name,
+                    cell_id=cell_id,
+                    now=now,
+                    station_composite=station_composite,
+                    nearby_stations=nearby_stations,
+                    active_alerts=active_alerts,
+                    us_aqi=us_aqi,
+                    pm25_val=pm25_val,
+                    ozone_val=ozone_val,
+                    tree_pollen_val=tree_pollen_val,
+                    grass_pollen_val=grass_pollen_val,
+                    weed_pollen_val=weed_pollen_val,
+                )
+                if cached_fallback is not None:
+                    return cached_fallback
+
+                # Fallback Tier 2: Official NOAA/NWS forecast + live METAR/Doppler when inside US
+                if is_us:
+                    try:
+                        return await self._fetch_nws_fallback_forecast(
+                            client=client,
+                            key=key,
+                            latitude=latitude,
+                            longitude=longitude,
+                            city_name=city_name,
+                            cell_id=cell_id,
+                            now=now,
+                            tz_name=tz_name,
+                            utc_offset_sec=utc_offset_sec,
+                            nearby_stations=nearby_stations,
+                            station_composite=station_composite,
+                            active_alerts=active_alerts,
+                            us_aqi=us_aqi,
+                            pm25_val=pm25_val,
+                            ozone_val=ozone_val,
+                            tree_pollen_val=tree_pollen_val,
+                            grass_pollen_val=grass_pollen_val,
+                            weed_pollen_val=weed_pollen_val,
+                        )
+                    except Exception as nws_err:
+                        print(f"⚠️ NWS fallback failed after upstream error ({ensemble_err}): {nws_err}")
+
+                if ensemble_err is not None:
+                    raise ensemble_err
+                raise RuntimeError("Upstream forecast data unavailable")
 
             target_elevation = float(raw_data.get("elevation") or 0.0)
             if target_elevation > 5.0 and nearby_stations:

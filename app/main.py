@@ -40,7 +40,7 @@ async def _background_doppler_loop():
 
 async def _background_verification_loop():
     """
-    Continuously refreshes active "Follow-the-User" grid cells every 30 minutes
+    Continuously refreshes active "Follow-the-User" grid cells every 2 hours
     so panda captures forecast snapshots and grades models against live PWS/METAR stations 24/7.
     """
     await asyncio.sleep(5)
@@ -52,9 +52,9 @@ async def _background_verification_loop():
                         """
                         SELECT city_name, latitude, longitude
                         FROM tracked_cells
-                        WHERE last_requested_at >= NOW() - INTERVAL '7 days'
+                        WHERE last_requested_at >= NOW() - INTERVAL '24 hours'
                         ORDER BY last_requested_at DESC
-                        LIMIT 15;
+                        LIMIT 6;
                         """
                     )
                 for c in active_cells:
@@ -66,8 +66,10 @@ async def _background_verification_loop():
                             sync_verify=True,
                         )
                         await asyncio.sleep(2)
-                    except Exception:
-                        pass
+                    except Exception as cell_err:
+                        if "429" in str(cell_err):
+                            print("⚠️ Background verification hit upstream 429 rate limit; skipping remaining cells this cycle.")
+                            break
         except asyncio.CancelledError:
             break
         except Exception as e:

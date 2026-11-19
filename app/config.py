@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     google_rtdn_webhook_token: str = ""
     
     # Cache & Verification Loop Settings
-    cache_ttl_seconds: int = 300  # 5 minutes for neighborhood/city cache sharing
-    verification_interval_seconds: int = 1800  # 30 minutes background verification pass
+    cache_ttl_seconds: int = 600  # 10 minutes for neighborhood/city cache sharing
+    verification_interval_seconds: int = 7200  # 2 hours background verification pass
     standard_lapse_rate_c_per_km: float = 6.5  # Standard adiabatic lapse rate (-6.5°C / 1000m)
     
     class Config:

@@ -2,6 +2,17 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.8.3] - 2026-11-19
+
+### Widget Freshness, Forecast Continuity & Upstream Efficiency
+- **Widget Snapshot Freshness Enforcement**:
+  - Enforced a strict 30-minute maximum stale window on cached widget sync responses (`503 Service Unavailable` when expired and upstream refresh fails) so home and lock screen widgets never display multi-hour-old weather as fresh.
+  - Filtered refreshed widget hourly strips to the current hour onward so upcoming hour columns stay synchronized with wall-clock time.
+- **Regional Forecast Continuity & Station Assimilation**:
+  - Added automatic fallback to cached short-term forecasts (`<= 3h`) and official regional public forecast guidance paired with live local weather station and radar telemetry whenever primary global guidance feeds experience rate limits or outages.
+- **Upstream Request & Verification Optimization**:
+  - Separated single-stream fields from multi-model queries, omitted redundant 24-hour lookbacks when unneeded, increased shared response cache TTL (`10 min`), and streamlined background verification (`2h` interval across the top `6` recently active cells with rate-limit short-circuiting).
+
 ## [v1.8.2] - 2026-11-17
 
 ### 10-Day Temperature Calibration, Snow Physics & Daily Icon Accuracy

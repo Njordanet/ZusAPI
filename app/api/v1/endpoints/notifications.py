@@ -17,6 +17,7 @@ router = APIRouter(prefix="/notifications", tags=["Notifications"])
 # Lightweight in-memory widget telemetry relay keyed by client IP (+ global fallback)
 _WIDGET_SYNC_CACHE: Dict[str, Dict[str, Any]] = {}
 _WIDGET_STALE_REFRESH_MS = 15 * 60 * 1000.0  # 15 minutes
+_WIDGET_MAX_STALE_SERVE_MS = 30 * 60 * 1000.0  # 30 minutes max stale window on refresh failure
 
 
 def _wmo_to_base_symbol(code: int, is_day: bool) -> str:
@@ -131,8 +132,15 @@ async def _refresh_stale_widget_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     is_precip_soon = wet_minutes >= 2
     short_rain, start_line, stop_line = _compute_rain_strings(minute_rates)
 
+    now_utc_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    future_hourly = [
+        hr
+        for hr in wx.hourly
+        if (hr.time.astimezone(timezone.utc) if hr.time.tzinfo else hr.time.replace(tzinfo=timezone.utc)) >= now_utc_hour
+    ] or wx.hourly
+
     hourly_items: List[Dict[str, Any]] = []
-    for idx, hr in enumerate(wx.hourly[:12]):
+    for idx, hr in enumerate(future_hourly[:12]):
         hr_local = hr.time.astimezone(tz) if hr.time.tzinfo else hr.time.replace(tzinfo=timezone.utc).astimezone(tz)
         h_num = hr_local.hour
         h12 = 12 if h_num % 12 == 0 else h_num % 12
@@ -386,7 +394,13 @@ async def get_widget_sync(
             if target_push_id:
                 seed["pushDeviceId"] = target_push_id
 
-            refreshed = await _refresh_stale_widget_entry(seed)
+            try:
+                refreshed = await _refresh_stale_widget_entry(seed)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Widget forecast refresh unavailable: {exc}",
+                )
             if seed.get("deviceId"):
                 _WIDGET_SYNC_CACHE[f"dev:{seed['deviceId']}"] = refreshed
             _WIDGET_SYNC_CACHE[_loc_cache_key(lat, lon, effective_unit)] = refreshed
@@ -408,7 +422,13 @@ async def get_widget_sync(
         }
         if device_id and device_id.strip():
             seed["deviceId"] = device_id.strip()
-        refreshed = await _refresh_stale_widget_entry(seed)
+        try:
+            refreshed = await _refresh_stale_widget_entry(seed)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Widget forecast refresh unavailable: {exc}",
+            )
         _WIDGET_SYNC_CACHE[_loc_cache_key(lat, lon, unit or "F")] = refreshed
         return refreshed
 
@@ -437,7 +457,12 @@ async def get_widget_sync(
                 pass
             _WIDGET_SYNC_CACHE[client_ip] = refreshed
             return refreshed
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"⚠️ Widget sync refresh failed (age={int((now_ms - entry_ts) / 1000)}s): {exc}")
+            if now_ms - entry_ts > _WIDGET_MAX_STALE_SERVE_MS:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Cached widget snapshot expired and refresh failed",
+                )
     return entry
 

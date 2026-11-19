@@ -1,5 +1,6 @@
 import pytest
 import sqlite3
+import time
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
@@ -812,6 +813,77 @@ async def test_widget_sync_location_required_and_live_gps_override(tmp_path):
                 assert abs(float(row["cell_lon"]) - (-71.4)) < 1e-4
                 assert row["city"] == "Providence"
 
+    finally:
+        _WIDGET_SYNC_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_widget_sync_rejects_expired_cache_and_returns_503_on_refresh_failure():
+    """
+    Verifies:
+    1. Cached snapshots older than 30 minutes never return 200 OK when refresh fails
+       (both stationary gps_live=true and gps_live=false return 503).
+    2. Moving with gps_live=true when forecast refresh fails returns 503 (not 500).
+    """
+    from app.api.v1.endpoints.notifications import _WIDGET_SYNC_CACHE
+
+    _WIDGET_SYNC_CACHE.clear()
+    client = TestClient(app)
+    stale_ms = (time.time() - 3600.0) * 1000.0  # 60 minutes old (> 30m limit)
+
+    try:
+        with patch(
+            "app.api.v1.endpoints.notifications.weather_service.get_forecast",
+            AsyncMock(side_effect=RuntimeError("429 Too Many Requests")),
+        ):
+            post_res = client.post(
+                "/api/v1/notifications/widget-sync",
+                json={
+                    "deviceId": "wdev_stale",
+                    "latitude": 42.2569,
+                    "longitude": -83.7705,
+                    "unitSymbol": "F",
+                    "locationName": "Ann Arbor",
+                    "locationRequired": False,
+                    "timestampMs": stale_ms,
+                },
+            )
+            assert post_res.status_code == 200
+
+            # Stationary gps_live=true must return 503 rather than serving 60m-old 200 OK
+            res_live = client.get(
+                "/api/v1/notifications/widget-sync",
+                params={
+                    "device_id": "wdev_stale",
+                    "lat": 42.2569,
+                    "lon": -83.7705,
+                    "unit": "F",
+                    "location_name": "Ann Arbor",
+                    "gps_live": "true",
+                },
+            )
+            assert res_live.status_code == 503
+
+            # Non-live gps_live=false must also return 503 when > 30m stale
+            res_non_live = client.get(
+                "/api/v1/notifications/widget-sync",
+                params={"device_id": "wdev_stale"},
+            )
+            assert res_non_live.status_code == 503
+
+            # Moving > 0.02° with gps_live=true must return 503 (not unhandled 500)
+            res_moved = client.get(
+                "/api/v1/notifications/widget-sync",
+                params={
+                    "device_id": "wdev_stale",
+                    "lat": 42.3407,
+                    "lon": -83.0545,
+                    "unit": "F",
+                    "location_name": "Detroit",
+                    "gps_live": "true",
+                },
+            )
+            assert res_moved.status_code == 503
     finally:
         _WIDGET_SYNC_CACHE.clear()
 
