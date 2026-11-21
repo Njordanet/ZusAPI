@@ -98,7 +98,12 @@ class WeatherAlertModel(BaseModel):
     severity: str
     urgency: str
     description: Optional[str] = None
+    instruction: Optional[str] = None
+    senderName: Optional[str] = None
+    areaDesc: Optional[str] = None
+    effective: Optional[str] = None
     expires: Optional[str] = None
+    url: Optional[str] = None
 
 
 class NowcastPoint(BaseModel):

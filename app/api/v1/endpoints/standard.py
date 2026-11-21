@@ -473,7 +473,7 @@ async def _build_darksky_payload(
                 "time": now_ts,
                 "expires": _parse_iso_to_ts(a.expires, now_ts + 7200),
                 "description": a.description or a.headline,
-                "uri": "https://www.weather.gov",
+                "uri": a.url or "https://www.weather.gov",
             }
             for a in w_resp.alerts
         ]

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import re
 import sqlite3
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -39,6 +40,26 @@ PRECIP_DBZ_THRESHOLDS = {
     "moderate": 30.0,
     "heavy": 42.0,
 }
+
+
+def _format_alert_notification_body(alert: WeatherAlertModel, max_len: int = 180) -> str:
+    """Build a concise, informative notification body from the alert description/instruction."""
+    raw = (alert.description or "").strip() or (alert.instruction or "").strip()
+    if not raw:
+        return alert.headline or f"{alert.event} in effect for your area."
+
+    # Clean NWS section markers like "* WHAT..." or "...HAZARDOUS WEATHER..."
+    cleaned = re.sub(r"\*\s*([A-Z][A-Z /]+)\.\.\.", r"\1: ", raw)
+    cleaned = re.sub(r"\.{3,}", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return alert.headline or f"{alert.event} in effect for your area."
+
+    if len(cleaned) <= max_len:
+        return cleaned
+
+    cut = cleaned[: max_len - 1].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return f"{cut}…"
 
 
 def quantize_cell(lat: float, lon: float) -> Tuple[float, float]:
@@ -935,7 +956,7 @@ class PushWorker:
                         messages_to_dispatch.append({
                             "to": token,
                             "title": f"⚠️ {alert.event}",
-                            "body": alert.headline or f"{alert.event} in effect for your area.",
+                            "body": _format_alert_notification_body(alert),
                             "sound": "default",
                             "priority": "high",
                             "interruptionLevel": interruption_level,
@@ -946,6 +967,7 @@ class PushWorker:
                                 "event": alert.event,
                                 "severity": alert.severity,
                                 "urgency": alert.urgency,
+                                "url": alert.url,
                                 "cell": [cell_lat, cell_lon],
                             },
                             "device_id": dev_id,

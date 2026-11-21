@@ -2,6 +2,14 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.9.0] - 2026-11-21
+
+### Detailed Weather Statements, Official Links & Advisory Notifications
+- **Expanded Weather Alert Metadata**:
+  - Added `instruction`, `senderName`, `areaDesc`, `effective`, and official `url` fields to weather alert responses so clients can display complete National Weather Service bulletins, preparedness actions, and direct links to official alert pages.
+- **Informative Advisory Push Notifications**:
+  - Updated severe weather and advisory push notification bodies to summarize the actual hazard description and instructions instead of repeating generic alert headlines.
+
 ## [v1.8.3] - 2026-11-19
 
 ### Widget Freshness, Forecast Continuity & Upstream Efficiency

@@ -654,7 +654,12 @@ class WeatherProviderService:
                             severity=str(props.get("severity") or "Moderate"),
                             urgency=str(props.get("urgency") or "Expected"),
                             description=props.get("description"),
-                            expires=props.get("expires"),
+                            instruction=props.get("instruction"),
+                            senderName=props.get("senderName"),
+                            areaDesc=props.get("areaDesc"),
+                            effective=props.get("effective") or props.get("onset") or props.get("sent"),
+                            expires=props.get("expires") or props.get("ends"),
+                            url=f"https://forecast.weather.gov/MapClick.php?lat={lat:.4f}&lon={lon:.4f}",
                         )
                     )
         except Exception:
