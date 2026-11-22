@@ -887,3 +887,196 @@ async def test_widget_sync_rejects_expired_cache_and_returns_503_on_refresh_fail
     finally:
         _WIDGET_SYNC_CACHE.clear()
 
+
+@pytest.mark.asyncio
+async def test_tokenless_subscription_skipped_and_server_briefings_flag(tmp_path):
+    """
+    Verifies:
+    1. register_subscription with expo_push_token=None returns server_briefings_supported=False,
+       and with a valid ExponentPushToken[...] returns server_briefings_supported=True.
+    2. evaluate_and_dispatch skips expo_push_token=None rows without calling get_forecast
+       and without writing to dispatched_briefings.
+    3. When the device subsequently registers a valid ExponentPushToken[...] within the 20-minute window,
+       its Morning Briefing dispatches immediately.
+    """
+    worker = PushWorker()
+    worker._db_path = tmp_path / "test_tokenless.db"
+    worker._init_sqlite()
+
+    res_none = await worker.register_subscription(
+        PushSubscriptionRegisterRequest(
+            device_id="dev_tokenless_1",
+            expo_push_token=None,
+            lat=42.26,
+            lon=-83.77,
+            timezone="America/New_York",
+            city="Ann Arbor",
+            temp_unit="F",
+            morning_briefing_enabled=True,
+            morning_briefing_time="07:30",
+            notifications_enabled=True,
+            dnd_enabled=False,
+        )
+    )
+    assert res_none.server_briefings_supported is False
+
+    mock_telemetry_dry = RadarLocalTelemetry(
+        inConusGrid=True,
+        currentDbz=0.0,
+        precipRateMmHr=0.0,
+        minuteByMinuteRates=[0.0] * 61,
+    )
+    cur = WeatherDataModel(
+        cityName="Ann Arbor",
+        temperature=6.0,
+        feelsLike=4.0,
+        condition=WeatherCondition.CLEAR,
+        tempMin=1.0,
+        tempMax=12.0,
+        humidity=55,
+        windSpeed=10.0,
+        windDirection=210,
+        uvIndex=3.0,
+        airPressure=1016.0,
+    )
+    d1 = DailyForecastModel(
+        date=datetime(2026, 11, 14, 0, 0, tzinfo=timezone.utc),
+        condition=WeatherCondition.CLEAR,
+        minTemperature=1.0,
+        maxTemperature=12.0,
+        precipitationChance=5,
+    )
+    mock_wx = WeatherResponse(current=cur, hourly=[], daily=[d1])
+
+    captured_batches = []
+
+    async def mock_dispatch(client, payloads):
+        captured_batches.extend(payloads)
+
+    worker._dispatch_expo_batches = AsyncMock(side_effect=mock_dispatch)
+
+    _MockDateTime._mock_now = datetime(2026, 11, 14, 7, 35, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+    mock_get_forecast = AsyncMock(return_value=mock_wx)
+
+    with patch("app.services.push_worker.datetime", _MockDateTime), \
+         patch("app.services.push_worker.doppler_service.get_point_nowcast", new=AsyncMock(return_value=mock_telemetry_dry)), \
+         patch("app.services.push_worker.weather_service._fetch_nws_polygon_alerts", new=AsyncMock(return_value=[])), \
+         patch("app.services.push_worker.weather_service.get_forecast", mock_get_forecast):
+
+        res_skip = await worker.evaluate_and_dispatch()
+        assert mock_get_forecast.await_count == 0
+        assert res_skip["briefing_dispatches"] == 0
+        assert len(captured_batches) == 0
+        with worker._get_connection() as conn:
+            cnt = conn.execute("SELECT COUNT(*) as c FROM dispatched_briefings").fetchone()["c"]
+            assert cnt == 0
+
+        # Now register valid token within the 20-minute window (at 07:42)
+        res_valid = await worker.register_subscription(
+            PushSubscriptionRegisterRequest(
+                device_id="dev_tokenless_1",
+                expo_push_token="ExponentPushToken[valid-tok-123]",
+                lat=42.26,
+                lon=-83.77,
+                timezone="America/New_York",
+                city="Ann Arbor",
+                temp_unit="F",
+                morning_briefing_enabled=True,
+                morning_briefing_time="07:30",
+                notifications_enabled=True,
+                dnd_enabled=False,
+            )
+        )
+        assert res_valid.server_briefings_supported is True
+
+        _MockDateTime._mock_now = datetime(2026, 11, 14, 7, 42, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+        res_sent = await worker.evaluate_and_dispatch()
+        assert mock_get_forecast.await_count == 1
+        assert res_sent["briefing_dispatches"] == 1
+        assert len(captured_batches) == 1
+        assert captured_batches[0]["to"] == "ExponentPushToken[valid-tok-123]"
+
+
+@pytest.mark.asyncio
+async def test_briefing_uses_subscriber_coords_and_reconciles_current_extremes(tmp_path):
+    """
+    Verifies:
+    1. Subscriber at (42.26, -83.77) (cell 42.25, -83.75) calls get_forecast with
+       (latitude=42.26, longitude=-83.77, city_name='Ann Arbor'), NOT the quantized cell center.
+    2. Morning briefing reconciles High / Low with wx.current.tempMax / wx.current.tempMin.
+    """
+    worker = PushWorker()
+    worker._db_path = tmp_path / "test_coords_extremes.db"
+    worker._init_sqlite()
+
+    await worker.register_subscription(
+        PushSubscriptionRegisterRequest(
+            device_id="dev_ann_arbor",
+            expo_push_token="ExponentPushToken[ann-arbor-1]",
+            lat=42.26,
+            lon=-83.77,
+            timezone="America/New_York",
+            city="Ann Arbor",
+            temp_unit="C",
+            morning_briefing_enabled=True,
+            morning_briefing_time="07:30",
+            notifications_enabled=True,
+            dnd_enabled=False,
+        )
+    )
+
+    mock_telemetry_dry = RadarLocalTelemetry(
+        inConusGrid=True,
+        currentDbz=0.0,
+        precipRateMmHr=0.0,
+        minuteByMinuteRates=[0.0] * 61,
+    )
+    # Daily says High 10°C / Low 2°C, while current.tempMax is 14°C and current.tempMin is -1°C
+    cur = WeatherDataModel(
+        cityName="Ann Arbor",
+        temperature=8.0,
+        feelsLike=6.0,
+        condition=WeatherCondition.PARTLY_CLOUDY,
+        tempMin=-1.0,
+        tempMax=14.0,
+        humidity=60,
+        windSpeed=12.0,
+        windDirection=240,
+        uvIndex=2.0,
+        airPressure=1014.0,
+    )
+    d1 = DailyForecastModel(
+        date=datetime(2026, 11, 14, 0, 0, tzinfo=timezone.utc),
+        condition=WeatherCondition.PARTLY_CLOUDY,
+        minTemperature=2.0,
+        maxTemperature=10.0,
+        precipitationChance=10,
+    )
+    mock_wx = WeatherResponse(current=cur, hourly=[], daily=[d1])
+
+    captured_batches = []
+
+    async def mock_dispatch(client, payloads):
+        captured_batches.extend(payloads)
+
+    worker._dispatch_expo_batches = AsyncMock(side_effect=mock_dispatch)
+
+    _MockDateTime._mock_now = datetime(2026, 11, 14, 7, 35, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+    mock_get_forecast = AsyncMock(return_value=mock_wx)
+
+    with patch("app.services.push_worker.datetime", _MockDateTime), \
+         patch("app.services.push_worker.doppler_service.get_point_nowcast", new=AsyncMock(return_value=mock_telemetry_dry)), \
+         patch("app.services.push_worker.weather_service._fetch_nws_polygon_alerts", new=AsyncMock(return_value=[])), \
+         patch("app.services.push_worker.weather_service.get_forecast", mock_get_forecast):
+
+        res = await worker.evaluate_and_dispatch()
+        assert res["briefing_dispatches"] == 1
+        mock_get_forecast.assert_awaited_once_with(
+            latitude=42.26,
+            longitude=-83.77,
+            city_name="Ann Arbor",
+        )
+        assert len(captured_batches) == 1
+        assert "High 14°C / Low -1°C" in captured_batches[0]["body"]
+
+

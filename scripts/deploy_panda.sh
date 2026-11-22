@@ -18,6 +18,7 @@ rsync -avz --delete \
   --exclude 'venv' \
   --exclude '.venv' \
   --exclude '.env' \
+  --exclude 'data' \
   ./ "${PANDA_HOST}:${REMOTE_DIR}/"
 
 # 3. Build & start docker compose

@@ -2,6 +2,16 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.9.1] - 2026-11-22
+
+### Daily Briefing & Local Temperature Consistency
+- **Consistent Neighborhood High & Low Temperatures**:
+  - Stabilized hourly temperature calibration across adjacent neighborhood cells and prevented repeated intra-hour morning updates from skewing afternoon high temperatures.
+  - Preserved verified local morning lows and daytime highs across the full local calendar day, including late-evening hours after UTC midnight.
+- **Scheduled Briefing Accuracy & Subscription Hygiene**:
+  - Updated scheduled Morning Briefings to query subscriber coordinates directly and reconcile same-day highs and lows with live conditions.
+  - Gated scheduled briefing evaluation and delivery ledgers on active push tokens so unprovisioned devices never record phantom dispatches.
+
 ## [v1.9.0] - 2026-11-21
 
 ### Detailed Weather Statements, Official Links & Advisory Notifications

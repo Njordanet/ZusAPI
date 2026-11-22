@@ -538,9 +538,9 @@ class WeatherProviderService:
             "forecast_days": 10,
             "forecast_minutely_15": 8,  # Next 2 hours in 15-min intervals
         }
-        if include_past_24h:
-            ensemble_params["past_hours"] = 24
-            single_params["past_hours"] = 24
+        past_h = 24 if include_past_24h else 12
+        ensemble_params["past_hours"] = past_h
+        single_params["past_hours"] = past_h
 
         resp_ensemble, resp_single = await asyncio.gather(
             client.get(settings.open_meteo_forecast_url, params=ensemble_params),
@@ -1769,10 +1769,17 @@ class WeatherProviderService:
                 if stream:
                     model_hourly_streams[m_name] = stream
 
-            # 3. Query cell RLS metadata & weights in parallel, plus 1km Doppler telemetry
-            rls_meta, db_weights = await asyncio.gather(
+            # 3. Query cell RLS metadata, spatially blended weights, & today's observed temperature bounds in parallel
+            tz_delta_init = timedelta(seconds=utc_offset_sec)
+            local_now_init = now + tz_delta_init
+            local_midnight_utc = (
+                datetime(local_now_init.year, local_now_init.month, local_now_init.day, 0, 0, 0)
+                - tz_delta_init
+            ).replace(tzinfo=timezone.utc)
+            rls_meta, db_weights, (obs_min_today, obs_max_today) = await asyncio.gather(
                 db_manager.get_cell_rls_metadata(cell_id),
-                db_manager.get_model_weights(cell_id),
+                db_manager.get_model_weights(cell_id, latitude, longitude),
+                db_manager.get_today_observed_temp_bounds(cell_id, local_midnight_utc),
             )
 
             est_temp_now = (
@@ -1873,7 +1880,7 @@ class WeatherProviderService:
                     ground_truth_precip_mmhr=ground_truth_precip_mmhr,
                     radar_raw_mmhr=radar_raw_mmhr,
                 )
-                db_weights = await db_manager.get_model_weights(cell_id)
+                db_weights = await db_manager.get_model_weights(cell_id, latitude, longitude)
             else:
                 bg_task = asyncio.create_task(
                     self._run_verification_pipeline(
@@ -2612,10 +2619,7 @@ class WeatherProviderService:
                     0,
                     tzinfo=timezone.utc,
                 )
-                raw_d_idx = daily_idx_by_date.get(
-                    local_date_key,
-                    min(d_idx, max(0, len(daily_times) - 1)),
-                )
+                raw_d_idx = daily_idx_by_date.get(local_date_key)
                 loc_raw_hours = raw_hours_by_local_date.get(local_date_key, [])
                 min_t_blend = 0.0
                 max_t_blend = 0.0
@@ -2658,7 +2662,7 @@ class WeatherProviderService:
                         for ri, uh in loc_raw_hours
                         if ri < len(h_t_arr) and h_t_arr[ri] is not None
                     ]
-                    if len(loc_adj_temps) >= 12:
+                    if len(loc_adj_temps) >= 12 or (raw_d_idx is None and len(loc_adj_temps) >= 1):
                         max_t_blend += max(loc_adj_temps) * w
                         min_t_blend += min(loc_adj_temps) * w
                         pop_vals = [
@@ -2711,7 +2715,8 @@ class WeatherProviderService:
                     d_code_arr = _raw_model_series(daily_raw, "weather_code", suffix)
 
                     if (
-                        raw_d_idx < len(d_max_arr)
+                        raw_d_idx is not None
+                        and raw_d_idx < len(d_max_arr)
                         and d_max_arr[raw_d_idx] is not None
                         and raw_d_idx < len(d_min_arr)
                         and d_min_arr[raw_d_idx] is not None
@@ -2754,8 +2759,9 @@ class WeatherProviderService:
                     or daily_raw.get("wind_direction_10m_dominant")
                     or []
                 )
-                d_wdir = int(d_wdir_arr[raw_d_idx]) if raw_d_idx < len(d_wdir_arr) and d_wdir_arr[raw_d_idx] is not None else 180
-                d_uv = float(d_uv_arr[raw_d_idx]) if raw_d_idx < len(d_uv_arr) and d_uv_arr[raw_d_idx] is not None else 5.0
+                eff_d_idx = raw_d_idx if raw_d_idx is not None else min(d_idx, max(0, len(daily_times) - 1))
+                d_wdir = int(d_wdir_arr[eff_d_idx]) if eff_d_idx < len(d_wdir_arr) and d_wdir_arr[eff_d_idx] is not None else 180
+                d_uv = float(d_uv_arr[eff_d_idx]) if eff_d_idx < len(d_uv_arr) and d_uv_arr[eff_d_idx] is not None else 5.0
                 astro_sr, astro_ss = calc_local_sunrise_sunset_iso(
                     latitude, longitude, local_day_dt, utc_offset_sec
                 )
@@ -2768,8 +2774,14 @@ class WeatherProviderService:
                 if day_slice:
                     slice_temps = [h.temperature for h in day_slice]
                     if d_idx == 0:
-                        d_min = round(min(d_min, min(slice_temps), final_current_temp), 1)
-                        d_max = round(max(d_max, max(slice_temps), final_current_temp), 1)
+                        min_candidates = [d_min, min(slice_temps), final_current_temp]
+                        max_candidates = [d_max, max(slice_temps), final_current_temp]
+                        if obs_min_today is not None:
+                            min_candidates.append(obs_min_today)
+                        if obs_max_today is not None:
+                            max_candidates.append(obs_max_today)
+                        d_min = round(min(min_candidates), 1)
+                        d_max = round(max(max_candidates), 1)
                     else:
                         d_min = round(min(d_min, min(slice_temps)), 1)
                         d_max = round(max(d_max, max(slice_temps)), 1)
@@ -2798,8 +2810,14 @@ class WeatherProviderService:
                         tz_delta=tz_delta,
                     )
                 elif d_idx == 0:
-                    d_min = round(min(d_min, final_current_temp), 1)
-                    d_max = round(max(d_max, final_current_temp), 1)
+                    min_candidates = [d_min, final_current_temp]
+                    max_candidates = [d_max, final_current_temp]
+                    if obs_min_today is not None:
+                        min_candidates.append(obs_min_today)
+                    if obs_max_today is not None:
+                        max_candidates.append(obs_max_today)
+                    d_min = round(min(min_candidates), 1)
+                    d_max = round(max(max_candidates), 1)
                     d_mid = (d_min + d_max) / 2.0
                     d_pt = classify_precip_type(temp_c=d_mid, wmo_code=day_code)
                     d_slr = calc_snow_liquid_ratio(d_mid, d_pt)

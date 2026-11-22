@@ -2,7 +2,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.models.weather import HourlyForecastModel, WeatherCondition
-from app.services.db import db_manager
+from app.services.db import (
+    _fit_hour_balanced_harmonic_bias,
+    _harmonic_bias_rls_step,
+    db_manager,
+    eval_diurnal_bias,
+)
 from app.services.weather_provider import (
     blend_hourly_precip_and_snow,
     calc_horizon_bias_scales,
@@ -187,3 +192,27 @@ def test_daily_snow_and_mix_reconciliation_when_confident():
     assert d_snow == 0.8
     assert d_pt == "sleet"
     assert day_code == 66
+
+
+def test_harmonic_bias_step_bounded_under_repeated_dawn_updates():
+    """Repeated single-hour updates remain bounded and hour-balanced fit weights distinct hours equally."""
+    b0, bsin, bcos = 0.0, 0.0, 0.0
+    for _ in range(30):
+        b0, bsin, bcos = _harmonic_bias_rls_step(b0, bsin, bcos, utc_hour=11, observed_bias=6.5)
+
+    assert abs(b0) <= 2.5
+    assert abs(bsin) <= 2.2
+    assert abs(bcos) <= 2.2
+    for h in range(24):
+        assert abs(eval_diurnal_bias(b0, bsin, bcos, h)) <= 3.5
+
+    # Hour-balanced Ridge fit takes Dict[int, float] (1 mean per distinct UTC hour)
+    # regardless of how many samples produced each hour's mean.
+    hourly_means = {h: (2.0 if h == 11 else 0.0) for h in range(24)}
+    fit_b0, fit_bsin, fit_bcos = _fit_hour_balanced_harmonic_bias(hourly_means)
+    assert abs(fit_b0) < 0.25
+    assert abs(fit_b0) <= 2.5
+    assert abs(fit_bsin) <= 2.2
+    assert abs(fit_bcos) <= 2.2
+    assert _fit_hour_balanced_harmonic_bias({}) == (0.0, 0.0, 0.0)
+

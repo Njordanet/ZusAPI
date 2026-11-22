@@ -1,5 +1,6 @@
 import asyncpg
 import math
+import numpy as np
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from app.config import settings
@@ -138,6 +139,8 @@ CREATE TABLE IF NOT EXISTS cell_rls_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE cell_rls_state ADD COLUMN IF NOT EXISTS last_live_graded_hour TIMESTAMPTZ;
+
 -- 7. Züs CONUS 1km Doppler Radar Grid Snapshots Ledger
 CREATE TABLE IF NOT EXISTS doppler_grid_frames (
     frame_id TEXT PRIMARY KEY,
@@ -165,7 +168,7 @@ def eval_diurnal_bias(beta0: float, beta_sin: float, beta_cos: float, utc_hour: 
     """
     rad = (2.0 * math.pi * (utc_hour % 24)) / 24.0
     val = beta0 + beta_sin * math.sin(rad) + beta_cos * math.cos(rad)
-    return max(-6.0, min(6.0, val))
+    return max(-3.5, min(3.5, val))
 
 
 def _harmonic_bias_rls_step(
@@ -175,7 +178,7 @@ def _harmonic_bias_rls_step(
     utc_hour: int,
     observed_bias: float,
     lr: float = 0.08,
-    l2_decay: float = 0.02,
+    l2_decay: float = 0.01,
 ) -> Tuple[float, float, float]:
     """
     O(1) Regularized Recursive Least Squares / NLMS step for the 3-parameter diurnal harmonic bias curve.
@@ -185,14 +188,41 @@ def _harmonic_bias_rls_step(
     s_h = math.sin(rad)
     c_h = math.cos(rad)
     pred_bias = beta0 + beta_sin * s_h + beta_cos * c_h
-    innovation = max(-8.0, min(8.0, observed_bias - pred_bias))
+    innovation = max(-6.0, min(6.0, observed_bias - pred_bias))
 
     # Feature norm squared ||[1, sin, cos]||^2 = 1 + sin^2 + cos^2 = 2.0
     step = lr * innovation / 2.0
-    new_b0 = max(-5.0, min(5.0, beta0 + step * 1.2))
-    new_bsin = max(-3.0, min(3.0, beta_sin * (1.0 - l2_decay) + step * s_h))
-    new_bcos = max(-3.0, min(3.0, beta_cos * (1.0 - l2_decay) + step * c_h))
+    new_b0 = max(-2.5, min(2.5, beta0 * (1.0 - l2_decay) + step))
+    new_bsin = max(-2.2, min(2.2, beta_sin * (1.0 - l2_decay) + step * s_h))
+    new_bcos = max(-2.2, min(2.2, beta_cos * (1.0 - l2_decay) + step * c_h))
     return round(new_b0, 4), round(new_bsin, 4), round(new_bcos, 4)
+
+
+def _fit_hour_balanced_harmonic_bias(hourly_means: Dict[int, float]) -> Tuple[float, float, float]:
+    """
+    Fits the 3-parameter diurnal harmonic bias curve weighting each distinct UTC hour equally
+    via Ridge normal equations: (X^T X + diag(1.5, 3.0, 3.0)) @ beta = X^T y.
+    """
+    if not hourly_means:
+        return (0.0, 0.0, 0.0)
+    xs: List[List[float]] = []
+    ys: List[float] = []
+    for h, mean_b in hourly_means.items():
+        rad = (2.0 * math.pi * (h % 24)) / 24.0
+        xs.append([1.0, math.sin(rad), math.cos(rad)])
+        ys.append(max(-5.0, min(5.0, float(mean_b))))
+    try:
+        x_mat = np.asarray(xs, dtype=float)
+        y_vec = np.asarray(ys, dtype=float)
+        reg = np.diag([1.5, 3.0, 3.0])
+        beta = np.linalg.solve(x_mat.T @ x_mat + reg, x_mat.T @ y_vec)
+    except Exception:
+        beta = [sum(ys) / len(ys), 0.0, 0.0]
+
+    b0 = round(max(-2.5, min(2.5, float(beta[0]))), 4)
+    bsin = round(max(-2.2, min(2.2, float(beta[1]))), 4)
+    bcos = round(max(-2.2, min(2.2, float(beta[2]))), 4)
+    return (b0, bsin, bcos)
 
 
 def _project_capped_simplex(weights: List[float], min_w: float = 0.03) -> List[float]:
@@ -310,10 +340,66 @@ class DatabaseManager:
             )
             async with self.pool.acquire() as conn:
                 await conn.execute(SCHEMA_SQL)
+            try:
+                await self.rebalance_harmonic_biases()
+            except Exception as e:
+                print(f"⚠️ Harmonic bias rebalance warning: {e}")
             print("⚡️ Connected to PostGIS Telemetry Database and verified RLS schema.")
         except Exception as e:
             print(f"⚠️ Database connection warning: {e}")
             self.pool = None
+
+    async def rebalance_harmonic_biases(self):
+        if not self.pool:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE model_accuracy_weights
+                SET bias_temp_c = GREATEST(-2.5, LEAST(2.5, bias_temp_c)),
+                    bias_sin_c  = GREATEST(-2.2, LEAST(2.2, bias_sin_c)),
+                    bias_cos_c  = GREATEST(-2.2, LEAST(2.2, bias_cos_c))
+                WHERE ABS(bias_temp_c) > 2.5 OR ABS(bias_sin_c) > 2.2 OR ABS(bias_cos_c) > 2.2;
+                """
+            )
+            rows = await conn.fetch(
+                """
+                SELECT cell_id, model_name,
+                       EXTRACT(HOUR FROM target_hour AT TIME ZONE 'UTC')::int AS uh,
+                       AVG(signed_bias_c) AS mean_bias,
+                       COUNT(*) AS cnt
+                FROM forecast_snapshots
+                WHERE verified = TRUE
+                  AND signed_bias_c IS NOT NULL
+                  AND target_hour >= NOW() - INTERVAL '14 days'
+                GROUP BY cell_id, model_name, uh;
+                """
+            )
+            grouped: Dict[Tuple[str, str], Tuple[Dict[int, float], int]] = {}
+            for r in rows:
+                key = (r["cell_id"], r["model_name"])
+                hourly_means, total_cnt = grouped.get(key, ({}, 0))
+                hourly_means[int(r["uh"])] = float(r["mean_bias"])
+                total_cnt += int(r["cnt"])
+                grouped[key] = (hourly_means, total_cnt)
+
+            updates: List[Tuple[str, str, float, float, float]] = []
+            for (cell_id, model_name), (hourly_means, total_cnt) in grouped.items():
+                if len(hourly_means) >= 6 and total_cnt >= 24:
+                    b0, bsin, bcos = _fit_hour_balanced_harmonic_bias(hourly_means)
+                    updates.append((cell_id, model_name, b0, bsin, bcos))
+
+            if updates:
+                await conn.executemany(
+                    """
+                    UPDATE model_accuracy_weights
+                    SET bias_temp_c = $3,
+                        bias_sin_c = $4,
+                        bias_cos_c = $5
+                    WHERE cell_id = $1 AND model_name = $2;
+                    """,
+                    updates,
+                )
 
     async def disconnect(self):
         if self.pool:
@@ -474,23 +560,140 @@ class DatabaseManager:
 
         return cell_id
 
-    async def get_model_weights(self, cell_id: str) -> List[Dict[str, Any]]:
+    async def get_model_weights(
+        self,
+        cell_id: str,
+        lat: Optional[float] = None,
+        lon: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         if not self.pool:
             return []
+        if lat is None or lon is None:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT model_name, mae_temp_c, bias_temp_c, bias_sin_c, bias_cos_c,
+                           mae_wind_kmh, bias_wind_kmh, brier_precip,
+                           dynamic_weight, weight_short, weight_med, weight_ext,
+                           accuracy_pct, samples_verified, updated_at
+                    FROM model_accuracy_weights
+                    WHERE cell_id = $1
+                    ORDER BY dynamic_weight DESC;
+                    """,
+                    cell_id,
+                )
+                return [dict(r) for r in rows]
+
+        lat0 = math.floor(lat * 10.0) / 10.0
+        lat1 = round(lat0 + 0.1, 1)
+        lon0 = math.floor(lon * 10.0) / 10.0
+        lon1 = round(lon0 + 0.1, 1)
+        u = max(0.0, min(1.0, (lat - lat0) / 0.1))
+        v = max(0.0, min(1.0, (lon - lon0) / 0.1))
+
+        corner_weights: Dict[str, float] = {}
+        for c_lat, c_lon, cw in (
+            (lat0, lon0, (1.0 - u) * (1.0 - v)),
+            (lat0, lon1, (1.0 - u) * v),
+            (lat1, lon0, u * (1.0 - v)),
+            (lat1, lon1, u * v),
+        ):
+            cid = f"{c_lat:.1f}:{c_lon:.1f}"
+            corner_weights[cid] = corner_weights.get(cid, 0.0) + cw
+        corner_weights[cell_id] = max(corner_weights.get(cell_id, 0.0), 1e-4)
+
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT model_name, mae_temp_c, bias_temp_c, bias_sin_c, bias_cos_c,
+                SELECT cell_id, model_name, mae_temp_c, bias_temp_c, bias_sin_c, bias_cos_c,
                        mae_wind_kmh, bias_wind_kmh, brier_precip,
                        dynamic_weight, weight_short, weight_med, weight_ext,
                        accuracy_pct, samples_verified, updated_at
                 FROM model_accuracy_weights
+                WHERE cell_id = ANY($1::text[]);
+                """,
+                list(corner_weights.keys()),
+            )
+
+        if len({r["cell_id"] for r in rows}) <= 1:
+            result = [dict(r) for r in rows]
+            result.sort(key=lambda r: float(r.get("dynamic_weight") or 0.0), reverse=True)
+            return result
+
+        by_model: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            d = dict(r)
+            by_model.setdefault(d["model_name"], []).append(d)
+
+        blend_fields = (
+            "mae_temp_c",
+            "bias_temp_c",
+            "bias_sin_c",
+            "bias_cos_c",
+            "mae_wind_kmh",
+            "bias_wind_kmh",
+            "brier_precip",
+            "dynamic_weight",
+            "weight_short",
+            "weight_med",
+            "weight_ext",
+            "accuracy_pct",
+        )
+        blended_rows: List[Dict[str, Any]] = []
+        for m_name, m_rows in by_model.items():
+            raw_weights = [
+                corner_weights.get(r["cell_id"], 0.0)
+                * max(0.05, min(1.0, float(r["samples_verified"] or 1) / 48.0))
+                for r in m_rows
+            ]
+            w_sum = sum(raw_weights)
+            if w_sum <= 0.0:
+                raw_weights = [1.0] * len(m_rows)
+                w_sum = float(len(m_rows))
+
+            blended: Dict[str, Any] = {"model_name": m_name}
+            for field in blend_fields:
+                blended[field] = sum(
+                    float(r.get(field) or 0.0) * wt for r, wt in zip(m_rows, raw_weights)
+                ) / w_sum
+
+            weighted_samples = sum(
+                float(r.get("samples_verified") or 0) * wt for r, wt in zip(m_rows, raw_weights)
+            ) / w_sum
+            blended["samples_verified"] = int(round(weighted_samples))
+            blended["updated_at"] = max(
+                (r["updated_at"] for r in m_rows if r.get("updated_at") is not None),
+                default=None,
+            )
+            blended_rows.append(blended)
+
+        blended_rows.sort(key=lambda r: float(r.get("dynamic_weight") or 0.0), reverse=True)
+        return blended_rows
+
+    async def get_today_observed_temp_bounds(
+        self,
+        cell_id: str,
+        since_utc: datetime,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if not self.pool:
+            return (None, None)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT MIN(actual_temp_c) AS min_t, MAX(actual_temp_c) AS max_t
+                FROM forecast_snapshots
                 WHERE cell_id = $1
-                ORDER BY dynamic_weight DESC;
+                  AND verified = TRUE
+                  AND target_hour >= $2
+                  AND actual_temp_c IS NOT NULL;
                 """,
                 cell_id,
+                since_utc,
             )
-            return [dict(r) for r in rows]
+            return (
+                float(row["min_t"]) if row and row["min_t"] is not None else None,
+                float(row["max_t"]) if row and row["max_t"] is not None else None,
+            )
 
     async def get_cell_rls_metadata(self, cell_id: str) -> Dict[str, Any]:
         if not self.pool:
@@ -764,9 +967,10 @@ class DatabaseManager:
             model_state: Dict[str, Dict[str, Any]] = {r["model_name"]: dict(r) for r in w_rows}
 
             rls_row = await conn.fetchrow(
-                "SELECT model_order, cov_short, cov_med, cov_ext, radar_zr_factor, rls_updates FROM cell_rls_state WHERE cell_id = $1",
+                "SELECT model_order, cov_short, cov_med, cov_ext, radar_zr_factor, rls_updates, last_live_graded_hour FROM cell_rls_state WHERE cell_id = $1",
                 cell_id,
             )
+            should_grade_live_0h = (rls_row is None) or (rls_row.get("last_live_graded_hour") != current_hour)
 
             if ground_truth_temp_c is not None and model_state:
                 # Step 1: Fetch unverified snapshots targeting the current verification window
@@ -863,181 +1067,197 @@ class DatabaseManager:
                         verify_updates_batch,
                     )
 
-                # Step 2: Also grade current-hour (0h) live stream against ground truth for immediate short-range responsiveness
+                # Step 2: Also grade current-hour (0h) live stream against ground truth once per (cell_id, current_hour)
                 now_hour_utc = current_hour.hour
-                for m_name, hours in model_forecasts.items():
-                    if not hours or m_name not in model_state:
-                        continue
-                    st = model_state[m_name]
-                    pred_now = float(hours[0]["temp_c"])
-                    pred_w_now = float(hours[0].get("wind_kmh", 0.0))
-                    abs_err = abs(pred_now - ground_truth_temp_c)
-                    signed_bias = pred_now - ground_truth_temp_c
-                    pred_prob = min(1.0, max(0.0, float(hours[0].get("precip_prob", 0)) / 100.0))
-                    if int(hours[0].get("wmo_code", 0)) >= 51:
-                        pred_prob = max(pred_prob, 0.75)
-                    brier_err = (pred_prob - obs_wet) ** 2
+                if should_grade_live_0h:
+                    for m_name, hours in model_forecasts.items():
+                        if not hours or m_name not in model_state:
+                            continue
+                        st = model_state[m_name]
+                        pred_now = float(hours[0]["temp_c"])
+                        pred_w_now = float(hours[0].get("wind_kmh", 0.0))
+                        abs_err = abs(pred_now - ground_truth_temp_c)
+                        signed_bias = pred_now - ground_truth_temp_c
+                        pred_prob = min(1.0, max(0.0, float(hours[0].get("precip_prob", 0)) / 100.0))
+                        if int(hours[0].get("wmo_code", 0)) >= 51:
+                            pred_prob = max(pred_prob, 0.75)
+                        brier_err = (pred_prob - obs_wet) ** 2
 
-                    b0, b_sin, b_cos = _harmonic_bias_rls_step(
-                        float(st["bias_temp_c"]),
-                        float(st["bias_sin_c"]),
-                        float(st["bias_cos_c"]),
-                        now_hour_utc,
-                        signed_bias,
-                        lr=0.06,
-                    )
-                    st["bias_temp_c"] = b0
-                    st["bias_sin_c"] = b_sin
-                    st["bias_cos_c"] = b_cos
-                    st["mae_temp_c"] = max(0.25, 0.90 * float(st["mae_temp_c"]) + 0.10 * abs_err)
-                    st["brier_precip"] = max(0.02, 0.90 * float(st["brier_precip"]) + 0.10 * brier_err)
-                    if ground_truth_wind_kmh is not None:
-                        w_err = abs(pred_w_now - ground_truth_wind_kmh)
-                        st["mae_wind_kmh"] = max(0.5, 0.90 * float(st["mae_wind_kmh"]) + 0.10 * w_err)
-                        st["bias_wind_kmh"] = 0.90 * float(st["bias_wind_kmh"]) + 0.10 * (pred_w_now - ground_truth_wind_kmh)
-                    st["samples_verified"] = int(st["samples_verified"]) + 1
-
-                    # Ensure 'short' bucket always has a complete K-model vector from hour 0 if snapshots weren't all present
-                    if m_name not in bucket_vectors["short"]:
-                        bucket_vectors["short"][m_name] = pred_now - eval_diurnal_bias(b0, b_sin, b_cos, now_hour_utc)
-
-                # Step 3: Execute Constrained Recursive Least Squares (RLS) Covariance Updates per Horizon Bucket
-                if rls_row:
-                    model_order = [m for m in rls_row["model_order"] if m in model_state]
-                    k = len(model_order)
-                    cov_short = list(rls_row["cov_short"]) if len(rls_row["cov_short"]) == k * k else _init_identity_cov(k)
-                    cov_med = list(rls_row["cov_med"]) if len(rls_row["cov_med"]) == k * k else _init_identity_cov(k)
-                    cov_ext = list(rls_row["cov_ext"]) if len(rls_row["cov_ext"]) == k * k else _init_identity_cov(k)
-                    zr_factor = float(rls_row["radar_zr_factor"] or 1.0)
-                    rls_updates = int(rls_row["rls_updates"] or 0)
-
-                    # Short-range (1-6h) RLS update
-                    if all(m in bucket_vectors["short"] for m in model_order):
-                        w_s = [float(model_state[m]["weight_short"]) for m in model_order]
-                        x_s = [bucket_vectors["short"][m] for m in model_order]
-                        new_w_s, cov_short = _rls_ensemble_step(w_s, cov_short, x_s, ground_truth_temp_c)
-                        for idx, m in enumerate(model_order):
-                            model_state[m]["weight_short"] = new_w_s[idx]
-                        rls_updates += 1
-
-                    # Medium-range (7-24h) RLS update
-                    if all(m in bucket_vectors["med"] for m in model_order):
-                        w_m = [float(model_state[m]["weight_med"]) for m in model_order]
-                        x_m = [bucket_vectors["med"][m] for m in model_order]
-                        new_w_m, cov_med = _rls_ensemble_step(w_m, cov_med, x_m, ground_truth_temp_c)
-                        for idx, m in enumerate(model_order):
-                            model_state[m]["weight_med"] = new_w_m[idx]
-                    else:
-                        # Gently nudge medium weights toward short + inverse-variance skill when waiting for 12-24h snapshots to mature
-                        for m in model_order:
-                            model_state[m]["weight_med"] = round(
-                                0.85 * float(model_state[m]["weight_med"]) + 0.15 * float(model_state[m]["weight_short"]),
-                                4,
-                            )
-
-                    # Extended-range (25h+) RLS update
-                    if all(m in bucket_vectors["ext"] for m in model_order):
-                        w_e = [float(model_state[m]["weight_ext"]) for m in model_order]
-                        x_e = [bucket_vectors["ext"][m] for m in model_order]
-                        new_w_e, cov_ext = _rls_ensemble_step(w_e, cov_ext, x_e, ground_truth_temp_c)
-                        for idx, m in enumerate(model_order):
-                            model_state[m]["weight_ext"] = new_w_e[idx]
-
-                    # Calibrate Radar Z-R / Virga attenuation factor when radar echoes or station precip are present
-                    if radar_raw_mmhr is not None and radar_raw_mmhr >= 0.25 and ground_truth_precip_mmhr is not None:
-                        ratio = max(0.35, min(1.75, (ground_truth_precip_mmhr + 0.15) / (radar_raw_mmhr + 0.15)))
-                        zr_factor = round(max(0.45, min(1.50, 0.90 * zr_factor + 0.10 * ratio)), 3)
-
-                    await conn.execute(
-                        """
-                        UPDATE cell_rls_state
-                        SET cov_short = $2,
-                            cov_med = $3,
-                            cov_ext = $4,
-                            radar_zr_factor = $5,
-                            rls_updates = $6,
-                            updated_at = NOW()
-                        WHERE cell_id = $1;
-                        """,
-                        cell_id,
-                        cov_short,
-                        cov_med,
-                        cov_ext,
-                        zr_factor,
-                        rls_updates,
-                    )
-
-                # Step 4: Combine RLS horizon weights with multi-variable skill penalty (Precip Brier + Wind MAE) & persist
-                raw_comp: Dict[str, float] = {}
-                for m, st in model_state.items():
-                    rls_blend = (
-                        0.45 * float(st["weight_short"])
-                        + 0.35 * float(st["weight_med"])
-                        + 0.20 * float(st["weight_ext"])
-                    )
-                    # Multi-variable skill modifier (rewards models with low Brier precip error & low wind MAE)
-                    brier_mod = 1.0 / (1.0 + 1.8 * max(0.02, float(st["brier_precip"])))
-                    wind_mod = 1.0 / (1.0 + 0.04 * max(0.5, float(st["mae_wind_kmh"])))
-                    raw_comp[m] = rls_blend * brier_mod * wind_mod
-
-                total_comp = sum(raw_comp.values()) or 1.0
-                weight_updates_batch: List[Tuple[Any, ...]] = []
-                for m, st in model_state.items():
-                    comp_w = round(raw_comp[m] / total_comp, 4)
-                    acc_pct = round(
-                        max(
-                            70.0,
-                            min(
-                                99.4,
-                                100.0
-                                - (float(st["mae_temp_c"]) * 3.1)
-                                - (float(st["brier_precip"]) * 7.5)
-                                - (max(0.0, float(st["mae_wind_kmh"]) - 2.5) * 0.25),
-                            ),
-                        ),
-                        1,
-                    )
-                    weight_updates_batch.append(
-                        (
-                            cell_id,
-                            m,
-                            round(float(st["mae_temp_c"]), 3),
-                            round(float(st["bias_temp_c"]), 4),
-                            round(float(st["bias_sin_c"]), 4),
-                            round(float(st["bias_cos_c"]), 4),
-                            round(float(st["mae_wind_kmh"]), 2),
-                            round(float(st["bias_wind_kmh"]), 2),
-                            round(float(st["brier_precip"]), 4),
-                            comp_w,
-                            round(float(st["weight_short"]), 4),
-                            round(float(st["weight_med"]), 4),
-                            round(float(st["weight_ext"]), 4),
-                            acc_pct,
-                            int(st["samples_verified"]),
+                        b0, b_sin, b_cos = _harmonic_bias_rls_step(
+                            float(st["bias_temp_c"]),
+                            float(st["bias_sin_c"]),
+                            float(st["bias_cos_c"]),
+                            now_hour_utc,
+                            signed_bias,
+                            lr=0.06,
                         )
-                    )
-                if weight_updates_batch:
-                    await conn.executemany(
-                        """
-                        UPDATE model_accuracy_weights
-                        SET mae_temp_c = $3,
-                            bias_temp_c = $4,
-                            bias_sin_c = $5,
-                            bias_cos_c = $6,
-                            mae_wind_kmh = $7,
-                            bias_wind_kmh = $8,
-                            brier_precip = $9,
-                            dynamic_weight = $10,
-                            weight_short = $11,
-                            weight_med = $12,
-                            weight_ext = $13,
-                            accuracy_pct = $14,
-                            samples_verified = $15,
-                            updated_at = NOW()
-                        WHERE cell_id = $1 AND model_name = $2;
-                        """,
-                        weight_updates_batch,
-                    )
+                        st["bias_temp_c"] = b0
+                        st["bias_sin_c"] = b_sin
+                        st["bias_cos_c"] = b_cos
+                        st["mae_temp_c"] = max(0.25, 0.90 * float(st["mae_temp_c"]) + 0.10 * abs_err)
+                        st["brier_precip"] = max(0.02, 0.90 * float(st["brier_precip"]) + 0.10 * brier_err)
+                        if ground_truth_wind_kmh is not None:
+                            w_err = abs(pred_w_now - ground_truth_wind_kmh)
+                            st["mae_wind_kmh"] = max(0.5, 0.90 * float(st["mae_wind_kmh"]) + 0.10 * w_err)
+                            st["bias_wind_kmh"] = 0.90 * float(st["bias_wind_kmh"]) + 0.10 * (pred_w_now - ground_truth_wind_kmh)
+                        st["samples_verified"] = int(st["samples_verified"]) + 1
+
+                        # Ensure 'short' bucket always has a complete K-model vector from hour 0 if snapshots weren't all present
+                        if m_name not in bucket_vectors["short"]:
+                            bucket_vectors["short"][m_name] = pred_now - eval_diurnal_bias(b0, b_sin, b_cos, now_hour_utc)
+                elif verify_updates_batch:
+                    for m_name, hours in model_forecasts.items():
+                        if not hours or m_name not in model_state or m_name in bucket_vectors["short"]:
+                            continue
+                        st = model_state[m_name]
+                        pred_now = float(hours[0]["temp_c"])
+                        bucket_vectors["short"][m_name] = pred_now - eval_diurnal_bias(
+                            float(st["bias_temp_c"]),
+                            float(st["bias_sin_c"]),
+                            float(st["bias_cos_c"]),
+                            now_hour_utc,
+                        )
+
+                if bool(verify_updates_batch) or should_grade_live_0h:
+                    # Step 3: Execute Constrained Recursive Least Squares (RLS) Covariance Updates per Horizon Bucket
+                    if rls_row:
+                        model_order = [m for m in rls_row["model_order"] if m in model_state]
+                        k = len(model_order)
+                        cov_short = list(rls_row["cov_short"]) if len(rls_row["cov_short"]) == k * k else _init_identity_cov(k)
+                        cov_med = list(rls_row["cov_med"]) if len(rls_row["cov_med"]) == k * k else _init_identity_cov(k)
+                        cov_ext = list(rls_row["cov_ext"]) if len(rls_row["cov_ext"]) == k * k else _init_identity_cov(k)
+                        zr_factor = float(rls_row["radar_zr_factor"] or 1.0)
+                        rls_updates = int(rls_row["rls_updates"] or 0)
+
+                        # Short-range (1-6h) RLS update
+                        if all(m in bucket_vectors["short"] for m in model_order):
+                            w_s = [float(model_state[m]["weight_short"]) for m in model_order]
+                            x_s = [bucket_vectors["short"][m] for m in model_order]
+                            new_w_s, cov_short = _rls_ensemble_step(w_s, cov_short, x_s, ground_truth_temp_c)
+                            for idx, m in enumerate(model_order):
+                                model_state[m]["weight_short"] = new_w_s[idx]
+                            rls_updates += 1
+
+                        # Medium-range (7-24h) RLS update
+                        if all(m in bucket_vectors["med"] for m in model_order):
+                            w_m = [float(model_state[m]["weight_med"]) for m in model_order]
+                            x_m = [bucket_vectors["med"][m] for m in model_order]
+                            new_w_m, cov_med = _rls_ensemble_step(w_m, cov_med, x_m, ground_truth_temp_c)
+                            for idx, m in enumerate(model_order):
+                                model_state[m]["weight_med"] = new_w_m[idx]
+                        else:
+                            # Gently nudge medium weights toward short + inverse-variance skill when waiting for 12-24h snapshots to mature
+                            for m in model_order:
+                                model_state[m]["weight_med"] = round(
+                                    0.85 * float(model_state[m]["weight_med"]) + 0.15 * float(model_state[m]["weight_short"]),
+                                    4,
+                                )
+
+                        # Extended-range (25h+) RLS update
+                        if all(m in bucket_vectors["ext"] for m in model_order):
+                            w_e = [float(model_state[m]["weight_ext"]) for m in model_order]
+                            x_e = [bucket_vectors["ext"][m] for m in model_order]
+                            new_w_e, cov_ext = _rls_ensemble_step(w_e, cov_ext, x_e, ground_truth_temp_c)
+                            for idx, m in enumerate(model_order):
+                                model_state[m]["weight_ext"] = new_w_e[idx]
+
+                        # Calibrate Radar Z-R / Virga attenuation factor when radar echoes or station precip are present
+                        if radar_raw_mmhr is not None and radar_raw_mmhr >= 0.25 and ground_truth_precip_mmhr is not None:
+                            ratio = max(0.35, min(1.75, (ground_truth_precip_mmhr + 0.15) / (radar_raw_mmhr + 0.15)))
+                            zr_factor = round(max(0.45, min(1.50, 0.90 * zr_factor + 0.10 * ratio)), 3)
+
+                        await conn.execute(
+                            """
+                            UPDATE cell_rls_state
+                            SET cov_short = $2,
+                                cov_med = $3,
+                                cov_ext = $4,
+                                radar_zr_factor = $5,
+                                rls_updates = $6,
+                                last_live_graded_hour = $7,
+                                updated_at = NOW()
+                            WHERE cell_id = $1;
+                            """,
+                            cell_id,
+                            cov_short,
+                            cov_med,
+                            cov_ext,
+                            zr_factor,
+                            rls_updates,
+                            current_hour,
+                        )
+
+                    # Step 4: Combine RLS horizon weights with multi-variable skill penalty (Precip Brier + Wind MAE) & persist
+                    raw_comp: Dict[str, float] = {}
+                    for m, st in model_state.items():
+                        rls_blend = (
+                            0.45 * float(st["weight_short"])
+                            + 0.35 * float(st["weight_med"])
+                            + 0.20 * float(st["weight_ext"])
+                        )
+                        # Multi-variable skill modifier (rewards models with low Brier precip error & low wind MAE)
+                        brier_mod = 1.0 / (1.0 + 1.8 * max(0.02, float(st["brier_precip"])))
+                        wind_mod = 1.0 / (1.0 + 0.04 * max(0.5, float(st["mae_wind_kmh"])))
+                        raw_comp[m] = rls_blend * brier_mod * wind_mod
+
+                    total_comp = sum(raw_comp.values()) or 1.0
+                    weight_updates_batch: List[Tuple[Any, ...]] = []
+                    for m, st in model_state.items():
+                        comp_w = round(raw_comp[m] / total_comp, 4)
+                        acc_pct = round(
+                            max(
+                                70.0,
+                                min(
+                                    99.4,
+                                    100.0
+                                    - (float(st["mae_temp_c"]) * 3.1)
+                                    - (float(st["brier_precip"]) * 7.5)
+                                    - (max(0.0, float(st["mae_wind_kmh"]) - 2.5) * 0.25),
+                                ),
+                            ),
+                            1,
+                        )
+                        weight_updates_batch.append(
+                            (
+                                cell_id,
+                                m,
+                                round(float(st["mae_temp_c"]), 3),
+                                round(float(st["bias_temp_c"]), 4),
+                                round(float(st["bias_sin_c"]), 4),
+                                round(float(st["bias_cos_c"]), 4),
+                                round(float(st["mae_wind_kmh"]), 2),
+                                round(float(st["bias_wind_kmh"]), 2),
+                                round(float(st["brier_precip"]), 4),
+                                comp_w,
+                                round(float(st["weight_short"]), 4),
+                                round(float(st["weight_med"]), 4),
+                                round(float(st["weight_ext"]), 4),
+                                acc_pct,
+                                int(st["samples_verified"]),
+                            )
+                        )
+                    if weight_updates_batch:
+                        await conn.executemany(
+                            """
+                            UPDATE model_accuracy_weights
+                            SET mae_temp_c = $3,
+                                bias_temp_c = $4,
+                                bias_sin_c = $5,
+                                bias_cos_c = $6,
+                                mae_wind_kmh = $7,
+                                bias_wind_kmh = $8,
+                                brier_precip = $9,
+                                dynamic_weight = $10,
+                                weight_short = $11,
+                                weight_med = $12,
+                                weight_ext = $13,
+                                accuracy_pct = $14,
+                                samples_verified = $15,
+                                updated_at = NOW()
+                            WHERE cell_id = $1 AND model_name = $2;
+                            """,
+                            weight_updates_batch,
+                        )
 
             # Step 5: Store future forecast snapshots across short, med, and ext horizons (1, 3, 6, 12, 24, 48h)
             snapshot_inserts_batch: List[Tuple[Any, ...]] = []

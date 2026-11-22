@@ -42,6 +42,14 @@ PRECIP_DBZ_THRESHOLDS = {
 }
 
 
+def _is_valid_expo_token(tok: Any) -> bool:
+    return bool(
+        tok
+        and isinstance(tok, str)
+        and (tok.startswith("ExponentPushToken[") or tok.startswith("ExpoPushToken["))
+    )
+
+
 def _format_alert_notification_body(alert: WeatherAlertModel, max_len: int = 180) -> str:
     """Build a concise, informative notification body from the alert description/instruction."""
     raw = (alert.description or "").strip() or (alert.instruction or "").strip()
@@ -186,8 +194,16 @@ def _build_briefing_message(
             (d for d in wx.daily if _format_forecast_date(d.date) == due_date),
             wx.daily[0] if wx.daily else None,
         )
-        raw_high = daily_item.maxTemperature if daily_item is not None else wx.current.tempMax
-        raw_low = daily_item.minTemperature if daily_item is not None else wx.current.tempMin
+        if daily_item is not None:
+            if _format_forecast_date(daily_item.date) == due_date:
+                raw_high = max(daily_item.maxTemperature, wx.current.tempMax)
+                raw_low = min(daily_item.minTemperature, wx.current.tempMin)
+            else:
+                raw_high = daily_item.maxTemperature
+                raw_low = daily_item.minTemperature
+        else:
+            raw_high = wx.current.tempMax
+            raw_low = wx.current.tempMin
         high = convert_temp_c(raw_high, unit)
         low = convert_temp_c(raw_low, unit)
         cond_obj = daily_item.condition if daily_item is not None else wx.current.condition
@@ -525,7 +541,7 @@ class PushWorker:
             freeze_alert_enabled=req.freeze_alert_enabled,
             aqi_alert_enabled=req.aqi_alert_enabled,
             wind_alert_threshold_mph=req.wind_alert_threshold_mph,
-            server_briefings_supported=True,
+            server_briefings_supported=_is_valid_expo_token(req.expo_push_token),
             updated_at=now_iso,
         )
 
@@ -692,6 +708,8 @@ class PushWorker:
                                freeze_alert_enabled, aqi_alert_enabled, wind_alert_threshold_mph
                         FROM push_subscriptions
                         WHERE notifications_enabled = 1
+                          AND expo_push_token IS NOT NULL
+                          AND (expo_push_token LIKE 'ExponentPushToken[%' OR expo_push_token LIKE 'ExpoPushToken[%')
                         """
                     ).fetchall()
 
@@ -1020,14 +1038,16 @@ class PushWorker:
 
                 if cell_due_briefings:
                     cell_city = cell_due_briefings[0][0].get("city") or "Current Location"
+                    req_lat = round(sum(float(b[0]["lat"]) for b in cell_due_briefings) / len(cell_due_briefings), 4)
+                    req_lon = round(sum(float(b[0]["lon"]) for b in cell_due_briefings) / len(cell_due_briefings), 4)
                     try:
                         wx = await weather_service.get_forecast(
-                            latitude=cell_lat,
-                            longitude=cell_lon,
+                            latitude=req_lat,
+                            longitude=req_lon,
                             city_name=cell_city,
                         )
                     except Exception as e:
-                        logger.warning(f"Failed to fetch cell forecast for briefing ({cell_lat}, {cell_lon}): {e}")
+                        logger.warning(f"Failed to fetch cell forecast for briefing ({req_lat}, {req_lon}): {e}")
                         wx = None
 
                     if wx is not None:
