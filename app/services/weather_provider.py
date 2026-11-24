@@ -77,6 +77,63 @@ def calc_wet_bulb_c(temp_c: float, rh_pct: float) -> float:
     return round(tw, 2)
 
 
+def calc_apparent_temp_c(temp_c: float, rh_pct: float, wind_kmh: float) -> float:
+    """
+    Computes apparent ('feels like') temperature (°C) using NWS Wind Chill in cold/windy
+    conditions, Rothfusz Heat Index in hot/humid conditions, and Steadman apparent
+    temperature in moderate regimes, with smooth transitions across boundaries.
+    """
+    t = float(temp_c)
+    rh = max(5.0, min(100.0, float(rh_pct)))
+    v_kmh = max(0.0, float(wind_kmh))
+    v_ms = v_kmh / 3.6
+
+    # Steadman shade apparent temperature
+    e_hpa = (rh / 100.0) * 6.105 * math.exp((17.27 * t) / (237.7 + t))
+    steadman = t + 0.33 * e_hpa - 0.70 * v_ms - 4.00
+
+    # NWS Wind Chill (valid T <= 10°C, V > 4.8 km/h)
+    if v_kmh > 4.8:
+        v_pow = v_kmh ** 0.16
+        wind_chill = 13.12 + 0.6215 * t - 11.37 * v_pow + 0.3965 * t * v_pow
+    else:
+        wind_chill = steadman
+
+    # Rothfusz Heat Index (valid T >= 26.7°C, RH >= 40%)
+    t_f = t * 9.0 / 5.0 + 32.0
+    hi_f = (
+        -42.379
+        + 2.04901523 * t_f
+        + 10.14333127 * rh
+        - 0.22475541 * t_f * rh
+        - 0.00683783 * t_f * t_f
+        - 0.05481717 * rh * rh
+        + 0.00122874 * t_f * t_f * rh
+        + 0.00085282 * t_f * rh * rh
+        - 0.00000199 * t_f * t_f * rh * rh
+    )
+    if rh < 13.0 and 80.0 <= t_f <= 112.0:
+        hi_f -= ((13.0 - rh) / 4.0) * math.sqrt(max(0.0, (17.0 - abs(t_f - 95.0)) / 17.0))
+    elif rh > 85.0 and 80.0 <= t_f <= 87.0:
+        hi_f += ((rh - 85.0) / 10.0) * ((87.0 - t_f) / 5.0)
+    heat_index = (hi_f - 32.0) * 5.0 / 9.0
+
+    if t <= 8.0:
+        val = wind_chill
+    elif t < 12.0:
+        w = (t - 8.0) / 4.0
+        val = (1.0 - w) * wind_chill + w * steadman
+    elif t >= 28.0 and rh >= 40.0:
+        val = heat_index
+    elif t >= 25.0 and rh >= 40.0:
+        w = (t - 25.0) / 3.0
+        val = (1.0 - w) * steadman + w * heat_index
+    else:
+        val = steadman
+
+    return round(val, 1)
+
+
 def calc_snow_liquid_ratio(temp_c: float, precip_type: Optional[str] = None) -> float:
     """
     Computes temperature-dependent Kuchera/Cobb Snow-to-Liquid Ratio (SLR).
@@ -88,6 +145,8 @@ def calc_snow_liquid_ratio(temp_c: float, precip_type: Optional[str] = None) -> 
         return 0.0
 
     t = float(temp_c)
+    if settings.zus_accuracy_v2 and precip_type == "snow" and t >= 3.0:
+        return 0.0
     if t >= 0.5:
         slr = max(4.0, 10.0 - 3.0 * t)
     elif t >= -15.0:
@@ -209,7 +268,12 @@ def blend_hourly_precip_and_snow(
             temp_c=m_temp, rh_pct=float(m_rh), wet_bulb_c=m_wb, wmo_code=m_code
         )
         m_slr = calc_snow_liquid_ratio(m_temp, m_pt)
-        m_snow_cm = (m_pr / 10.0) * m_slr if (m_pt in ("snow", "sleet") and m_pr > 0.0) else 0.0
+        is_freezing_rain = settings.zus_accuracy_v2 and m_code in (56, 57, 66, 67)
+        m_snow_cm = (
+            0.0
+            if is_freezing_rain
+            else ((m_pr / 10.0) * m_slr if (m_pt in ("snow", "sleet") and m_pr > 0.0) else 0.0)
+        )
         blended_snow_cm += m_snow_cm * w
 
         if m_pr >= 0.05 or m_pop >= 25:
@@ -498,11 +562,18 @@ class WeatherProviderService:
         include_past_24h: bool = False,
     ) -> Dict[str, Any]:
         in_conus = db_manager.is_conus_region(lat, lon)
-        models_csv = (
-            "best_match,ecmwf_ifs025,ncep_nbm_conus,gfs_seamless,icon_seamless,gem_seamless"
-            if in_conus
-            else "best_match,ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless"
-        )
+        if settings.zus_accuracy_v2:
+            models_csv = (
+                "gfs_hrrr,ecmwf_ifs025,ecmwf_aifs025_single,ncep_nbm_conus,gfs_global,icon_seamless,gem_seamless"
+                if in_conus
+                else "ecmwf_ifs025,ecmwf_aifs025_single,gfs_global,icon_seamless,gem_seamless"
+            )
+        else:
+            models_csv = (
+                "best_match,ecmwf_ifs025,ncep_nbm_conus,gfs_seamless,icon_seamless,gem_seamless"
+                if in_conus
+                else "best_match,ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless"
+            )
         ensemble_params: Dict[str, Any] = {
             "latitude": lat,
             "longitude": lon,
@@ -670,17 +741,20 @@ class WeatherProviderService:
         self,
         cell_id: str,
         past_hourly_temps: Dict[datetime, float],
-        model_hourly_streams: Dict[str, List[Dict[str, Any]]],
+        model_hourly_streams: Dict[str, List[Optional[Dict[str, Any]]]],
         ground_truth_temp: Optional[float],
         ground_truth_precip_active: bool,
         ground_truth_wind: Optional[float],
         ground_truth_precip_mmhr: Optional[float],
         radar_raw_mmhr: Optional[float],
+        obs_precip_checked: bool = True,
+        consensus_hours: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         try:
-            if past_hourly_temps:
+            if past_hourly_temps or settings.zus_accuracy_v2:
                 await db_manager.backfill_expired_snapshots(
-                    cell_id=cell_id, past_hourly_temps=past_hourly_temps
+                    cell_id=cell_id,
+                    past_hourly_temps=({} if settings.zus_accuracy_v2 else past_hourly_temps),
                 )
             await db_manager.save_forecast_snapshots_and_verify(
                 cell_id=cell_id,
@@ -690,6 +764,8 @@ class WeatherProviderService:
                 ground_truth_wind_kmh=ground_truth_wind,
                 ground_truth_precip_mmhr=ground_truth_precip_mmhr,
                 radar_raw_mmhr=radar_raw_mmhr,
+                obs_precip_checked=obs_precip_checked,
+                consensus_hours=consensus_hours,
             )
         except Exception as e:
             print(f"⚠️ Async RLS verification warning for cell {cell_id}: {e}")
@@ -753,8 +829,12 @@ class WeatherProviderService:
                 if station_checked_dry and nwp_mmhr < 0.08 and (not doppler or doppler.currentDbz < 22.0):
                     # Nearby METAR station & NWP both report dry; suppress weak uncorroborated radar clutter/virga
                     blended = rad_mmhr * 0.35 if rad_mmhr >= 0.35 else 0.0
+                elif settings.zus_accuracy_v2:
+                    # Convex radar->NWP handoff: radar dominates early minutes (90%), transitioning smoothly toward NWP by 60m (55%)
+                    w_rad = 0.90 - 0.35 * (t_min / 60.0)
+                    blended = rad_mmhr * w_rad + nwp_mmhr * (1.0 - w_rad)
                 else:
-                    # Radar dominates minutes 0..35 (88%), gradually giving NWP more weight by minute 60 (72% radar / 28% NWP)
+                    # Legacy blend
                     w_rad = 0.88 - 0.16 * (t_min / 60.0)
                     blended = max(rad_mmhr, rad_mmhr * w_rad + nwp_mmhr * (1.0 - w_rad))
             else:
@@ -770,10 +850,18 @@ class WeatherProviderService:
                 doppler.intensityCategory = "Light Rain" if station_mmhr >= 0.8 else "Light Drizzle"
 
         points: List[NowcastPoint] = []
+        has_dop_probs = bool(
+            doppler and doppler.inConusGrid and len(doppler.minuteProbabilities60m) >= 61
+        )
         for idx in range(5):
             t_m = idx * 15
             b_mmhr = fused_61[t_m]
-            prob = min(100, int(round(b_mmhr * 35))) if b_mmhr > 0.08 else 0
+            if settings.zus_accuracy_v2 and has_dop_probs:
+                prob = max(0, min(100, int(round(float(doppler.minuteProbabilities60m[t_m]) * 100.0))))
+            elif settings.zus_accuracy_v2:
+                prob = min(100, int(round(100.0 * (1.0 - math.exp(-b_mmhr / 0.45))))) if b_mmhr > 0.08 else 0
+            else:
+                prob = min(100, int(round(b_mmhr * 35))) if b_mmhr > 0.08 else 0
             points.append(
                 NowcastPoint(
                     timeOffsetMinutes=t_m,
@@ -906,6 +994,16 @@ class WeatherProviderService:
             )
         )
         radar_zr_factor = float(rls_meta.get("radar_zr_factor") or 1.0)
+        est_rh_now = calc_relative_humidity(est_temp_now, est_dewp_now)
+        est_wmo_now = int(station_composite["wx_wmo"]) if (station_composite and station_composite.get("wx_wmo")) else (h0.wmoCode if h0 else 0)
+        est_wx_now = station_composite.get("wx_string") if station_composite else None
+        est_pt_now = classify_precip_type(
+            temp_c=est_temp_now,
+            rh_pct=float(est_rh_now),
+            wmo_code=est_wmo_now,
+            metar_wx=est_wx_now,
+        )
+        est_cape_now = float(h0.capeJkg if (h0 and h0.capeJkg is not None) else (current_model.capeJkg or 0.0))
         doppler_telemetry = await doppler_service.get_point_telemetry(
             latitude,
             longitude,
@@ -916,6 +1014,8 @@ class WeatherProviderService:
             station_checked=st_checked_now,
             cloud_cover_low=(float(h0.cloudCoverLow) if (h0 and h0.cloudCoverLow is not None) else None),
             nwp_precip_active=nwp_precip_now,
+            precip_type=est_pt_now,
+            cape_jkg=est_cape_now,
         )
         nowcast_obj = self._build_nowcast(
             {"minutely_15": {}},
@@ -1122,7 +1222,7 @@ class WeatherProviderService:
         if future_daily:
             cached_resp.daily = future_daily
 
-        if city_name and city_name != "Unknown Location":
+        if not self._is_generic_city_name(city_name):
             cached_resp.current.cityName = city_name
 
         doppler_telemetry, nowcast_obj = await self._assimilate_fallback_telemetry(
@@ -1484,36 +1584,144 @@ class WeatherProviderService:
             self._cache.popitem(last=False)
         return result
 
+    @staticmethod
+    def _is_generic_city_name(name: Optional[str]) -> bool:
+        if not name:
+            return True
+        s = name.strip()
+        if not s or s.lower() == "unknown location":
+            return True
+        parts = s.split(",")
+        if len(parts) == 2:
+            try:
+                float(parts[0].strip())
+                float(parts[1].strip())
+                return True
+            except ValueError:
+                pass
+        return False
+
+    async def refresh_live_doppler_on_response(
+        self,
+        response: WeatherResponse,
+        latitude: float,
+        longitude: float,
+    ) -> WeatherResponse:
+        """
+        O(1) RAM refresh of dopplerTelemetry and nowcast on cached responses so
+        minute-by-minute radar timing never lags behind the 2-minute MRMS ingest.
+        """
+        if not settings.zus_accuracy_v2:
+            return response
+        key = self._cache_key(latitude, longitude)
+        entry = self._cache.get(key) or {}
+        cur = response.current
+        h0 = response.hourly[0] if response.hourly else None
+        st_checked = bool(cur.localStationName and (cur.localStationDistanceKm or 99.0) <= 35.0)
+        st_wet = bool(cur.localStationWx)
+        nwp_precip = bool(
+            h0
+            and (
+                (h0.precipMm or 0.0) >= 0.1
+                or (h0.precipitationChance or 0) >= 25
+                or h0.wmoCode >= 51
+            )
+        )
+        radar_zr = float(entry.get("radar_zr_factor") or 1.0)
+        try:
+            fresh_doppler = await doppler_service.get_point_telemetry(
+                latitude,
+                longitude,
+                temp_c=cur.temperature,
+                dewpoint_c=cur.dewPoint,
+                station_wet=st_wet,
+                radar_zr_factor=radar_zr,
+                station_checked=st_checked,
+                cloud_cover_low=(float(cur.cloudCoverLow) if cur.cloudCoverLow is not None else None),
+                nwp_precip_active=nwp_precip,
+                precip_type=cur.precipType,
+                cape_jkg=cur.capeJkg,
+            )
+        except Exception:
+            return response
+
+        raw_m15 = entry.get("raw_m15")
+        st_comp = entry.get("station_composite")
+        if raw_m15 is not None:
+            fresh_nowcast = self._build_nowcast(
+                {"minutely_15": raw_m15},
+                fresh_doppler,
+                st_comp,
+                radar_zr_factor=radar_zr,
+            )
+        else:
+            fresh_nowcast = response.nowcast
+
+        cur_updates: Dict[str, Any] = {}
+        if fresh_nowcast and fresh_nowcast.summaryText:
+            cur_updates["nowcastSummary"] = fresh_nowcast.summaryText
+        if fresh_nowcast and fresh_nowcast.points:
+            cur_updates["precipIntensityMmHr"] = round(
+                max(
+                    float(fresh_nowcast.points[0].precipIntensityMmHr),
+                    float(fresh_doppler.precipRateMmHr if fresh_doppler else 0.0),
+                    float(st_comp.get("precip_mmhr") or 0.0) if st_comp else 0.0,
+                ),
+                2,
+            )
+        updated_cur = cur.model_copy(update=cur_updates) if cur_updates else cur
+        return response.model_copy(
+            update={
+                "current": updated_cur,
+                "dopplerTelemetry": fresh_doppler,
+                "nowcast": fresh_nowcast,
+            }
+        )
+
     async def get_forecast(
         self,
         latitude: float,
         longitude: float,
         city_name: str,
         sync_verify: bool = False,
+        bypass_cache: bool = False,
     ) -> WeatherResponse:
         key = self._cache_key(latitude, longitude)
         now = datetime.now(timezone.utc)
 
-        if key in self._cache:
+        if not bypass_cache and key in self._cache:
             entry = self._cache[key]
             if (now - entry["cached_at"]).total_seconds() < settings.cache_ttl_seconds:
                 self._cache.move_to_end(key)
                 response: WeatherResponse = entry["data"]
-                if city_name and city_name != "Unknown Location" and response.current.cityName != city_name:
+                if settings.zus_accuracy_v2:
+                    response = await self.refresh_live_doppler_on_response(response, latitude, longitude)
+                if not self._is_generic_city_name(city_name) and response.current.cityName != city_name:
                     cur_copy = response.current.model_copy(update={"cityName": city_name})
                     return response.model_copy(update={"cached": True, "current": cur_copy})
                 return response.model_copy(update={"cached": True})
 
         lock = self._inflight_locks.setdefault(key, asyncio.Lock())
+        if len(self._inflight_locks) > self._max_cache_entries:
+            stale_locks = [
+                lk_key
+                for lk_key, lk_obj in self._inflight_locks.items()
+                if lk_key != key and not lk_obj.locked()
+            ]
+            for lk_key in stale_locks[: len(self._inflight_locks) - self._max_cache_entries]:
+                self._inflight_locks.pop(lk_key, None)
+
         async with lock:
             # Double-check cache after acquiring singleflight lock
             now = datetime.now(timezone.utc)
-            if key in self._cache:
+            if not bypass_cache and key in self._cache:
                 entry = self._cache[key]
                 if (now - entry["cached_at"]).total_seconds() < settings.cache_ttl_seconds:
                     self._cache.move_to_end(key)
                     response = entry["data"]
-                    if city_name and city_name != "Unknown Location" and response.current.cityName != city_name:
+                    if settings.zus_accuracy_v2:
+                        response = await self.refresh_live_doppler_on_response(response, latitude, longitude)
+                    if not self._is_generic_city_name(city_name) and response.current.cityName != city_name:
                         cur_copy = response.current.model_copy(update={"cityName": city_name})
                         return response.model_copy(update={"cached": True, "current": cur_copy})
                     return response.model_copy(update={"cached": True})
@@ -1524,7 +1732,11 @@ class WeatherProviderService:
             cell_id = db_manager.make_cell_id(latitude, longitude)
 
             # Fast O(1) check if this cell has expired snapshots needing past_hours=24 backfill
-            need_past_24h = await db_manager.has_expired_unverified_snapshots(cell_id)
+            need_past_24h = (
+                False
+                if settings.zus_accuracy_v2
+                else await db_manager.has_expired_unverified_snapshots(cell_id)
+            )
 
             # 1. Execute ALL upstream queries in parallel (Ensemble + AQI/TZ + NWS Alerts + Nearby METAR/PWS Stations)
             client = http_pool.get_client()
@@ -1620,36 +1832,55 @@ class WeatherProviderService:
                 raise RuntimeError("Upstream forecast data unavailable")
 
             target_elevation = float(raw_data.get("elevation") or 0.0)
-            if target_elevation > 5.0 and nearby_stations:
-                # Re-normalize station lapse-rate adjustment in-memory (<0.05ms via cached sector)
-                nearby_stations, station_composite = await station_service.fetch_nearby_stations(
-                    lat=latitude,
-                    lon=longitude,
-                    target_elev_m=target_elevation,
-                )
+            if target_elevation > 5.0:
+                try:
+                    await db_manager.update_cell_elevation(cell_id, target_elevation)
+                except Exception:
+                    pass
+                if nearby_stations:
+                    # Re-normalize station lapse-rate adjustment in-memory (<0.05ms via cached sector)
+                    nearby_stations, station_composite = await station_service.fetch_nearby_stations(
+                        lat=latitude,
+                        lon=longitude,
+                        target_elev_m=target_elevation,
+                    )
 
             # 2. Extract individual model hourly streams from Open-Meteo Multi-Model payload
             hourly_raw = raw_data.get("hourly", {})
             daily_raw = raw_data.get("daily", {})
             current_raw = raw_data.get("current", {})
 
-            model_suffixes = {
-                "HRRR": "best_match",
-                "ECMWF": "ecmwf_ifs025",
-                "GFS": "gfs_seamless",
-                "ICON": "icon_seamless",
-                "GEM": "gem_seamless",
-            }
-            if not is_us:
-                model_suffixes.pop("HRRR", None)
-            if in_conus and any(
-                v is not None for v in (hourly_raw.get("temperature_2m_ncep_nbm_conus") or [])
-            ):
-                model_suffixes["NBM"] = "ncep_nbm_conus"
+            if settings.zus_accuracy_v2:
+                model_suffixes: Dict[str, str] = {
+                    "ECMWF": "ecmwf_ifs025",
+                    "GFS": "gfs_global",
+                    "ICON": "icon_seamless",
+                    "GEM": "gem_seamless",
+                }
+                if any(v is not None for v in (hourly_raw.get("temperature_2m_ecmwf_aifs025_single") or [])):
+                    model_suffixes["AIFS"] = "ecmwf_aifs025_single"
+                if in_conus and any(v is not None for v in (hourly_raw.get("temperature_2m_gfs_hrrr") or [])):
+                    model_suffixes["HRRR"] = "gfs_hrrr"
+                if in_conus and any(v is not None for v in (hourly_raw.get("temperature_2m_ncep_nbm_conus") or [])):
+                    model_suffixes["NBM"] = "ncep_nbm_conus"
+            else:
+                model_suffixes = {
+                    "HRRR": "best_match",
+                    "ECMWF": "ecmwf_ifs025",
+                    "GFS": "gfs_seamless",
+                    "ICON": "icon_seamless",
+                    "GEM": "gem_seamless",
+                }
+                if not is_us:
+                    model_suffixes.pop("HRRR", None)
+                if in_conus and any(
+                    v is not None for v in (hourly_raw.get("temperature_2m_ncep_nbm_conus") or [])
+                ):
+                    model_suffixes["NBM"] = "ncep_nbm_conus"
 
             times_list = hourly_raw.get("time", [])
             current_hour_str = now.strftime("%Y-%m-%dT%H:00")
-            start_idx = 0
+            start_idx = max(0, len(times_list) - 1) if (settings.zus_accuracy_v2 and times_list) else 0
             for idx, t_str in enumerate(times_list):
                 if t_str >= current_hour_str:
                     start_idx = idx
@@ -1718,7 +1949,8 @@ class WeatherProviderService:
                 or []
             )
 
-            model_hourly_streams: Dict[str, List[Dict[str, Any]]] = {}
+            model_hourly_streams: Dict[str, List[Optional[Dict[str, Any]]]] = {}
+            base_hour_utc = now.replace(minute=0, second=0, microsecond=0)
             for m_name, suffix in model_suffixes.items():
                 t_arr = _raw_model_series(hourly_raw, "temperature_2m", suffix)
                 fl_arr = _raw_model_series(hourly_raw, "apparent_temperature", suffix)
@@ -1736,7 +1968,7 @@ class WeatherProviderService:
                 cape_arr = _raw_model_series(hourly_raw, "cape", suffix)
                 c_arr = _raw_model_series(hourly_raw, "weather_code", suffix)
 
-                stream: List[Dict[str, Any]] = []
+                stream: List[Optional[Dict[str, Any]]] = []
                 max_offsets = max(25, len(times_list) - start_idx)
                 for offset in range(max_offsets):
                     idx = start_idx + offset
@@ -1744,14 +1976,21 @@ class WeatherProviderService:
                         break
                     temp_val = t_arr[idx]
                     if temp_val is None:
+                        if settings.zus_accuracy_v2:
+                            stream.append(None)
                         continue
                     w_val = float(w_arr[idx]) if idx < len(w_arr) and w_arr[idx] is not None else 0.0
+                    pop_raw = (
+                        int(p_arr[idx])
+                        if (idx < len(p_arr) and p_arr[idx] is not None)
+                        else (None if settings.zus_accuracy_v2 else 0)
+                    )
                     stream.append(
                         {
-                            "time": now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=offset),
+                            "time": base_hour_utc + timedelta(hours=offset),
                             "temp_c": float(temp_val),
                             "feels_c": float(fl_arr[idx]) if idx < len(fl_arr) and fl_arr[idx] is not None else float(temp_val),
-                            "precip_prob": int(p_arr[idx]) if idx < len(p_arr) and p_arr[idx] is not None else 0,
+                            "precip_prob": pop_raw,
                             "precip_mm": float(pr_arr[idx]) if idx < len(pr_arr) and pr_arr[idx] is not None else 0.0,
                             "wind_kmh": w_val,
                             "wind_dir": float(wdir_arr[idx]) if idx < len(wdir_arr) and wdir_arr[idx] is not None else None,
@@ -1766,7 +2005,7 @@ class WeatherProviderService:
                             "wmo_code": int(c_arr[idx]) if idx < len(c_arr) and c_arr[idx] is not None else 0,
                         }
                     )
-                if stream:
+                if any(pt is not None for pt in stream):
                     model_hourly_streams[m_name] = stream
 
             # 3. Query cell RLS metadata, spatially blended weights, & today's observed temperature bounds in parallel
@@ -1804,11 +2043,28 @@ class WeatherProviderService:
             nwp_precip_now = any(
                 (
                     s[0].get("precip_mm", 0.0) >= 0.1
-                    or s[0].get("precip_prob", 0) >= 25
+                    or (s[0].get("precip_prob") or 0) >= 25
                     or s[0].get("wmo_code", 0) >= 51
                 )
                 for s in model_hourly_streams.values()
-                if s
+                if s and s[0] is not None
+            )
+            est_rh_now = calc_relative_humidity(est_temp_now, est_dewp_now)
+            est_wmo_now = (
+                int(station_composite["wx_wmo"])
+                if (station_composite and station_composite.get("wx_wmo"))
+                else int(current_raw.get("weather_code") or 0)
+            )
+            est_wx_now = station_composite.get("wx_string") if station_composite else None
+            est_pt_now = classify_precip_type(
+                temp_c=est_temp_now,
+                rh_pct=float(est_rh_now),
+                wmo_code=est_wmo_now,
+                metar_wx=est_wx_now,
+            )
+            est_cape_now = float(
+                current_raw.get("cape")
+                or (cape_hourly_arr[start_idx] if (start_idx < len(cape_hourly_arr) and cape_hourly_arr[start_idx] is not None) else 0.0)
             )
             doppler_telemetry = await doppler_service.get_point_telemetry(
                 latitude,
@@ -1820,11 +2076,13 @@ class WeatherProviderService:
                 station_checked=st_checked_now,
                 cloud_cover_low=est_cclow_now,
                 nwp_precip_active=nwp_precip_now,
+                precip_type=est_pt_now,
+                cape_jkg=est_cape_now,
             )
 
             # 4. Schedule or Run RLS Verification & Snapshot Persistence
             past_hourly_temps: Dict[datetime, float] = {}
-            if need_past_24h and start_idx > 0:
+            if not settings.zus_accuracy_v2 and need_past_24h and start_idx > 0:
                 best_past_arr = (
                     hourly_raw.get("temperature_2m_best_match")
                     or hourly_raw.get("temperature_2m_ecmwf_ifs025")
@@ -1860,6 +2118,10 @@ class WeatherProviderService:
                 if (doppler_telemetry and doppler_telemetry.inConusGrid)
                 else None
             )
+            obs_precip_checked = bool(
+                in_conus
+                or (station_composite and (station_composite.get("closest_distance_km") or 99.0) <= 25.0)
+            )
             ground_truth_precip_active = bool(
                 (station_composite and station_composite.get("wx_condition") is not None)
                 or (
@@ -1879,6 +2141,7 @@ class WeatherProviderService:
                     ground_truth_wind=ground_truth_wind,
                     ground_truth_precip_mmhr=ground_truth_precip_mmhr,
                     radar_raw_mmhr=radar_raw_mmhr,
+                    obs_precip_checked=obs_precip_checked,
                 )
                 db_weights = await db_manager.get_model_weights(cell_id, latitude, longitude)
             else:
@@ -1892,6 +2155,7 @@ class WeatherProviderService:
                         ground_truth_wind=ground_truth_wind,
                         ground_truth_precip_mmhr=ground_truth_precip_mmhr,
                         radar_raw_mmhr=radar_raw_mmhr,
+                        obs_precip_checked=obs_precip_checked,
                     )
                 )
                 self._bg_tasks.add(bg_task)
@@ -1911,15 +2175,25 @@ class WeatherProviderService:
             for w_row in db_weights:
                 m = w_row["model_name"]
                 if m in model_hourly_streams:
+                    brier_v = max(0.02, float(w_row.get("brier_precip") or 0.10))
+                    wind_mae_v = max(0.5, float(w_row.get("mae_wind_kmh") or 3.5))
+                    if w_row.get("weight_precip") is None:
+                        w_row["weight_precip"] = 1.0 / ((0.04 + brier_v) ** 1.5)
+                    if w_row.get("weight_wind") is None:
+                        w_row["weight_wind"] = 1.0 / ((1.0 + wind_mae_v) ** 1.5)
                     weights_map[m] = w_row
                     b0 = float(w_row.get("bias_temp_c") or 0.0)
                     bsin = float(w_row.get("bias_sin_c") or 0.0)
                     bcos = float(w_row.get("bias_cos_c") or 0.0)
                     diurnal_now = round(eval_diurnal_bias(b0, bsin, bcos, now.hour), 2)
-                    m_stream0 = model_hourly_streams[m][0] if model_hourly_streams[m] else None
+                    m_stream0 = next((pt for pt in model_hourly_streams[m] if pt is not None), None)
                     m_wind_bias = float(w_row.get("bias_wind_kmh") or 0.0) * 0.4
                     m_cur_temp = round(float(m_stream0["temp_c"]) - diurnal_now, 1) if m_stream0 else None
-                    m_cur_pop = int(m_stream0.get("precip_prob", 0)) if m_stream0 else None
+                    m_cur_pop = (
+                        int(m_stream0["precip_prob"])
+                        if (m_stream0 and m_stream0.get("precip_prob") is not None)
+                        else None
+                    )
                     m_cur_wind = round(max(0.0, float(m_stream0.get("wind_kmh", 0.0)) - m_wind_bias), 1) if m_stream0 else None
                     model_weight_details.append(
                         ModelWeightDetail(
@@ -1932,8 +2206,8 @@ class WeatherProviderService:
                             maeCelsius=round(float(w_row["mae_temp_c"]), 2),
                             biasCelsius=round(b0, 2),
                             diurnalBiasNowCelsius=diurnal_now,
-                            maeWindKmh=round(float(w_row.get("mae_wind_kmh") or 3.5), 2),
-                            brierPrecip=round(float(w_row.get("brier_precip") or 0.10), 3),
+                            maeWindKmh=round(wind_mae_v, 2),
+                            brierPrecip=round(brier_v, 3),
                             samplesVerified=int(w_row["samples_verified"]),
                             currentTempCelsius=m_cur_temp,
                             currentPrecipProb=m_cur_pop,
@@ -1944,12 +2218,14 @@ class WeatherProviderService:
             if not weights_map:
                 equal_w = round(1.0 / max(1, len(model_hourly_streams)), 3)
                 for m in model_hourly_streams:
-                    m_stream0 = model_hourly_streams[m][0] if model_hourly_streams[m] else None
+                    m_stream0 = next((pt for pt in model_hourly_streams[m] if pt is not None), None)
                     weights_map[m] = {
                         "dynamic_weight": equal_w,
                         "weight_short": equal_w,
                         "weight_med": equal_w,
                         "weight_ext": equal_w,
+                        "weight_precip": equal_w,
+                        "weight_wind": equal_w,
                         "bias_temp_c": 0.0,
                         "bias_sin_c": 0.0,
                         "bias_cos_c": 0.0,
@@ -1964,13 +2240,19 @@ class WeatherProviderService:
                             weightShort=equal_w,
                             weightMed=equal_w,
                             weightExt=equal_w,
+                            weightPrecip=equal_w,
+                            weightWind=equal_w,
                             accuracyPercent=94.0,
                             maeCelsius=1.0,
                             biasCelsius=0.0,
                             diurnalBiasNowCelsius=0.0,
                             samplesVerified=1,
                             currentTempCelsius=round(float(m_stream0["temp_c"]), 1) if m_stream0 else None,
-                            currentPrecipProb=int(m_stream0.get("precip_prob", 0)) if m_stream0 else None,
+                            currentPrecipProb=(
+                                int(m_stream0["precip_prob"])
+                                if (m_stream0 and m_stream0.get("precip_prob") is not None)
+                                else None
+                            ),
                             currentWindKmh=round(float(m_stream0.get("wind_kmh", 0.0)), 1) if m_stream0 else None,
                         )
                     )
@@ -1980,10 +2262,17 @@ class WeatherProviderService:
                 ("weight_short", "norm_short"),
                 ("weight_med", "norm_med"),
                 ("weight_ext", "norm_ext"),
+                ("weight_precip", "norm_precip"),
+                ("weight_wind", "norm_wind"),
             ):
                 b_sum = sum(float(weights_map[m].get(bucket_key) or weights_map[m]["dynamic_weight"]) for m in weights_map) or 1.0
                 for m in weights_map:
                     weights_map[m][norm_key] = float(weights_map[m].get(bucket_key) or weights_map[m]["dynamic_weight"]) / b_sum
+
+            for mwd in model_weight_details:
+                if mwd.modelName in weights_map:
+                    mwd.weightPrecip = round(float(weights_map[mwd.modelName]["norm_precip"]), 3)
+                    mwd.weightWind = round(float(weights_map[mwd.modelName]["norm_wind"]), 3)
 
             # Cap secondary global models in extended range when primary extended guidance is present
             if len(weights_map) >= 4 and ("ECMWF" in weights_map or "NBM" in weights_map):
@@ -2008,9 +2297,12 @@ class WeatherProviderService:
                 blended_t = 0.0
                 blended_fl = 0.0
                 blended_p = 0.0
+                pop_w_total = 0.0
                 blended_pr_mm = 0.0
+                qpf_w_total = 0.0
                 blended_wind = 0.0
                 blended_gust = 0.0
+                wind_w_total = 0.0
                 blended_wdir_sin = 0.0
                 blended_wdir_cos = 0.0
                 wdir_w_total = 0.0
@@ -2044,13 +2336,19 @@ class WeatherProviderService:
                 top_w = -1.0
                 top_wet_code = 0
                 top_wet_w = -1.0
-                dt = now + timedelta(hours=h_offset)
+                dt = (
+                    (base_hour_utc + timedelta(hours=h_offset))
+                    if settings.zus_accuracy_v2
+                    else (now + timedelta(hours=h_offset))
+                )
                 target_utc_hour = dt.hour
                 _, wind_bias_scale = calc_horizon_bias_scales(float(h_offset))
 
                 for m_name, stream in model_hourly_streams.items():
                     if h_offset < len(stream) and m_name in weights_map:
                         pt = stream[h_offset]
+                        if pt is None:
+                            continue
                         w_info = weights_map[m_name]
                         if h_offset <= 6:
                             w = w_info["norm_short"]
@@ -2063,6 +2361,10 @@ class WeatherProviderService:
                         else:
                             w = w_info["norm_ext"]
 
+                        w_pop = w_info["norm_precip"] if settings.zus_accuracy_v2 else w
+                        w_qpf = (0.5 * w + 0.5 * w_info["norm_precip"]) if settings.zus_accuracy_v2 else w
+                        w_wnd = (0.5 * w + 0.5 * w_info["norm_wind"]) if settings.zus_accuracy_v2 else w
+
                         bias = eval_decayed_diurnal_bias(
                             float(w_info.get("bias_temp_c") or 0.0),
                             float(w_info.get("bias_sin_c") or 0.0),
@@ -2073,8 +2375,13 @@ class WeatherProviderService:
                         wind_bias = float(w_info.get("bias_wind_kmh") or 0.0) * 0.4 * wind_bias_scale
                         bias_corrected_t = pt["temp_c"] - bias
                         bias_corrected_fl = pt.get("feels_c", pt["temp_c"]) - bias
-                        bias_corrected_dew = pt.get("dew_c", pt["temp_c"] - 4.0) - bias
-                        pop_val = int(pt["precip_prob"])
+                        raw_dew = pt.get("dew_c", pt["temp_c"] - 4.0)
+                        bias_corrected_dew = (
+                            min(bias_corrected_t, raw_dew - 0.45 * bias)
+                            if settings.zus_accuracy_v2
+                            else (raw_dew - bias)
+                        )
+                        pop_raw = pt.get("precip_prob")
                         pr_mm_val = float(pt.get("precip_mm", 0.0))
                         w_val = max(0.0, float(pt.get("wind_kmh", 0.0)) - wind_bias)
                         g_val = max(w_val, float(pt.get("gust_kmh", round(w_val * 1.3, 1))) - wind_bias)
@@ -2083,17 +2390,25 @@ class WeatherProviderService:
 
                         blended_t += bias_corrected_t * w
                         blended_fl += bias_corrected_fl * w
-                        blended_p += pop_val * w
-                        blended_pr_mm += pr_mm_val * w
-                        blended_wind += w_val * w
-                        blended_gust += g_val * w
+                        if pop_raw is not None:
+                            pop_int = int(pop_raw)
+                            blended_p += pop_int * w_pop
+                            pop_w_total += w_pop
+                            hour_pops.append(pop_int)
+                            entry_pop = pop_int
+                        else:
+                            entry_pop = int(min(90, round(pr_mm_val * 60.0))) if pr_mm_val > 0 else 0
+                        blended_pr_mm += pr_mm_val * w_qpf
+                        qpf_w_total += w_qpf
+                        blended_wind += w_val * w_wnd
+                        blended_gust += g_val * w_wnd
+                        wind_w_total += w_wnd
                         blended_dew += bias_corrected_dew * w
                         blended_cloud += c_val * w
                         total_w += w
 
                         hour_temps.append(bias_corrected_t)
                         hour_feels.append(bias_corrected_fl)
-                        hour_pops.append(pop_val)
                         hour_pr_mms.append(pr_mm_val)
                         hour_winds.append(w_val)
                         hour_gusts.append(g_val)
@@ -2101,12 +2416,12 @@ class WeatherProviderService:
                         hour_clouds.append(c_val)
                         hour_model_entries.append(
                             {
-                                "weight": w,
+                                "weight": w_qpf,
                                 "temp_c": bias_corrected_t,
                                 "dew_c": bias_corrected_dew,
                                 "rh_pct": pt.get("rh_pct"),
                                 "precip_mm": pr_mm_val,
-                                "precip_prob": pop_val,
+                                "precip_prob": entry_pop,
                                 "wmo_code": code,
                             }
                         )
@@ -2119,9 +2434,9 @@ class WeatherProviderService:
 
                         if pt.get("wind_dir") is not None:
                             wd_rad = math.radians(float(pt["wind_dir"]))
-                            blended_wdir_sin += math.sin(wd_rad) * w
-                            blended_wdir_cos += math.cos(wd_rad) * w
-                            wdir_w_total += w
+                            blended_wdir_sin += math.sin(wd_rad) * w_wnd
+                            blended_wdir_cos += math.cos(wd_rad) * w_wnd
+                            wdir_w_total += w_wnd
 
                         if pt.get("rh_pct") is not None:
                             blended_rh += float(pt["rh_pct"]) * w
@@ -2147,7 +2462,12 @@ class WeatherProviderService:
                             top_w = w
                             top_code = code
                         if code >= 51:
-                            eff_wet_w = w * (1.35 if m_name == "HRRR" else 1.0)
+                            hrrr_boost = (
+                                (1.25 if (m_name == "HRRR" and h_offset <= 18) else 1.0)
+                                if settings.zus_accuracy_v2
+                                else (1.35 if m_name == "HRRR" else 1.0)
+                            )
+                            eff_wet_w = w * hrrr_boost
                             wet_w += eff_wet_w
                             if eff_wet_w > top_wet_w:
                                 top_wet_w = eff_wet_w
@@ -2156,14 +2476,16 @@ class WeatherProviderService:
                 if total_w > 0:
                     final_h_temp = round(blended_t / total_w, 1)
                     final_h_feels = round(blended_fl / total_w, 1)
-                    final_h_precip = int(round(blended_p / total_w))
-                    final_h_pr_mm = round(blended_pr_mm / total_w, 2)
-                    final_h_wind = round(blended_wind / total_w, 1)
-                    final_h_gust = round(blended_gust / total_w, 1)
+                    final_h_precip = int(round(blended_p / pop_w_total)) if pop_w_total > 0 else 0
+                    final_h_pr_mm = round(blended_pr_mm / qpf_w_total, 2) if qpf_w_total > 0 else 0.0
+                    final_h_wind = round(blended_wind / wind_w_total, 1) if wind_w_total > 0 else 0.0
+                    final_h_gust = round(blended_gust / wind_w_total, 1) if wind_w_total > 0 else 0.0
                     final_h_dew = round(blended_dew / total_w, 1)
                     final_h_cloud = int(round(blended_cloud / total_w))
                     final_h_press = round(blended_press / press_w_total, 1) if press_w_total > 0 else 1013.2
                 else:
+                    if settings.zus_accuracy_v2:
+                        continue
                     final_h_temp, final_h_feels, final_h_precip, final_h_pr_mm, final_h_wind = 0.0, 0.0, 0, 0.0, 0.0
                     final_h_gust, final_h_dew, final_h_cloud, final_h_press = 0.0, 0.0, 0, 1013.2
 
@@ -2186,6 +2508,8 @@ class WeatherProviderService:
                     h_rh = int(round(0.65 * thermo_rh + 0.35 * model_rh))
                 else:
                     h_rh = thermo_rh
+                if settings.zus_accuracy_v2:
+                    final_h_feels = calc_apparent_temp_c(final_h_temp, float(h_rh), final_h_wind)
 
                 if cape_w_total > 0:
                     h_cape = round(blended_cape / cape_w_total, 1)
@@ -2359,8 +2683,10 @@ class WeatherProviderService:
             local_station_name: Optional[str] = None
             local_station_dist: Optional[float] = None
             local_station_wx: Optional[str] = None
+            station_in_range = bool(station_composite and station_composite["closest_distance_km"] <= 35.0)
+            station_weight = 0.0
 
-            if station_composite and station_composite["closest_distance_km"] <= 35.0:
+            if station_in_range:
                 dist = station_composite["closest_distance_km"]
                 station_weight = max(0.35, min(0.75, 1.0 - (dist / 50.0)))
                 final_current_temp = round(
@@ -2376,20 +2702,35 @@ class WeatherProviderService:
 
             temp_delta_now = round(final_current_temp - ensemble_current_temp, 2)
 
-            raw_dewp = (
-                station_composite["dewpoint_c"]
-                if (station_composite and station_composite.get("dewpoint_c") is not None)
-                else (
-                    hourly_models[0].dewPoint
-                    if (hourly_models and hourly_models[0].dewPoint is not None)
-                    else (final_current_temp - 5.0)
-                )
+            ens_dewp = (
+                float(hourly_models[0].dewPoint)
+                if (hourly_models and hourly_models[0].dewPoint is not None)
+                else (final_current_temp - 5.0)
             )
-            dewpoint_c = round(float(raw_dewp), 1)
+            if settings.zus_accuracy_v2:
+                if station_in_range and station_composite.get("dewpoint_c") is not None:
+                    dewpoint_c = round(
+                        min(
+                            final_current_temp,
+                            float(station_composite["dewpoint_c"]) * station_weight
+                            + ens_dewp * (1.0 - station_weight),
+                        ),
+                        1,
+                    )
+                else:
+                    dewpoint_c = round(min(final_current_temp, ens_dewp), 1)
+            else:
+                raw_dewp = (
+                    station_composite["dewpoint_c"]
+                    if (station_composite and station_composite.get("dewpoint_c") is not None)
+                    else ens_dewp
+                )
+                dewpoint_c = round(float(raw_dewp), 1)
+            dewp_delta_now = round(dewpoint_c - ens_dewp, 2)
             comfort_label = classify_dewpoint_comfort(dewpoint_c)
 
             min_curr_doppler_dbz = 24.0 if (st_checked_now and not st_wet_now) else 18.0
-            if station_composite and station_composite.get("wx_condition") is not None:
+            if station_in_range and station_composite.get("wx_condition") is not None:
                 current_condition = station_composite["wx_condition"]
                 observed_wmo = int(station_composite.get("wx_wmo") or 61)
             elif (
@@ -2422,50 +2763,105 @@ class WeatherProviderService:
             top_models = [m.modelName for m in model_weight_details[:2]]
             dominant_str = " + ".join(top_models) + " Blend" if top_models else "Multi-Model Blend"
 
-            msl_pressure = (
-                (station_composite and station_composite.get("pressure_hpa"))
-                or (hourly_models[0].pressure if hourly_models and hourly_models[0].pressure is not None else None)
+            ens_press = float(
+                (hourly_models[0].pressure if hourly_models and hourly_models[0].pressure is not None else None)
                 or current_raw.get("pressure_msl")
                 or 1013.25
             )
-
-            wind_speed_kmh = float(
-                (station_composite and station_composite.get("wind_kmh"))
-                if (station_composite and station_composite.get("wind_kmh") is not None)
-                else (
-                    hourly_models[0].windSpeed
-                    if hourly_models
-                    else (current_raw.get("wind_speed_10m") or 0.0)
-                )
+            ens_wind = float(
+                hourly_models[0].windSpeed
+                if hourly_models
+                else (current_raw.get("wind_speed_10m") or 0.0)
             )
-            wind_gust_kmh = float(
-                (station_composite and station_composite.get("gust_kmh"))
-                if (station_composite and station_composite.get("gust_kmh") is not None)
-                else (
-                    hourly_models[0].windGusts
-                    if (hourly_models and hourly_models[0].windGusts is not None)
-                    else round(wind_speed_kmh * 1.25, 1)
-                )
+            ens_gust = float(
+                hourly_models[0].windGusts
+                if (hourly_models and hourly_models[0].windGusts is not None)
+                else round(ens_wind * 1.25, 1)
             )
-            wind_dir_deg = int(
-                (station_composite and station_composite.get("wind_dir"))
-                if (station_composite and station_composite.get("wind_dir") is not None)
-                else (
-                    hourly_models[0].windDirection
-                    if (hourly_models and hourly_models[0].windDirection is not None)
-                    else 180
-                )
+            ens_wdir = int(
+                hourly_models[0].windDirection
+                if (hourly_models and hourly_models[0].windDirection is not None)
+                else 180
+            )
+            ens_vis = float(
+                hourly_models[0].visibilityKm
+                if (hourly_models and hourly_models[0].visibilityKm is not None)
+                else 16.0
             )
 
-            visibility_km = float(
-                (station_composite and station_composite.get("visibility_km"))
-                if (station_composite and station_composite.get("visibility_km") is not None)
-                else (
-                    hourly_models[0].visibilityKm
-                    if (hourly_models and hourly_models[0].visibilityKm is not None)
-                    else 16.0
+            if settings.zus_accuracy_v2:
+                wind_w = 0.70 * station_weight if station_in_range else 0.0
+                if station_in_range and station_composite.get("pressure_hpa") is not None:
+                    msl_pressure = round(
+                        float(station_composite["pressure_hpa"]) * station_weight
+                        + ens_press * (1.0 - station_weight),
+                        1,
+                    )
+                else:
+                    msl_pressure = round(ens_press, 1)
+
+                if station_in_range and station_composite.get("wind_kmh") is not None:
+                    wind_speed_kmh = round(
+                        float(station_composite["wind_kmh"]) * wind_w + ens_wind * (1.0 - wind_w),
+                        1,
+                    )
+                else:
+                    wind_speed_kmh = round(ens_wind, 1)
+
+                if station_in_range and station_composite.get("gust_kmh") is not None:
+                    wind_gust_kmh = round(
+                        max(
+                            wind_speed_kmh,
+                            float(station_composite["gust_kmh"]) * wind_w + ens_gust * (1.0 - wind_w),
+                        ),
+                        1,
+                    )
+                else:
+                    wind_gust_kmh = round(max(wind_speed_kmh, ens_gust), 1)
+
+                if station_in_range and station_composite.get("wind_dir") is not None:
+                    s_rad = math.radians(float(station_composite["wind_dir"]))
+                    e_rad = math.radians(float(ens_wdir))
+                    w_sin = math.sin(s_rad) * wind_w + math.sin(e_rad) * (1.0 - wind_w)
+                    w_cos = math.cos(s_rad) * wind_w + math.cos(e_rad) * (1.0 - wind_w)
+                    wind_dir_deg = int(round(math.degrees(math.atan2(w_sin, w_cos)))) % 360
+                else:
+                    wind_dir_deg = ens_wdir
+
+                if station_in_range and station_composite.get("visibility_km") is not None:
+                    visibility_km = round(
+                        float(station_composite["visibility_km"]) * station_weight
+                        + ens_vis * (1.0 - station_weight),
+                        1,
+                    )
+                else:
+                    visibility_km = round(ens_vis, 1)
+            else:
+                msl_pressure = (
+                    (station_composite and station_composite.get("pressure_hpa"))
+                    or ens_press
                 )
-            )
+                wind_speed_kmh = float(
+                    (station_composite and station_composite.get("wind_kmh"))
+                    if (station_composite and station_composite.get("wind_kmh") is not None)
+                    else ens_wind
+                )
+                wind_gust_kmh = float(
+                    (station_composite and station_composite.get("gust_kmh"))
+                    if (station_composite and station_composite.get("gust_kmh") is not None)
+                    else ens_gust
+                )
+                wind_dir_deg = int(
+                    (station_composite and station_composite.get("wind_dir"))
+                    if (station_composite and station_composite.get("wind_dir") is not None)
+                    else ens_wdir
+                )
+                visibility_km = float(
+                    (station_composite and station_composite.get("visibility_km"))
+                    if (station_composite and station_composite.get("visibility_km") is not None)
+                    else ens_vis
+                )
+            wind_delta_now = round(wind_speed_kmh - ens_wind, 2)
 
             cloud_cover_pct = int(
                 hourly_models[0].cloudCover
@@ -2481,16 +2877,9 @@ class WeatherProviderService:
                 max(
                     nowcast_obj.points[0].precipIntensityMmHr if nowcast_obj.points else 0.0,
                     doppler_telemetry.precipRateMmHr if doppler_telemetry else 0.0,
-                    float(station_composite.get("precip_mmhr") or 0.0) if station_composite else 0.0,
+                    float(station_composite.get("precip_mmhr") or 0.0) if (station_in_range and station_composite) else 0.0,
                 )
             )
-
-            base_feels = (
-                hourly_models[0].feelsLike
-                if (hourly_models and hourly_models[0].feelsLike is not None)
-                else final_current_temp
-            )
-            final_current_feels = round(float(base_feels) + temp_delta_now, 1)
 
             curr_cape = float(
                 hourly_models[0].capeJkg
@@ -2503,15 +2892,43 @@ class WeatherProviderService:
                 else 2.0
             )
 
-            curr_hum = int(
-                (station_composite and station_composite.get("humidity"))
-                if (station_composite and station_composite.get("humidity") is not None)
-                else (
-                    hourly_models[0].humidity
-                    if (hourly_models and hourly_models[0].humidity is not None)
-                    else calc_relative_humidity(final_current_temp, dewpoint_c)
+            thermo_rh_now = calc_relative_humidity(final_current_temp, dewpoint_c)
+            if settings.zus_accuracy_v2:
+                if station_in_range and station_composite.get("humidity") is not None:
+                    curr_hum = int(
+                        max(
+                            5,
+                            min(
+                                100,
+                                round(
+                                    float(station_composite["humidity"]) * station_weight
+                                    + thermo_rh_now * (1.0 - station_weight)
+                                ),
+                            ),
+                        )
+                    )
+                else:
+                    curr_hum = thermo_rh_now
+                final_current_feels = calc_apparent_temp_c(
+                    final_current_temp, float(curr_hum), wind_speed_kmh
                 )
-            )
+            else:
+                curr_hum = int(
+                    (station_composite and station_composite.get("humidity"))
+                    if (station_composite and station_composite.get("humidity") is not None)
+                    else (
+                        hourly_models[0].humidity
+                        if (hourly_models and hourly_models[0].humidity is not None)
+                        else thermo_rh_now
+                    )
+                )
+                base_feels = (
+                    hourly_models[0].feelsLike
+                    if (hourly_models and hourly_models[0].feelsLike is not None)
+                    else final_current_temp
+                )
+                final_current_feels = round(float(base_feels) + temp_delta_now, 1)
+
             curr_wb = calc_wet_bulb_c(final_current_temp, float(curr_hum))
             curr_pt = classify_precip_type(
                 temp_c=final_current_temp,
@@ -2521,7 +2938,7 @@ class WeatherProviderService:
                 metar_wx=local_station_wx,
             )
 
-            # Anchor hourly[0] ("NOW") to assimilated current state and smoothly decay station delta into +1h/+2h
+            # Anchor hourly[0] ("NOW") to assimilated current state and smoothly decay station innovations into +1h..+3h
             if hourly_models:
                 h0 = hourly_models[0]
                 h0.temperature = final_current_temp
@@ -2543,18 +2960,51 @@ class WeatherProviderService:
                 h0.wetBulbTemperature = curr_wb
                 h0.precipType = curr_pt
 
-                if abs(temp_delta_now) >= 0.1:
-                    for decay_idx, decay_factor in ((1, 0.55), (2, 0.25)):
-                        if decay_idx < len(hourly_models):
-                            hk = hourly_models[decay_idx]
+                decay_schedule = ((1, 0.55), (2, 0.25), (3, 0.10)) if settings.zus_accuracy_v2 else ((1, 0.55), (2, 0.25))
+                for decay_idx, decay_factor in decay_schedule:
+                    if decay_idx < len(hourly_models):
+                        hk = hourly_models[decay_idx]
+                        if abs(temp_delta_now) >= 0.1:
                             adj_delta = round(temp_delta_now * decay_factor, 1)
                             hk.temperature = round(hk.temperature + adj_delta, 1)
-                            if hk.feelsLike is not None:
-                                hk.feelsLike = round(hk.feelsLike + adj_delta, 1)
                             if hk.tempMin is not None:
                                 hk.tempMin = min(hk.tempMin, hk.temperature)
                             if hk.tempMax is not None:
                                 hk.tempMax = max(hk.tempMax, hk.temperature)
+                        if settings.zus_accuracy_v2:
+                            if abs(dewp_delta_now) >= 0.1 and hk.dewPoint is not None:
+                                hk.dewPoint = round(min(hk.temperature, hk.dewPoint + dewp_delta_now * decay_factor), 1)
+                            if abs(wind_delta_now) >= 0.3:
+                                hk.windSpeed = round(max(0.0, hk.windSpeed + wind_delta_now * decay_factor), 1)
+                            if hk.dewPoint is not None:
+                                hk.humidity = calc_relative_humidity(hk.temperature, hk.dewPoint)
+                            hk.feelsLike = calc_apparent_temp_c(
+                                hk.temperature,
+                                float(hk.humidity if hk.humidity is not None else 55),
+                                hk.windSpeed,
+                            )
+                        elif abs(temp_delta_now) >= 0.1 and hk.feelsLike is not None:
+                            hk.feelsLike = round(hk.feelsLike + round(temp_delta_now * decay_factor, 1), 1)
+
+            if settings.zus_accuracy_v2 and hourly_models:
+                consensus_hours = [
+                    {
+                        "time": hm.time,
+                        "temp_c": hm.temperature,
+                        "precip_prob": hm.precipitationChance,
+                        "wind_kmh": hm.windSpeed,
+                        "wmo_code": hm.wmoCode,
+                    }
+                    for hm in hourly_models
+                ]
+                if sync_verify:
+                    await db_manager.archive_consensus_snapshots(cell_id, consensus_hours)
+                else:
+                    cons_task = asyncio.create_task(
+                        db_manager.archive_consensus_snapshots(cell_id, consensus_hours)
+                    )
+                    self._bg_tasks.add(cons_task)
+                    cons_task.add_done_callback(self._bg_tasks.discard)
 
             # 8. Compute Multi-Model Daily Blend (10 Days) Reconciled with RLS Hourly Slices
             daily_times = daily_raw.get("time", [])
@@ -2624,8 +3074,11 @@ class WeatherProviderService:
                 min_t_blend = 0.0
                 max_t_blend = 0.0
                 precip_blend = 0.0
+                d_pop_w_total = 0.0
                 psum_blend = 0.0
+                d_qpf_w_total = 0.0
                 wmax_blend = 0.0
+                d_wind_w_total = 0.0
                 w_total = 0.0
                 wet_day_w = 0.0
                 mod_wet_w = 0.0
@@ -2646,6 +3099,10 @@ class WeatherProviderService:
                         w = 0.5 * w_info["norm_med"] + 0.5 * w_info["norm_ext"]
                     else:
                         w = w_info["norm_ext"]
+
+                    w_pop = w_info["norm_precip"] if settings.zus_accuracy_v2 else w
+                    w_qpf = (0.5 * w + 0.5 * w_info["norm_precip"]) if settings.zus_accuracy_v2 else w
+                    w_wnd = (0.5 * w + 0.5 * w_info["norm_wind"]) if settings.zus_accuracy_v2 else w
 
                     b0 = float(w_info.get("bias_temp_c") or 0.0)
                     bsin = float(w_info.get("bias_sin_c") or 0.0)
@@ -2686,9 +3143,15 @@ class WeatherProviderService:
                             if ri < len(h_c_arr) and h_c_arr[ri] is not None
                         ]
                         m_psum = sum(pr_vals) if pr_vals else 0.0
-                        precip_blend += (max(pop_vals) if pop_vals else 0.0) * w
-                        psum_blend += m_psum * w
-                        wmax_blend += (max(w_vals) if w_vals else 12.0) * w
+                        if pop_vals:
+                            precip_blend += max(pop_vals) * w_pop
+                            d_pop_w_total += w_pop
+                        elif not settings.zus_accuracy_v2:
+                            d_pop_w_total += w
+                        psum_blend += m_psum * w_qpf
+                        d_qpf_w_total += w_qpf
+                        wmax_blend += (max(w_vals) if w_vals else 12.0) * w_wnd
+                        d_wind_w_total += w_wnd
                         w_total += w
                         if m_psum >= 1.0:
                             wet_day_w += w
@@ -2723,12 +3186,19 @@ class WeatherProviderService:
                     ):
                         max_t_blend += (float(d_max_arr[raw_d_idx]) - bias_max) * w
                         min_t_blend += (float(d_min_arr[raw_d_idx]) - bias_min) * w
-                        pop_val = float(d_pop_arr[raw_d_idx]) if raw_d_idx < len(d_pop_arr) and d_pop_arr[raw_d_idx] is not None else 0.0
+                        has_d_pop = raw_d_idx < len(d_pop_arr) and d_pop_arr[raw_d_idx] is not None
+                        pop_val = float(d_pop_arr[raw_d_idx]) if has_d_pop else 0.0
                         psum_val = float(d_psum_arr[raw_d_idx]) if raw_d_idx < len(d_psum_arr) and d_psum_arr[raw_d_idx] is not None else 0.0
                         wmax_val = float(d_wmax_arr[raw_d_idx]) if raw_d_idx < len(d_wmax_arr) and d_wmax_arr[raw_d_idx] is not None else 12.0
-                        precip_blend += pop_val * w
-                        psum_blend += psum_val * w
-                        wmax_blend += wmax_val * w
+                        if has_d_pop:
+                            precip_blend += pop_val * w_pop
+                            d_pop_w_total += w_pop
+                        elif not settings.zus_accuracy_v2:
+                            d_pop_w_total += w
+                        psum_blend += psum_val * w_qpf
+                        d_qpf_w_total += w_qpf
+                        wmax_blend += wmax_val * w_wnd
+                        d_wind_w_total += w_wnd
                         w_total += w
                         if psum_val >= 1.0:
                             wet_day_w += w
@@ -2742,15 +3212,15 @@ class WeatherProviderService:
                 if w_total > 0:
                     d_min = round(min_t_blend / w_total, 1)
                     d_max = round(max_t_blend / w_total, 1)
-                    base_d_pop = precip_blend / w_total
+                    base_d_pop = (precip_blend / d_pop_w_total) if d_pop_w_total > 0 else 0.0
                     agree_frac = wet_day_w / w_total
                     mod_agree_frac = mod_wet_w / w_total
                     if agree_frac >= 0.60 and base_d_pop >= 25.0:
                         d_pop = int(min(90, round(base_d_pop + 22.0 * (agree_frac - 0.45) + 12.0 * mod_agree_frac)))
                     else:
                         d_pop = int(round(base_d_pop))
-                    d_psum = round(psum_blend / w_total, 2)
-                    d_wmax = round(wmax_blend / w_total, 1)
+                    d_psum = round(psum_blend / d_qpf_w_total, 2) if d_qpf_w_total > 0 else 0.0
+                    d_wmax = round(wmax_blend / d_wind_w_total, 1) if d_wind_w_total > 0 else 10.0
                 else:
                     d_min, d_max, d_pop, d_psum, d_wmax = 0.0, 0.0, 0, 0.0, 10.0
 
@@ -2799,11 +3269,16 @@ class WeatherProviderService:
                     if abs(sin_sum) > 1e-6 or abs(cos_sum) > 1e-6:
                         d_wdir = int(round(math.degrees(math.atan2(sin_sum, cos_sum)))) % 360
 
+                    eff_d_psum = (
+                        round(sum(float(h.precipMm or 0.0) for h in day_slice), 2)
+                        if (settings.zus_accuracy_v2 and d_idx == 0)
+                        else d_psum
+                    )
                     day_code, d_pt, d_snow_accum, d_slr = reconcile_daily_condition_and_snow(
                         day_slice=day_slice,
                         d_idx=d_idx,
                         d_pop=d_pop,
-                        d_psum=d_psum,
+                        d_psum=eff_d_psum,
                         d_min=d_min,
                         d_max=d_max,
                         initial_day_code=day_code,
@@ -2916,8 +3391,14 @@ class WeatherProviderService:
                 )
             )
 
+            effective_city_name = city_name
+            if self._is_generic_city_name(city_name):
+                prev_entry = self._cache.get(key)
+                if prev_entry and not self._is_generic_city_name(prev_entry["data"].current.cityName):
+                    effective_city_name = prev_entry["data"].current.cityName
+
             current_model = WeatherDataModel(
-                cityName=city_name,
+                cityName=effective_city_name,
                 temperature=final_current_temp,
                 feelsLike=final_current_feels,
                 condition=current_condition,
@@ -2983,6 +3464,9 @@ class WeatherProviderService:
             self._cache[key] = {
                 "cached_at": now,
                 "data": result,
+                "raw_m15": raw_data.get("minutely_15", {}),
+                "station_composite": station_composite,
+                "radar_zr_factor": float(rls_meta.get("radar_zr_factor") or 1.0),
             }
             while len(self._cache) > self._max_cache_entries:
                 self._cache.popitem(last=False)

@@ -22,6 +22,10 @@ def _kmh_to_unit(val: Optional[float], unit_mode: str) -> Optional[float]:
     return val
 
 
+def _convert_or_keep(converted: Optional[float], fallback: float) -> float:
+    return converted if converted is not None else fallback
+
+
 def _apply_weather_transforms(
     resp: WeatherResponse,
     units: str,
@@ -56,18 +60,18 @@ def _apply_weather_transforms(
         is_us = unit_mode in ("imperial", "us")
         c = data.current
         if is_us:
-            c.temperature = _c_to_f(c.temperature) or c.temperature
-            c.feelsLike = _c_to_f(c.feelsLike) or c.feelsLike
-            c.tempMin = _c_to_f(c.tempMin) or c.tempMin
-            c.tempMax = _c_to_f(c.tempMax) or c.tempMax
+            c.temperature = _convert_or_keep(_c_to_f(c.temperature), c.temperature)
+            c.feelsLike = _convert_or_keep(_c_to_f(c.feelsLike), c.feelsLike)
+            c.tempMin = _convert_or_keep(_c_to_f(c.tempMin), c.tempMin)
+            c.tempMax = _convert_or_keep(_c_to_f(c.tempMax), c.tempMax)
             c.dewPoint = _c_to_f(c.dewPoint)
             c.visibility = round(c.visibility * 0.621371, 1)
-        c.windSpeed = _kmh_to_unit(c.windSpeed, unit_mode) or 0.0
+        c.windSpeed = _convert_or_keep(_kmh_to_unit(c.windSpeed, unit_mode), 0.0)
         c.windGust = _kmh_to_unit(c.windGust, unit_mode)
 
         for h in data.hourly:
             if is_us:
-                h.temperature = _c_to_f(h.temperature) or h.temperature
+                h.temperature = _convert_or_keep(_c_to_f(h.temperature), h.temperature)
                 h.tempMin = _c_to_f(h.tempMin)
                 h.tempMax = _c_to_f(h.tempMax)
                 h.feelsLike = _c_to_f(h.feelsLike)
@@ -78,7 +82,7 @@ def _apply_weather_transforms(
                 h.dewMax = _c_to_f(h.dewMax)
                 if h.visibilityKm is not None:
                     h.visibilityKm = round(h.visibilityKm * 0.621371, 2)
-            h.windSpeed = _kmh_to_unit(h.windSpeed, unit_mode) or 0.0
+            h.windSpeed = _convert_or_keep(_kmh_to_unit(h.windSpeed, unit_mode), 0.0)
             h.windMin = _kmh_to_unit(h.windMin, unit_mode)
             h.windMax = _kmh_to_unit(h.windMax, unit_mode)
             h.windGusts = _kmh_to_unit(h.windGusts, unit_mode)
@@ -87,9 +91,9 @@ def _apply_weather_transforms(
 
         for d in data.daily:
             if is_us:
-                d.minTemperature = _c_to_f(d.minTemperature) or d.minTemperature
-                d.maxTemperature = _c_to_f(d.maxTemperature) or d.maxTemperature
-            d.windSpeedMax = _kmh_to_unit(d.windSpeedMax, unit_mode) or 0.0
+                d.minTemperature = _convert_or_keep(_c_to_f(d.minTemperature), d.minTemperature)
+                d.maxTemperature = _convert_or_keep(_c_to_f(d.maxTemperature), d.maxTemperature)
+            d.windSpeedMax = _convert_or_keep(_kmh_to_unit(d.windSpeedMax, unit_mode), 0.0)
 
     return data
 

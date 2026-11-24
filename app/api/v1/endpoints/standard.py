@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from fastapi import APIRouter, Path, Query, Request, Response, HTTPException
 
+from app.config import settings
 from app.models.weather import WeatherCondition, WeatherResponse
 from app.services.weather_provider import weather_service
 from app.services.doppler_service import doppler_service
@@ -39,16 +40,22 @@ def _parse_iso_to_ts(iso_str: Optional[str], default_ts: int) -> int:
         return default_ts
 
 
-def _is_daytime_ts(ts: int, sunrise_ts: int, sunset_ts: int) -> bool:
-    if sunset_ts > sunrise_ts:
-        # Compare time-of-day modulo 86400 so hourly timestamps across days check against solar window
-        tod = ts % 86400
-        sr_tod = sunrise_ts % 86400
-        ss_tod = sunset_ts % 86400
+def _is_daytime_ts(ts: int, sunrise_ts: int, sunset_ts: int, utc_offset_seconds: int = 0) -> bool:
+    tod = ts % 86400
+    sr_tod = sunrise_ts % 86400
+    ss_tod = sunset_ts % 86400
+    if sr_tod != ss_tod:
         if sr_tod < ss_tod:
             return sr_tod <= tod <= ss_tod
         return tod >= sr_tod or tod <= ss_tod
-    return 6 <= ((ts // 3600) % 24) <= 18
+    local_hour = ((ts + utc_offset_seconds) // 3600) % 24
+    return 6 <= local_hour <= 18
+
+
+def _daily_local_date(d_dt: datetime, tz_delta: timedelta):
+    if d_dt.hour == 12 and d_dt.minute == 0 and d_dt.second == 0:
+        return d_dt.date()
+    return (d_dt + tz_delta).date()
 
 
 def _darksky_icon(
@@ -198,11 +205,16 @@ async def _build_darksky_payload(
     w_resp = await weather_service.get_forecast(
         latitude=lat,
         longitude=lon,
-        city_name=f"{lat:.3f},{lon:.3f}",
+        city_name="Unknown Location",
     )
     dop = w_resp.dopplerTelemetry
     cur = w_resp.current
     now_ts = int(cur.timestamp.timestamp())
+    minutely_base_ts = (
+        int(datetime.now(timezone.utc).replace(second=0, microsecond=0).timestamp())
+        if settings.zus_accuracy_v2
+        else now_ts
+    )
 
     # Today's sunrise/sunset timestamps for accurate day/night icon selection
     sr_today_ts = (
@@ -215,7 +227,7 @@ async def _build_darksky_payload(
         if w_resp.daily
         else now_ts + 6 * 3600
     )
-    is_day_now = _is_daytime_ts(now_ts, sr_today_ts, ss_today_ts)
+    is_day_now = _is_daytime_ts(now_ts, sr_today_ts, ss_today_ts, w_resp.utcOffsetSeconds)
 
     rates_61 = _extract_61_minutely_rates(w_resp)
     minutely_data: List[Dict[str, Any]] = []
@@ -223,9 +235,23 @@ async def _build_darksky_payload(
     h0 = w_resp.hourly[0] if w_resp.hourly else None
     ens_spread = max(0.05, float((h0.precipMmMax if h0 and h0.precipMmMax is not None else 0.2) - (h0.precipMmMin if h0 and h0.precipMmMin is not None else 0.0)))
     base_err_frac = max(0.12, min(0.45, ens_spread / max(0.5, float(h0.precipMm if h0 else 1.0))))
+    use_cone_probs = bool(
+        settings.zus_accuracy_v2
+        and dop
+        and dop.inConusGrid
+        and len(dop.minuteProbabilities60m) >= 61
+    )
+    use_cone_errs = bool(
+        settings.zus_accuracy_v2
+        and dop
+        and dop.inConusGrid
+        and len(dop.minuteIntensityErrors60m) >= 61
+    )
 
     for minute, mmhr in enumerate(rates_61):
-        if mmhr >= 0.10:
+        if use_cone_probs:
+            prob = round(max(0.0, min(1.0, float(dop.minuteProbabilities60m[minute]))), 2)
+        elif mmhr >= 0.10:
             prob = min(1.0, round(0.80 + 0.20 * (1.0 - math.exp(-(mmhr - 0.10) / 1.5)), 2))
         elif mmhr >= 0.05:
             prob = round(0.50 + ((mmhr - 0.05) / 0.05) * 0.30, 2)
@@ -233,13 +259,16 @@ async def _build_darksky_payload(
             prob = 0.0
 
         pt_dict: Dict[str, Any] = {
-            "time": now_ts + (minute * 60),
+            "time": minutely_base_ts + (minute * 60),
             "precipIntensity": _convert_precip_rate(mmhr, units_norm),
             "precipProbability": prob,
         }
         if mmhr > 0.05:
-            cone_growth = (minute / 60.0) * 0.20
-            err_val = mmhr * (base_err_frac + cone_growth)
+            if use_cone_errs:
+                err_val = max(0.01, float(dop.minuteIntensityErrors60m[minute]))
+            else:
+                cone_growth = (minute / 60.0) * 0.20
+                err_val = mmhr * (base_err_frac + cone_growth)
             pt_dict["precipIntensityError"] = _convert_precip_rate(err_val, units_norm)
             pt_dict["precipType"] = curr_pt
         minutely_data.append(pt_dict)
@@ -308,9 +337,13 @@ async def _build_darksky_payload(
         target_hours = w_resp.hourly[:max_h_count]
         for h in target_hours:
             h_ts = int(h.time.timestamp())
-            h_is_day = _is_daytime_ts(h_ts, sr_today_ts, ss_today_ts)
+            h_is_day = _is_daytime_ts(h_ts, sr_today_ts, ss_today_ts, w_resp.utcOffsetSeconds)
             h_prob = round(h.precipitationChance / 100.0, 2)
-            h_mmhr = float(h.precipMm) if h.precipMm > 0 else (round(h_prob * 1.4, 2) if h_prob >= 0.35 else 0.0)
+            h_mmhr = (
+                float(h.precipMm)
+                if settings.zus_accuracy_v2
+                else (float(h.precipMm) if h.precipMm > 0 else (round(h_prob * 1.4, 2) if h_prob >= 0.35 else 0.0))
+            )
             h_feels = h.feelsLike if h.feelsLike is not None else h.temperature
             h_dew = h.dewPoint if h.dewPoint is not None else (h.temperature - 4.0)
             h_hum = h.humidity if h.humidity is not None else cur.humidity
@@ -354,16 +387,29 @@ async def _build_darksky_payload(
 
     if "daily" not in excluded:
         daily_data: List[Dict[str, Any]] = []
+        tz_delta = timedelta(seconds=w_resp.utcOffsetSeconds)
+        hourly_by_local_date: Dict[Any, List[Any]] = {}
+        for h in w_resp.hourly:
+            hourly_by_local_date.setdefault((h.time + tz_delta).date(), []).append(h)
+
         for d_idx, d in enumerate(w_resp.daily):
             d_ts = int(d.date.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
             d_prob = round(d.precipitationChance / 100.0, 2)
-            d_mmhr = round(d.precipSumMm / 8.0, 2) if d.precipSumMm > 0 else (round(d_prob * 1.8, 2) if d_prob >= 0.30 else 0.0)
+            d_mmhr = (
+                (round(d.precipSumMm / 8.0, 2) if d.precipSumMm > 0 else 0.0)
+                if settings.zus_accuracy_v2
+                else (round(d.precipSumMm / 8.0, 2) if d.precipSumMm > 0 else (round(d_prob * 1.8, 2) if d_prob >= 0.30 else 0.0))
+            )
             t_min = _convert_temp(d.minTemperature, units_norm)
             t_max = _convert_temp(d.maxTemperature, units_norm)
             sr_ts = _parse_iso_to_ts(d.sunrise, d_ts + 6 * 3600)
             ss_ts = _parse_iso_to_ts(d.sunset, d_ts + 18 * 3600)
 
-            day_hours = w_resp.hourly[d_idx * 24 : (d_idx + 1) * 24]
+            day_hours = (
+                hourly_by_local_date.get(_daily_local_date(d.date, tz_delta))
+                if settings.zus_accuracy_v2
+                else None
+            ) or w_resp.hourly[d_idx * 24 : (d_idx + 1) * 24]
             if day_hours:
                 avg_hum = round(sum((h.humidity or cur.humidity) for h in day_hours) / len(day_hours) / 100.0, 2)
                 avg_press = round(sum((h.pressure or cur.airPressure) for h in day_hours) / len(day_hours), 2)
@@ -596,7 +642,7 @@ async def get_open_meteo_standard_forecast(
     w_resp = await weather_service.get_forecast(
         latitude=latitude,
         longitude=longitude,
-        city_name=f"{latitude:.3f},{longitude:.3f}",
+        city_name="Unknown Location",
     )
     cur = w_resp.current
     rates_61 = _extract_61_minutely_rates(w_resp)
@@ -621,8 +667,13 @@ async def get_open_meteo_standard_forecast(
     p_sym = "inch" if p_unit == "inch" else "mm"
 
     # Build 15-minute array from fused 61-minute Doppler/NWP curve
+    m15_base = (
+        datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        if settings.zus_accuracy_v2
+        else cur.timestamp.replace(second=0, microsecond=0)
+    )
     m15_times = [
-        fmt_time(cur.timestamp.replace(second=0, microsecond=0) + timedelta(minutes=m))
+        fmt_time(m15_base + timedelta(minutes=m))
         for m in (0, 15, 30, 45, 60)
     ]
     m15_precip = [conv_p(rates_61[m] / 4.0) for m in (0, 15, 30, 45, 60)]
@@ -763,13 +814,18 @@ async def get_owm_onecall_standard(
     excluded = {s.strip().lower() for s in (exclude or "").split(",") if s.strip()}
 
     w_resp = await weather_service.get_forecast(
-        latitude=lat, longitude=lon, city_name=f"{lat:.3f},{lon:.3f}"
+        latitude=lat, longitude=lon, city_name="Unknown Location"
     )
     cur = w_resp.current
     now_ts = int(cur.timestamp.timestamp())
+    minutely_base_ts = (
+        int(datetime.now(timezone.utc).replace(second=0, microsecond=0).timestamp())
+        if settings.zus_accuracy_v2
+        else now_ts
+    )
     sr_today = _parse_iso_to_ts(w_resp.daily[0].sunrise, now_ts - 6 * 3600) if w_resp.daily else now_ts - 6 * 3600
     ss_today = _parse_iso_to_ts(w_resp.daily[0].sunset, now_ts + 6 * 3600) if w_resp.daily else now_ts + 6 * 3600
-    is_day_now = _is_daytime_ts(now_ts, sr_today, ss_today)
+    is_day_now = _is_daytime_ts(now_ts, sr_today, ss_today, w_resp.utcOffsetSeconds)
 
     payload: Dict[str, Any] = {
         "lat": lat,
@@ -800,72 +856,96 @@ async def get_owm_onecall_standard(
     if "minutely" not in excluded:
         rates_61 = _extract_61_minutely_rates(w_resp)
         payload["minutely"] = [
-            {"dt": now_ts + m * 60, "precipitation": round(mmhr, 2)}
+            {"dt": minutely_base_ts + m * 60, "precipitation": round(mmhr, 2)}
             for m, mmhr in enumerate(rates_61)
         ]
 
     if "hourly" not in excluded:
-        payload["hourly"] = [
-            {
-                "dt": int(h.time.timestamp()),
-                "temp": _convert_temp(h.temperature, u_mode),
-                "feels_like": _convert_temp(h.feelsLike if h.feelsLike is not None else h.temperature, u_mode),
-                "pressure": round(h.pressure if h.pressure is not None else cur.airPressure),
-                "humidity": h.humidity if h.humidity is not None else cur.humidity,
-                "dew_point": _convert_temp(h.dewPoint if h.dewPoint is not None else h.temperature - 4.0, u_mode),
-                "uvi": h.uvIndex if h.uvIndex is not None else 0.0,
-                "clouds": h.cloudCover if h.cloudCover is not None else 25,
-                "visibility": int(round((h.visibilityKm if h.visibilityKm is not None else cur.visibility) * 1000.0)),
-                "wind_speed": _convert_wind(h.windSpeed, wind_mode),
-                "wind_deg": h.windDirection if h.windDirection is not None else cur.windDirection,
-                "wind_gust": _convert_wind(h.windGusts or (h.windSpeed * 1.25), wind_mode),
-                "weather": [
-                    _wmo_to_owm(
-                        h.wmoCode,
-                        is_day=_is_daytime_ts(int(h.time.timestamp()), sr_today, ss_today),
-                    )
-                ],
-                "pop": round(h.precipitationChance / 100.0, 2),
-                "rain": {"1h": round(h.precipMm, 2)} if h.precipMm > 0 and h.temperature > 0.5 else {},
-                "snow": {"1h": round(h.precipMm, 2)} if h.precipMm > 0 and h.temperature <= 0.5 else {},
-            }
-            for h in w_resp.hourly[:48]
-        ]
+        owm_hourly: List[Dict[str, Any]] = []
+        for h in w_resp.hourly[:48]:
+            h_is_snow = (h.precipType == "snow") if (settings.zus_accuracy_v2 and h.precipType) else (h.temperature <= 0.5)
+            owm_hourly.append(
+                {
+                    "dt": int(h.time.timestamp()),
+                    "temp": _convert_temp(h.temperature, u_mode),
+                    "feels_like": _convert_temp(h.feelsLike if h.feelsLike is not None else h.temperature, u_mode),
+                    "pressure": round(h.pressure if h.pressure is not None else cur.airPressure),
+                    "humidity": h.humidity if h.humidity is not None else cur.humidity,
+                    "dew_point": _convert_temp(h.dewPoint if h.dewPoint is not None else h.temperature - 4.0, u_mode),
+                    "uvi": h.uvIndex if h.uvIndex is not None else 0.0,
+                    "clouds": h.cloudCover if h.cloudCover is not None else 25,
+                    "visibility": int(round((h.visibilityKm if h.visibilityKm is not None else cur.visibility) * 1000.0)),
+                    "wind_speed": _convert_wind(h.windSpeed, wind_mode),
+                    "wind_deg": h.windDirection if h.windDirection is not None else cur.windDirection,
+                    "wind_gust": _convert_wind(h.windGusts or (h.windSpeed * 1.25), wind_mode),
+                    "weather": [
+                        _wmo_to_owm(
+                            h.wmoCode,
+                            is_day=_is_daytime_ts(int(h.time.timestamp()), sr_today, ss_today, w_resp.utcOffsetSeconds),
+                        )
+                    ],
+                    "pop": round(h.precipitationChance / 100.0, 2),
+                    "rain": {"1h": round(h.precipMm, 2)} if h.precipMm > 0 and not h_is_snow else {},
+                    "snow": {"1h": round(h.precipMm, 2)} if h.precipMm > 0 and h_is_snow else {},
+                }
+            )
+        payload["hourly"] = owm_hourly
 
     if "daily" not in excluded:
-        payload["daily"] = [
-            {
-                "dt": int(d.date.timestamp()),
-                "sunrise": _parse_iso_to_ts(d.sunrise, int(d.date.timestamp()) + 6 * 3600),
-                "sunset": _parse_iso_to_ts(d.sunset, int(d.date.timestamp()) + 18 * 3600),
-                "moon_phase": _calc_moon_phase(d.date),
-                "summary": d.condition.value,
-                "temp": {
-                    "day": _convert_temp(d.maxTemperature, u_mode),
-                    "min": _convert_temp(d.minTemperature, u_mode),
-                    "max": _convert_temp(d.maxTemperature, u_mode),
-                    "night": _convert_temp(d.minTemperature, u_mode),
-                    "eve": _convert_temp((d.maxTemperature + d.minTemperature) / 2.0, u_mode),
-                    "morn": _convert_temp(d.minTemperature, u_mode),
-                },
-                "feels_like": {
-                    "day": _convert_temp(d.maxTemperature, u_mode),
-                    "night": _convert_temp(d.minTemperature, u_mode),
-                    "eve": _convert_temp((d.maxTemperature + d.minTemperature) / 2.0, u_mode),
-                    "morn": _convert_temp(d.minTemperature, u_mode),
-                },
-                "pressure": round(cur.airPressure),
-                "humidity": cur.humidity,
-                "wind_speed": _convert_wind(d.windSpeedMax, wind_mode),
-                "wind_deg": d.windDirectionDominant,
-                "weather": [_wmo_to_owm(d.wmoCode, is_day=True)],
-                "clouds": 40 if d.wmoCode >= 2 else 10,
-                "pop": round(d.precipitationChance / 100.0, 2),
-                "rain": round(d.precipSumMm, 2) if d.precipSumMm > 0 else 0.0,
-                "uvi": d.uvIndexMax,
-            }
-            for d in w_resp.daily
-        ]
+        tz_delta = timedelta(seconds=w_resp.utcOffsetSeconds)
+        owm_hourly_by_date: Dict[Any, List[Any]] = {}
+        for h in w_resp.hourly:
+            owm_hourly_by_date.setdefault((h.time + tz_delta).date(), []).append(h)
+
+        owm_daily: List[Dict[str, Any]] = []
+        for d in w_resp.daily:
+            day_hours = (
+                owm_hourly_by_date.get(_daily_local_date(d.date, tz_delta))
+                if settings.zus_accuracy_v2
+                else None
+            )
+            if settings.zus_accuracy_v2 and day_hours:
+                d_pressure = round(sum((h.pressure if h.pressure is not None else cur.airPressure) for h in day_hours) / len(day_hours))
+                d_humidity = round(sum((h.humidity if h.humidity is not None else cur.humidity) for h in day_hours) / len(day_hours))
+                d_clouds = round(sum((h.cloudCover if h.cloudCover is not None else (40 if d.wmoCode >= 2 else 10)) for h in day_hours) / len(day_hours))
+            else:
+                d_pressure = round(cur.airPressure)
+                d_humidity = cur.humidity
+                d_clouds = 40 if d.wmoCode >= 2 else 10
+
+            owm_daily.append(
+                {
+                    "dt": int(d.date.timestamp()),
+                    "sunrise": _parse_iso_to_ts(d.sunrise, int(d.date.timestamp()) + 6 * 3600),
+                    "sunset": _parse_iso_to_ts(d.sunset, int(d.date.timestamp()) + 18 * 3600),
+                    "moon_phase": _calc_moon_phase(d.date),
+                    "summary": d.condition.value,
+                    "temp": {
+                        "day": _convert_temp(d.maxTemperature, u_mode),
+                        "min": _convert_temp(d.minTemperature, u_mode),
+                        "max": _convert_temp(d.maxTemperature, u_mode),
+                        "night": _convert_temp(d.minTemperature, u_mode),
+                        "eve": _convert_temp((d.maxTemperature + d.minTemperature) / 2.0, u_mode),
+                        "morn": _convert_temp(d.minTemperature, u_mode),
+                    },
+                    "feels_like": {
+                        "day": _convert_temp(d.maxTemperature, u_mode),
+                        "night": _convert_temp(d.minTemperature, u_mode),
+                        "eve": _convert_temp((d.maxTemperature + d.minTemperature) / 2.0, u_mode),
+                        "morn": _convert_temp(d.minTemperature, u_mode),
+                    },
+                    "pressure": d_pressure,
+                    "humidity": d_humidity,
+                    "wind_speed": _convert_wind(d.windSpeedMax, wind_mode),
+                    "wind_deg": d.windDirectionDominant,
+                    "weather": [_wmo_to_owm(d.wmoCode, is_day=True)],
+                    "clouds": d_clouds,
+                    "pop": round(d.precipitationChance / 100.0, 2),
+                    "rain": round(d.precipSumMm, 2) if d.precipSumMm > 0 else 0.0,
+                    "uvi": d.uvIndexMax,
+                }
+            )
+        payload["daily"] = owm_daily
 
     if "alerts" not in excluded:
         payload["alerts"] = [
@@ -905,13 +985,13 @@ async def get_owm_v25_current_weather(
     wind_mode = "imperial" if u_mode == "imperial" else "metric_owm"
 
     w_resp = await weather_service.get_forecast(
-        latitude=lat, longitude=lon, city_name=f"{lat:.3f},{lon:.3f}"
+        latitude=lat, longitude=lon, city_name="Unknown Location"
     )
     cur = w_resp.current
     now_ts = int(cur.timestamp.timestamp())
     sr_today = _parse_iso_to_ts(w_resp.daily[0].sunrise, now_ts - 6 * 3600) if w_resp.daily else now_ts - 6 * 3600
     ss_today = _parse_iso_to_ts(w_resp.daily[0].sunset, now_ts + 6 * 3600) if w_resp.daily else now_ts + 6 * 3600
-    is_day_now = _is_daytime_ts(now_ts, sr_today, ss_today)
+    is_day_now = _is_daytime_ts(now_ts, sr_today, ss_today, w_resp.utcOffsetSeconds)
 
     return {
         "coord": {"lon": lon, "lat": lat},
@@ -938,7 +1018,7 @@ async def get_owm_v25_current_weather(
             "sunset": ss_today,
         },
         "timezone": w_resp.utcOffsetSeconds,
-        "name": cur.cityName,
+        "name": cur.cityName if (cur.cityName and cur.cityName != "Unknown Location") else f"{lat:.3f},{lon:.3f}",
         "cod": 200,
     }
 
@@ -998,13 +1078,20 @@ async def get_rainviewer_standard_tile(
     options: str,
 ):
     png_bytes = await doppler_service.get_tile_png(frame_id=frame_id, z=z, x=x, y=y)
+    is_mutable = frame_id == "latest" or frame_id.startswith("nowcast_") or frame_id.startswith("past_")
+    cache_header = (
+        "public, max-age=120, s-maxage=120"
+        if is_mutable
+        else "public, max-age=86400, s-maxage=86400, immutable"
+    )
+    cdn_cache_header = "public, max-age=120" if is_mutable else "public, max-age=86400, immutable"
     return Response(
         content=png_bytes,
         media_type="image/png",
         headers={
-            "Cache-Control": "public, max-age=86400, s-maxage=86400, immutable",
-            "CDN-Cache-Control": "public, max-age=86400, immutable",
-            "Cloudflare-CDN-Cache-Control": "public, max-age=86400, immutable",
+            "Cache-Control": cache_header,
+            "CDN-Cache-Control": cdn_cache_header,
+            "Cloudflare-CDN-Cache-Control": cdn_cache_header,
             "Access-Control-Allow-Origin": "*",
         },
     )

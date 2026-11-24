@@ -64,6 +64,7 @@ async def _background_verification_loop():
                             longitude=float(c["longitude"]),
                             city_name=str(c["city_name"]),
                             sync_verify=True,
+                            bypass_cache=True,
                         )
                         await asyncio.sleep(2)
                     except Exception as cell_err:

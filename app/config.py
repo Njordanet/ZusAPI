@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 600  # 10 minutes for neighborhood/city cache sharing
     verification_interval_seconds: int = 7200  # 2 hours background verification pass
     standard_lapse_rate_c_per_km: float = 6.5  # Standard adiabatic lapse rate (-6.5°C / 1000m)
+    zus_accuracy_v2: bool = True  # Runtime kill-switch for accuracy v2 algorithms
+    station_max_age_minutes: int = 65  # Reject stale surface station observations older than 65m
     
     class Config:
         env_file = ".env"

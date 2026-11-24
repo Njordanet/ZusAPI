@@ -2,6 +2,21 @@
 
 All notable changes to this service will be documented in this file.
 
+## [v1.10.0] - 2026-11-23
+
+### Hyperlocal Radar Timing, Forecast Precision & Rollback Safety
+- **Minute-by-Minute Radar & Precipitation Nowcasting**:
+  - Corrected storm motion tracking across mid- and high-latitude regions, improved fast-moving storm detection, and eliminated isolated clear-sky motion artifacts for sharper precipitation arrival and departure timing.
+  - Added precipitation-phase-calibrated radar intensity conversion (distinguishing cold snow, wet snow, wintry mix, convective downpours, and stratiform rain) alongside per-minute precipitation probability and intensity uncertainty estimates.
+  - Kept extended radar fallback advection progressing smoothly beyond 2 hours, aligned rolling radar tile cache lifetimes, and prevented dry-radar hours from inflating rain totals or turning freezing rain into snow accumulation.
+- **Multi-Source Forecast Consensus & Surface Conditions**:
+  - Replaced redundant duplicate forecast inputs with independent regional and global guidance streams, decoupled precipitation and wind skill weighting from temperature weighting, and fixed missing-hour stream alignment.
+  - Improved live feels-like temperature accuracy across freezing wind-chill and humid heat regimes, refined elevation-adjusted dewpoint and local surface blending, and eliminated edge-case `0.0°F` unit-conversion and UTC-hour lookup glitches.
+  - Hardened precipitation alert onset filtering against brief single-minute radar noise while allowing approaching storms that intensify into moderate or heavy rain to notify higher-threshold subscribers.
+- **Verification Hygiene & Zero-Downtime Rollback Tooling**:
+  - Hardened forecast verification against self-grading bias and small-sample station outlier masking, rejected stale surface observations older than 65 minutes, and extended forecast accuracy tracking out to 7 days.
+  - Added automated pre-deployment database, image, and configuration snapshots alongside instant runtime kill-switch (`ZUS_ACCURACY_V2=false`) and one-command rollback recovery scripts.
+
 ## [v1.9.1] - 2026-11-22
 
 ### Daily Briefing & Local Temperature Consistency

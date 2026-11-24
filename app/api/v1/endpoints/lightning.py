@@ -52,12 +52,22 @@ async def get_lightning(
             if resp.status_code == 200:
                 data = resp.json()
                 wmo_code = int(data.get("current", {}).get("weather_code") or 0)
-                cape_arr = data.get("hourly", {}).get("cape") or [0.0]
-                li_arr = data.get("hourly", {}).get("lifted_index") or [2.0]
-                if cape_arr and cape_arr[0] is not None:
-                    cape = float(cape_arr[0])
-                if li_arr and li_arr[0] is not None:
-                    lifted_idx = float(li_arr[0])
+                hourly_blk = data.get("hourly", {})
+                cape_arr = hourly_blk.get("cape") or [0.0]
+                li_arr = hourly_blk.get("lifted_index") or [2.0]
+                if settings.zus_accuracy_v2:
+                    times_arr = hourly_blk.get("time") or []
+                    target_hour_str = now.strftime("%Y-%m-%dT%H:00")
+                    if target_hour_str in times_arr:
+                        h_idx = times_arr.index(target_hour_str)
+                    else:
+                        h_idx = min(now.hour, max(0, len(cape_arr) - 1))
+                else:
+                    h_idx = 0
+                if cape_arr and 0 <= h_idx < len(cape_arr) and cape_arr[h_idx] is not None:
+                    cape = float(cape_arr[h_idx])
+                if li_arr and 0 <= h_idx < len(li_arr) and li_arr[h_idx] is not None:
+                    lifted_idx = float(li_arr[h_idx])
         except Exception:
             pass
 

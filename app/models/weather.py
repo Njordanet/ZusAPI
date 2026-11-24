@@ -65,6 +65,8 @@ class ModelWeightDetail(BaseModel):
     diurnalBiasNowCelsius: Optional[float] = None
     maeWindKmh: Optional[float] = None
     brierPrecip: Optional[float] = None
+    weightPrecip: Optional[float] = None
+    weightWind: Optional[float] = None
     samplesVerified: int
     currentTempCelsius: Optional[float] = None
     currentPrecipProb: Optional[int] = None
@@ -144,6 +146,8 @@ class RadarLocalTelemetry(BaseModel):
     virgaFactor: float = 1.0
     minuteRates60m: List[float] = []
     minuteByMinuteRates: List[float] = []
+    minuteProbabilities60m: List[float] = Field(default_factory=list)
+    minuteIntensityErrors60m: List[float] = Field(default_factory=list)
 
 
 class RadarManifestResponse(BaseModel):

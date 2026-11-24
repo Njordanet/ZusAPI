@@ -1,13 +1,66 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 PANDA_HOST="${PANDA_HOST:-panda}"
 REMOTE_DIR="~/zus-api"
+SKIP_SNAPSHOT=0
+
+for arg in "$@"; do
+  case "${arg}" in
+    --skip-snapshot)
+      SKIP_SNAPSHOT=1
+      ;;
+    *)
+      echo "Unknown option: ${arg}" >&2
+      echo "Usage: $0 [--skip-snapshot]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 echo "⚡️ Deploying ZüsAPI to ${PANDA_HOST}:${REMOTE_DIR}..."
 
 # 1. Ensure remote directory exists
 ssh "${PANDA_HOST}" "mkdir -p ${REMOTE_DIR}"
+
+# 1b. Pre-deploy rollback snapshot (code, live container image tag, and DB dump)
+if [ "${SKIP_SNAPSHOT}" -eq 0 ]; then
+  echo "🛡️ Creating pre-deploy rollback snapshot on ${PANDA_HOST}..."
+  ssh "${PANDA_HOST}" 'bash -s' << 'SNAP_EOF'
+set -euo pipefail
+REMOTE_APP="${HOME}/zus-api"
+ROLLBACK_DIR="${HOME}/zus-api-rollback-prev"
+if [ -f "${REMOTE_APP}/docker-compose.yml" ]; then
+  SNAP_STAMP=$(date -u +"%Y%m%d_%H%M%SZ")
+  if [ -x "${REMOTE_APP}/scripts/backup_databases.sh" ] && [ -n "$(docker ps -q --filter name='^zus-db$')" ]; then
+    echo "📦 Running pre-deploy database backup..."
+    bash "${REMOTE_APP}/scripts/backup_databases.sh"
+  else
+    echo "ℹ️ Skipping pre-deploy DB dump (zus-db not running or backup script not yet installed)."
+  fi
+
+  LIVE_IMG_ID=$(docker inspect --format='{{.Image}}' zus-api 2>/dev/null || true)
+  if [ -n "${LIVE_IMG_ID}" ]; then
+    docker tag "${LIVE_IMG_ID}" zus-api-zus-api:rollback-prev
+    docker tag "${LIVE_IMG_ID}" "zus-api-zus-api:rollback-${SNAP_STAMP}"
+    echo "🏷️ Tagged live image ${LIVE_IMG_ID} -> zus-api-zus-api:rollback-prev & rollback-${SNAP_STAMP}"
+  fi
+
+  mkdir -p "${ROLLBACK_DIR}"
+  rsync -a --delete \
+    --exclude '.env' \
+    --exclude 'data' \
+    --exclude '__pycache__' \
+    --exclude '.pytest_cache' \
+    "${REMOTE_APP}/" "${ROLLBACK_DIR}/"
+  echo "✅ Snapshotted ${REMOTE_APP} -> ${ROLLBACK_DIR}"
+else
+  echo "ℹ️ Initial deployment detected; no prior installation to snapshot."
+fi
+SNAP_EOF
+else
+  echo "⚠️ Skipping pre-deploy snapshot (--skip-snapshot specified)."
+fi
 
 # 2. Sync codebase
 rsync -avz --delete \

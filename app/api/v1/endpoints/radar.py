@@ -84,8 +84,8 @@ async def get_radar_tile(
     y: int,
 ):
     png_bytes = await doppler_service.get_tile_png(frame_id=frame_id, z=z, x=x, y=y)
-    # Content-addressed frame_ids are immutable once recorded; "latest" refreshes every 120s via MRMS
-    is_mutable = frame_id == "latest" or frame_id.startswith("nowcast_")
+    # Content-addressed frame_ids are immutable once recorded; semantic rolling aliases refresh every 120s
+    is_mutable = frame_id == "latest" or frame_id.startswith("nowcast_") or frame_id.startswith("past_")
     cache_header = (
         "public, max-age=120, s-maxage=120"
         if is_mutable

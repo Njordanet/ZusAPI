@@ -1,7 +1,7 @@
 import asyncpg
 import math
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from app.config import settings
 
@@ -123,6 +123,8 @@ ALTER TABLE model_accuracy_weights ADD COLUMN IF NOT EXISTS bias_wind_kmh DOUBLE
 ALTER TABLE model_accuracy_weights ADD COLUMN IF NOT EXISTS weight_short DOUBLE PRECISION NOT NULL DEFAULT 0.20;
 ALTER TABLE model_accuracy_weights ADD COLUMN IF NOT EXISTS weight_med DOUBLE PRECISION NOT NULL DEFAULT 0.20;
 ALTER TABLE model_accuracy_weights ADD COLUMN IF NOT EXISTS weight_ext DOUBLE PRECISION NOT NULL DEFAULT 0.20;
+ALTER TABLE model_accuracy_weights ADD COLUMN IF NOT EXISTS weight_precip DOUBLE PRECISION NOT NULL DEFAULT 0.167;
+ALTER TABLE model_accuracy_weights ADD COLUMN IF NOT EXISTS weight_wind DOUBLE PRECISION NOT NULL DEFAULT 0.167;
 UPDATE model_accuracy_weights
 SET weight_short = dynamic_weight, weight_med = dynamic_weight, weight_ext = dynamic_weight
 WHERE weight_short = 0.20 AND weight_med = 0.20 AND weight_ext = 0.20 AND dynamic_weight != 0.20;
@@ -301,20 +303,73 @@ def _rls_ensemble_step(
 
     # 6. Update inverse covariance matrix P_t = (1/lambda) * (P - k_t * (P*e)^T) + ridge_diag * I
     inv_lambda = 1.0 / forgetting_factor
-    new_cov = [0.0] * (k * k)
-    for i in range(k):
-        row_off = i * k
-        g_i = gain[i]
-        for j in range(k):
-            val = inv_lambda * (cov_flat[row_off + j] - g_i * p_e[j])
-            if i == j:
-                # Diagonal stabilization + cap trace so P never explodes or collapses
-                val = max(0.02, min(2.5, val + ridge_diag))
-            else:
-                val = max(-1.5, min(1.5, val))
-            new_cov[row_off + j] = round(val, 5)
+    if settings.zus_accuracy_v2:
+        raw_p = [[0.0] * k for _ in range(k)]
+        for i in range(k):
+            row_off = i * k
+            g_i = gain[i]
+            for j in range(k):
+                raw_p[i][j] = inv_lambda * (cov_flat[row_off + j] - g_i * p_e[j])
+        # Enforce exact symmetry and gentle PSD-preserving shrinkage toward diagonal
+        sym_p = [[0.0] * k for _ in range(k)]
+        for i in range(k):
+            for j in range(i, k):
+                sym_val = 0.5 * (raw_p[i][j] + raw_p[j][i])
+                if i == j:
+                    val = max(0.02, sym_val + ridge_diag)
+                    sym_p[i][i] = val
+                else:
+                    val = 0.98 * sym_val
+                    sym_p[i][j] = val
+                    sym_p[j][i] = val
+        # Congruent scaling D * P * D if any diagonal exceeds 2.5 (preserves positive-semidefiniteness)
+        d_scale = [
+            math.sqrt(2.5 / sym_p[i][i]) if sym_p[i][i] > 2.5 else 1.0
+            for i in range(k)
+        ]
+        new_cov = [0.0] * (k * k)
+        for i in range(k):
+            row_off = i * k
+            for j in range(k):
+                val = sym_p[i][j] * d_scale[i] * d_scale[j]
+                if i == j:
+                    val = max(0.02, min(2.5, val))
+                new_cov[row_off + j] = round(val, 5)
+    else:
+        new_cov = [0.0] * (k * k)
+        for i in range(k):
+            row_off = i * k
+            g_i = gain[i]
+            for j in range(k):
+                val = inv_lambda * (cov_flat[row_off + j] - g_i * p_e[j])
+                if i == j:
+                    # Diagonal stabilization + cap trace so P never explodes or collapses
+                    val = max(0.02, min(2.5, val + ridge_diag))
+                else:
+                    val = max(-1.5, min(1.5, val))
+                new_cov[row_off + j] = round(val, 5)
 
     return new_weights, new_cov
+
+
+def resolve_backfill_truth(
+    target_hour: datetime,
+    real_station_hourly: Dict[datetime, float],
+    past_hourly_temps: Dict[datetime, float],
+    use_v2: bool = True,
+) -> Tuple[Optional[float], bool]:
+    """
+    Resolves ground-truth temperature for an expired snapshot hour.
+    Explicitly distinguishes 0.0°C (freezing) from missing None and blocks
+    circular NWP self-grading when use_v2 is True.
+    """
+    obs_val = real_station_hourly.get(target_hour)
+    if obs_val is not None:
+        return (float(obs_val), True)
+    if use_v2:
+        return (None, False)
+    nwp_val = past_hourly_temps.get(target_hour)
+    return (float(nwp_val), False) if nwp_val is not None else (None, False)
 
 
 def _init_identity_cov(k: int, diag_val: float = 0.35) -> List[float]:
@@ -409,7 +464,23 @@ class DatabaseManager:
     @staticmethod
     def make_cell_id(lat: float, lon: float) -> str:
         # ~10km grid cell resolution (0.1 degree)
-        return f"{round(lat, 1):.1f}:{round(lon, 1):.1f}"
+        r_lat = round(float(lat), 1)
+        r_lon = round(float(lon), 1)
+        if r_lat == 0.0:
+            r_lat = 0.0
+        if r_lon == 0.0:
+            r_lon = 0.0
+        return f"{r_lat:.1f}:{r_lon:.1f}"
+
+    async def update_cell_elevation(self, cell_id: str, elevation_m: float) -> None:
+        if not self.pool or elevation_m <= 0.0:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE tracked_cells SET elevation_m = $2 WHERE cell_id = $1 AND elevation_m <= 5.0;",
+                cell_id,
+                float(elevation_m),
+            )
 
     @staticmethod
     def is_us_region(lat: float, lon: float) -> bool:
@@ -445,7 +516,12 @@ class DatabaseManager:
                 INSERT INTO tracked_cells (cell_id, city_name, latitude, longitude, elevation_m, region_mode, is_coastal, request_count, last_requested_at, geom)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, 1, NOW(), ST_SetSRID(ST_MakePoint($4, $3), 4326))
                 ON CONFLICT (cell_id) DO UPDATE SET
-                    city_name = EXCLUDED.city_name,
+                    city_name = CASE
+                        WHEN EXCLUDED.city_name NOT IN ('', 'Unknown Location')
+                             AND EXCLUDED.city_name !~ '^-?[0-9]+\\.[0-9]+,\\s*-?[0-9]+\\.[0-9]+$'
+                        THEN EXCLUDED.city_name
+                        ELSE tracked_cells.city_name
+                    END,
                     elevation_m = CASE WHEN EXCLUDED.elevation_m > 0 THEN EXCLUDED.elevation_m ELSE tracked_cells.elevation_m END,
                     request_count = tracked_cells.request_count + 1,
                     last_requested_at = NOW();
@@ -459,45 +535,48 @@ class DatabaseManager:
                 is_coastal,
             )
 
-            # Seed baseline prior weights & horizon buckets if this is a newly discovered cell
-            existing = await conn.fetchval(
-                "SELECT COUNT(*) FROM model_accuracy_weights WHERE cell_id = $1",
-                cell_id,
-            )
-            if existing == 0:
+            # Seed baseline prior weights & horizon buckets for active models in this region
+            if settings.zus_accuracy_v2:
                 if region_mode == "US_HYPERLOCAL":
                     if in_conus:
-                        # (model, mae_t, bias_t, brier, w_comp, w_short, w_med, w_ext, acc_pct)
                         priors = [
-                            ("HRRR", 0.85, 0.0, 0.08, 0.28, 0.38, 0.24, 0.12, 96.4),
-                            ("ECMWF", 0.92, -0.1, 0.09, 0.26, 0.20, 0.26, 0.34, 95.8),
-                            ("NBM", 0.88, 0.0, 0.08, 0.24, 0.20, 0.26, 0.30, 96.0),
-                            ("GFS", 1.25, 0.2, 0.13, 0.10, 0.10, 0.10, 0.12, 92.5),
-                            ("ICON", 1.15, -0.1, 0.11, 0.07, 0.07, 0.08, 0.07, 93.4),
-                            ("GEM", 1.35, 0.1, 0.14, 0.05, 0.05, 0.06, 0.05, 91.2),
+                            ("HRRR", 0.85, 0.0, 0.08, 0.24, 0.34, 0.20, 0.10, 96.4),
+                            ("ECMWF", 0.90, -0.1, 0.09, 0.22, 0.18, 0.22, 0.28, 96.0),
+                            ("AIFS", 0.88, 0.0, 0.09, 0.18, 0.12, 0.20, 0.26, 96.1),
+                            ("NBM", 0.88, 0.0, 0.07, 0.20, 0.18, 0.22, 0.22, 96.2),
+                            ("GFS", 1.20, 0.2, 0.12, 0.07, 0.07, 0.07, 0.07, 92.8),
+                            ("ICON", 1.12, -0.1, 0.11, 0.05, 0.06, 0.05, 0.04, 93.6),
+                            ("GEM", 1.30, 0.1, 0.13, 0.04, 0.05, 0.04, 0.03, 91.5),
                         ]
+                        target_order = ["HRRR", "ECMWF", "AIFS", "NBM", "GFS", "ICON", "GEM"]
                     else:
                         priors = [
-                            ("HRRR", 0.85, 0.0, 0.08, 0.34, 0.44, 0.32, 0.18, 96.4),
-                            ("ECMWF", 0.92, -0.1, 0.09, 0.30, 0.24, 0.32, 0.42, 95.8),
-                            ("GFS", 1.25, 0.2, 0.13, 0.16, 0.14, 0.16, 0.18, 92.5),
-                            ("ICON", 1.15, -0.1, 0.11, 0.12, 0.10, 0.12, 0.14, 93.4),
-                            ("GEM", 1.35, 0.1, 0.14, 0.08, 0.08, 0.08, 0.08, 91.2),
+                            ("HRRR", 0.85, 0.0, 0.08, 0.28, 0.38, 0.24, 0.14, 96.4),
+                            ("ECMWF", 0.90, -0.1, 0.09, 0.25, 0.20, 0.26, 0.32, 96.0),
+                            ("AIFS", 0.88, 0.0, 0.09, 0.20, 0.14, 0.22, 0.28, 96.1),
+                            ("GFS", 1.20, 0.2, 0.12, 0.12, 0.12, 0.12, 0.12, 92.8),
+                            ("ICON", 1.12, -0.1, 0.11, 0.09, 0.09, 0.09, 0.08, 93.6),
+                            ("GEM", 1.30, 0.1, 0.13, 0.06, 0.07, 0.07, 0.06, 91.5),
                         ]
+                        target_order = ["HRRR", "ECMWF", "AIFS", "GFS", "ICON", "GEM"]
                 else:
                     priors = [
-                        ("ECMWF", 0.88, 0.0, 0.08, 0.38, 0.36, 0.38, 0.42, 96.2),
-                        ("ICON", 0.96, -0.1, 0.09, 0.28, 0.30, 0.28, 0.26, 95.1),
-                        ("GFS", 1.22, 0.2, 0.12, 0.18, 0.18, 0.18, 0.18, 92.8),
-                        ("GEM", 1.30, 0.0, 0.13, 0.16, 0.16, 0.16, 0.14, 91.9),
+                        ("ECMWF", 0.88, 0.0, 0.08, 0.30, 0.28, 0.30, 0.34, 96.2),
+                        ("AIFS", 0.86, 0.0, 0.09, 0.26, 0.22, 0.26, 0.30, 96.2),
+                        ("ICON", 0.96, -0.1, 0.09, 0.20, 0.24, 0.20, 0.16, 95.1),
+                        ("GFS", 1.20, 0.2, 0.12, 0.14, 0.16, 0.14, 0.12, 92.8),
+                        ("GEM", 1.30, 0.0, 0.13, 0.10, 0.10, 0.10, 0.08, 91.9),
                     ]
+                    target_order = ["ECMWF", "AIFS", "ICON", "GFS", "GEM"]
+
                 for m_name, mae, bias, brier, w_comp, w_s, w_m, w_e, acc in priors:
                     await conn.execute(
                         """
                         INSERT INTO model_accuracy_weights
                             (cell_id, model_name, mae_temp_c, bias_temp_c, brier_precip,
-                             dynamic_weight, weight_short, weight_med, weight_ext, accuracy_pct, samples_verified)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 12)
+                             dynamic_weight, weight_short, weight_med, weight_ext,
+                             weight_precip, weight_wind, accuracy_pct, samples_verified)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $6, $6, $10, 12)
                         ON CONFLICT (cell_id, model_name) DO NOTHING;
                         """,
                         cell_id,
@@ -511,52 +590,137 @@ class DatabaseManager:
                         w_e,
                         acc,
                     )
-            elif in_conus:
-                await conn.execute(
-                    """
-                    INSERT INTO model_accuracy_weights
-                        (cell_id, model_name, mae_temp_c, bias_temp_c, brier_precip,
-                         dynamic_weight, weight_short, weight_med, weight_ext, accuracy_pct, samples_verified)
-                    VALUES ($1, 'NBM', 0.88, 0.0, 0.08, 0.24, 0.20, 0.26, 0.30, 96.0, 12)
-                    ON CONFLICT (cell_id, model_name) DO NOTHING;
-                    """,
-                    cell_id,
-                )
 
-            # Ensure cell_rls_state row exists with initial diagonal covariance matrices
-            rls_exists = await conn.fetchval(
-                "SELECT 1 FROM cell_rls_state WHERE cell_id = $1",
-                cell_id,
-            )
-            if not rls_exists:
-                if in_conus:
-                    model_order = ["HRRR", "ECMWF", "NBM", "GFS", "ICON", "GEM"]
-                elif region_mode == "US_HYPERLOCAL":
-                    model_order = ["HRRR", "ECMWF", "GFS", "ICON", "GEM"]
-                else:
-                    model_order = ["ECMWF", "ICON", "GFS", "GEM"]
-                init_cov = _init_identity_cov(len(model_order), diag_val=0.35)
-                await conn.execute(
-                    """
-                    INSERT INTO cell_rls_state (cell_id, model_order, cov_short, cov_med, cov_ext, radar_zr_factor, rls_updates)
-                    VALUES ($1, $2, $3, $4, $5, 1.0, 0)
-                    ON CONFLICT (cell_id) DO NOTHING;
-                    """,
-                    cell_id,
-                    model_order,
-                    init_cov,
-                    init_cov,
-                    init_cov,
-                )
-            elif in_conus:
-                await conn.execute(
-                    """
-                    UPDATE cell_rls_state
-                    SET model_order = array_append(model_order, 'NBM')
-                    WHERE cell_id = $1 AND NOT ('NBM' = ANY(model_order));
-                    """,
+                existing_order = await conn.fetchval(
+                    "SELECT model_order FROM cell_rls_state WHERE cell_id = $1",
                     cell_id,
                 )
+                if existing_order is None:
+                    init_cov = _init_identity_cov(len(target_order), diag_val=0.35)
+                    await conn.execute(
+                        """
+                        INSERT INTO cell_rls_state (cell_id, model_order, cov_short, cov_med, cov_ext, radar_zr_factor, rls_updates)
+                        VALUES ($1, $2, $3, $4, $5, 1.0, 0)
+                        ON CONFLICT (cell_id) DO NOTHING;
+                        """,
+                        cell_id,
+                        target_order,
+                        init_cov,
+                        init_cov,
+                        init_cov,
+                    )
+                elif list(existing_order) != target_order:
+                    init_cov = _init_identity_cov(len(target_order), diag_val=0.35)
+                    await conn.execute(
+                        """
+                        UPDATE cell_rls_state
+                        SET model_order = $2,
+                            cov_short = $3,
+                            cov_med = $3,
+                            cov_ext = $3,
+                            updated_at = NOW()
+                        WHERE cell_id = $1;
+                        """,
+                        cell_id,
+                        target_order,
+                        init_cov,
+                    )
+            else:
+                existing = await conn.fetchval(
+                    "SELECT COUNT(*) FROM model_accuracy_weights WHERE cell_id = $1",
+                    cell_id,
+                )
+                if existing == 0:
+                    if region_mode == "US_HYPERLOCAL":
+                        if in_conus:
+                            priors = [
+                                ("HRRR", 0.85, 0.0, 0.08, 0.28, 0.38, 0.24, 0.12, 96.4),
+                                ("ECMWF", 0.92, -0.1, 0.09, 0.26, 0.20, 0.26, 0.34, 95.8),
+                                ("NBM", 0.88, 0.0, 0.08, 0.24, 0.20, 0.26, 0.30, 96.0),
+                                ("GFS", 1.25, 0.2, 0.13, 0.10, 0.10, 0.10, 0.12, 92.5),
+                                ("ICON", 1.15, -0.1, 0.11, 0.07, 0.07, 0.08, 0.07, 93.4),
+                                ("GEM", 1.35, 0.1, 0.14, 0.05, 0.05, 0.06, 0.05, 91.2),
+                            ]
+                        else:
+                            priors = [
+                                ("HRRR", 0.85, 0.0, 0.08, 0.34, 0.44, 0.32, 0.18, 96.4),
+                                ("ECMWF", 0.92, -0.1, 0.09, 0.30, 0.24, 0.32, 0.42, 95.8),
+                                ("GFS", 1.25, 0.2, 0.13, 0.16, 0.14, 0.16, 0.18, 92.5),
+                                ("ICON", 1.15, -0.1, 0.11, 0.12, 0.10, 0.12, 0.14, 93.4),
+                                ("GEM", 1.35, 0.1, 0.14, 0.08, 0.08, 0.08, 0.08, 91.2),
+                            ]
+                    else:
+                        priors = [
+                            ("ECMWF", 0.88, 0.0, 0.08, 0.38, 0.36, 0.38, 0.42, 96.2),
+                            ("ICON", 0.96, -0.1, 0.09, 0.28, 0.30, 0.28, 0.26, 95.1),
+                            ("GFS", 1.22, 0.2, 0.12, 0.18, 0.18, 0.18, 0.18, 92.8),
+                            ("GEM", 1.30, 0.0, 0.13, 0.16, 0.16, 0.16, 0.14, 91.9),
+                        ]
+                    for m_name, mae, bias, brier, w_comp, w_s, w_m, w_e, acc in priors:
+                        await conn.execute(
+                            """
+                            INSERT INTO model_accuracy_weights
+                                (cell_id, model_name, mae_temp_c, bias_temp_c, brier_precip,
+                                 dynamic_weight, weight_short, weight_med, weight_ext, accuracy_pct, samples_verified)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 12)
+                            ON CONFLICT (cell_id, model_name) DO NOTHING;
+                            """,
+                            cell_id,
+                            m_name,
+                            mae,
+                            bias,
+                            brier,
+                            w_comp,
+                            w_s,
+                            w_m,
+                            w_e,
+                            acc,
+                        )
+                elif in_conus:
+                    await conn.execute(
+                        """
+                        INSERT INTO model_accuracy_weights
+                            (cell_id, model_name, mae_temp_c, bias_temp_c, brier_precip,
+                             dynamic_weight, weight_short, weight_med, weight_ext, accuracy_pct, samples_verified)
+                        VALUES ($1, 'NBM', 0.88, 0.0, 0.08, 0.24, 0.20, 0.26, 0.30, 96.0, 12)
+                        ON CONFLICT (cell_id, model_name) DO NOTHING;
+                        """,
+                        cell_id,
+                    )
+
+                rls_exists = await conn.fetchval(
+                    "SELECT 1 FROM cell_rls_state WHERE cell_id = $1",
+                    cell_id,
+                )
+                if not rls_exists:
+                    if in_conus:
+                        model_order = ["HRRR", "ECMWF", "NBM", "GFS", "ICON", "GEM"]
+                    elif region_mode == "US_HYPERLOCAL":
+                        model_order = ["HRRR", "ECMWF", "GFS", "ICON", "GEM"]
+                    else:
+                        model_order = ["ECMWF", "ICON", "GFS", "GEM"]
+                    init_cov = _init_identity_cov(len(model_order), diag_val=0.35)
+                    await conn.execute(
+                        """
+                        INSERT INTO cell_rls_state (cell_id, model_order, cov_short, cov_med, cov_ext, radar_zr_factor, rls_updates)
+                        VALUES ($1, $2, $3, $4, $5, 1.0, 0)
+                        ON CONFLICT (cell_id) DO NOTHING;
+                        """,
+                        cell_id,
+                        model_order,
+                        init_cov,
+                        init_cov,
+                        init_cov,
+                    )
+                elif in_conus:
+                    await conn.execute(
+                        """
+                        UPDATE cell_rls_state
+                        SET model_order = array_append(model_order, 'NBM')
+                        WHERE cell_id = $1 AND NOT ('NBM' = ANY(model_order));
+                        """,
+                        cell_id,
+                    )
 
         return cell_id
 
@@ -575,6 +739,7 @@ class DatabaseManager:
                     SELECT model_name, mae_temp_c, bias_temp_c, bias_sin_c, bias_cos_c,
                            mae_wind_kmh, bias_wind_kmh, brier_precip,
                            dynamic_weight, weight_short, weight_med, weight_ext,
+                           weight_precip, weight_wind,
                            accuracy_pct, samples_verified, updated_at
                     FROM model_accuracy_weights
                     WHERE cell_id = $1
@@ -608,6 +773,7 @@ class DatabaseManager:
                 SELECT cell_id, model_name, mae_temp_c, bias_temp_c, bias_sin_c, bias_cos_c,
                        mae_wind_kmh, bias_wind_kmh, brier_precip,
                        dynamic_weight, weight_short, weight_med, weight_ext,
+                       weight_precip, weight_wind,
                        accuracy_pct, samples_verified, updated_at
                 FROM model_accuracy_weights
                 WHERE cell_id = ANY($1::text[]);
@@ -637,6 +803,8 @@ class DatabaseManager:
             "weight_short",
             "weight_med",
             "weight_ext",
+            "weight_precip",
+            "weight_wind",
             "accuracy_pct",
         )
         blended_rows: List[Dict[str, Any]] = []
@@ -930,21 +1098,23 @@ class DatabaseManager:
     async def save_forecast_snapshots_and_verify(
         self,
         cell_id: str,
-        model_forecasts: Dict[str, List[Dict[str, Any]]],
+        model_forecasts: Dict[str, List[Optional[Dict[str, Any]]]],
         ground_truth_temp_c: Optional[float],
         ground_truth_precip_active: Optional[bool] = None,
         ground_truth_wind_kmh: Optional[float] = None,
         ground_truth_precip_mmhr: Optional[float] = None,
         radar_raw_mmhr: Optional[float] = None,
+        obs_precip_checked: bool = True,
+        consensus_hours: Optional[List[Dict[str, Any]]] = None,
     ):
         """
         Recursive Grading & Constrained RLS Weighting Engine:
-        1. Grades past unverified snapshots against ground-truth station observations (Temp, Wind, Precip Brier).
+        1. Grades snapshots matching the current verification hour against ground-truth station observations (Temp, Wind, Precip Brier).
         2. Updates 3-parameter Diurnal Harmonic Bias Regression (beta0, beta_sin, beta_cos) per model.
         3. Runs O(K^2) Constrained Recursive Least Squares (RLS) covariance updates across 3 horizon buckets:
            - short (1-6h lead), med (7-24h lead), ext (25h+ lead).
         4. Recursively calibrates the cell's Radar Z-R / Virga attenuation factor when radar & station gauges co-exist.
-        5. Stores future forecast snapshots for 1h, 3h, 6h, 12h, 24h, 48h lead times and prunes verified snapshots >14d old.
+        5. Stores future forecast snapshots across 1h..168h lead times (plus ZUS_CONSENSUS) and prunes verified snapshots >14d old.
         """
         if not self.pool:
             return
@@ -958,7 +1128,8 @@ class DatabaseManager:
                 """
                 SELECT model_name, mae_temp_c, bias_temp_c, bias_sin_c, bias_cos_c,
                        mae_wind_kmh, bias_wind_kmh, brier_precip,
-                       dynamic_weight, weight_short, weight_med, weight_ext, samples_verified
+                       dynamic_weight, weight_short, weight_med, weight_ext,
+                       weight_precip, weight_wind, samples_verified
                 FROM model_accuracy_weights
                 WHERE cell_id = $1;
                 """,
@@ -973,19 +1144,32 @@ class DatabaseManager:
             should_grade_live_0h = (rls_row is None) or (rls_row.get("last_live_graded_hour") != current_hour)
 
             if ground_truth_temp_c is not None and model_state:
-                # Step 1: Fetch unverified snapshots targeting the current verification window
-                unverified = await conn.fetch(
-                    """
-                    SELECT id, model_name, target_hour, lead_hours, predicted_temp_c, predicted_precip_prob, predicted_wind_kmh, wmo_code
-                    FROM forecast_snapshots
-                    WHERE cell_id = $1
-                      AND verified = FALSE
-                      AND target_hour <= $2::timestamptz
-                      AND target_hour >= $2::timestamptz - INTERVAL '3 hours';
-                    """,
-                    cell_id,
-                    current_hour,
-                )
+                # Step 1: Fetch unverified snapshots matching current_hour (exact temporal alignment in v2)
+                if settings.zus_accuracy_v2:
+                    unverified = await conn.fetch(
+                        """
+                        SELECT id, model_name, target_hour, lead_hours, predicted_temp_c, predicted_precip_prob, predicted_wind_kmh, wmo_code
+                        FROM forecast_snapshots
+                        WHERE cell_id = $1
+                          AND verified = FALSE
+                          AND target_hour = $2::timestamptz;
+                        """,
+                        cell_id,
+                        current_hour,
+                    )
+                else:
+                    unverified = await conn.fetch(
+                        """
+                        SELECT id, model_name, target_hour, lead_hours, predicted_temp_c, predicted_precip_prob, predicted_wind_kmh, wmo_code
+                        FROM forecast_snapshots
+                        WHERE cell_id = $1
+                          AND verified = FALSE
+                          AND target_hour <= $2::timestamptz
+                          AND target_hour >= $2::timestamptz - INTERVAL '3 hours';
+                        """,
+                        cell_id,
+                        current_hour,
+                    )
 
                 # Group verified predictions by lead_hours bucket so RLS can grade the full K-model vector together
                 bucket_vectors: Dict[str, Dict[str, float]] = {"short": {}, "med": {}, "ext": {}}
@@ -995,9 +1179,16 @@ class DatabaseManager:
                     m_name = row["model_name"]
                     pred_t = float(row["predicted_temp_c"])
                     pred_w = float(row["predicted_wind_kmh"] or 0.0)
-                    pred_prob = min(1.0, max(0.0, float(row["predicted_precip_prob"] or 0) / 100.0))
-                    if int(row["wmo_code"] or 0) >= 51:
-                        pred_prob = max(pred_prob, 0.75)
+                    raw_pop = row["predicted_precip_prob"]
+                    if settings.zus_accuracy_v2:
+                        has_pop = (raw_pop is not None) and (int(raw_pop) >= 0) and obs_precip_checked
+                        pred_prob = min(1.0, max(0.0, float(raw_pop) / 100.0)) if has_pop else None
+                        brier_err = ((pred_prob - obs_wet) ** 2) if pred_prob is not None else None
+                    else:
+                        pred_prob = min(1.0, max(0.0, float(raw_pop or 0) / 100.0))
+                        if int(row["wmo_code"] or 0) >= 51:
+                            pred_prob = max(pred_prob, 0.75)
+                        brier_err = (pred_prob - obs_wet) ** 2
 
                     abs_err = abs(pred_t - ground_truth_temp_c)
                     signed_bias = pred_t - ground_truth_temp_c
@@ -1006,7 +1197,6 @@ class DatabaseManager:
                         if ground_truth_wind_kmh is not None
                         else None
                     )
-                    brier_err = (pred_prob - obs_wet) ** 2
 
                     verify_updates_batch.append(
                         (
@@ -1035,7 +1225,8 @@ class DatabaseManager:
                         st["bias_sin_c"] = b_sin
                         st["bias_cos_c"] = b_cos
                         st["mae_temp_c"] = max(0.25, 0.86 * float(st["mae_temp_c"]) + 0.14 * abs_err)
-                        st["brier_precip"] = max(0.02, 0.88 * float(st["brier_precip"]) + 0.12 * brier_err)
+                        if brier_err is not None:
+                            st["brier_precip"] = max(0.02, 0.88 * float(st["brier_precip"]) + 0.12 * brier_err)
                         if wind_err is not None and ground_truth_wind_kmh is not None:
                             st["mae_wind_kmh"] = max(0.5, 0.88 * float(st["mae_wind_kmh"]) + 0.12 * wind_err)
                             st["bias_wind_kmh"] = 0.88 * float(st["bias_wind_kmh"]) + 0.12 * (pred_w - ground_truth_wind_kmh)
@@ -1071,17 +1262,27 @@ class DatabaseManager:
                 now_hour_utc = current_hour.hour
                 if should_grade_live_0h:
                     for m_name, hours in model_forecasts.items():
-                        if not hours or m_name not in model_state:
+                        if not hours or hours[0] is None or m_name not in model_state:
                             continue
+                        h0 = hours[0]
                         st = model_state[m_name]
-                        pred_now = float(hours[0]["temp_c"])
-                        pred_w_now = float(hours[0].get("wind_kmh", 0.0))
+                        pred_now = float(h0["temp_c"])
+                        pred_w_now = float(h0.get("wind_kmh", 0.0))
                         abs_err = abs(pred_now - ground_truth_temp_c)
                         signed_bias = pred_now - ground_truth_temp_c
-                        pred_prob = min(1.0, max(0.0, float(hours[0].get("precip_prob", 0)) / 100.0))
-                        if int(hours[0].get("wmo_code", 0)) >= 51:
-                            pred_prob = max(pred_prob, 0.75)
-                        brier_err = (pred_prob - obs_wet) ** 2
+                        raw_pop_0 = h0.get("precip_prob")
+                        if settings.zus_accuracy_v2:
+                            has_pop_0 = (raw_pop_0 is not None) and (int(raw_pop_0) >= 0) and obs_precip_checked
+                            brier_err = (
+                                (min(1.0, max(0.0, float(raw_pop_0) / 100.0)) - obs_wet) ** 2
+                                if has_pop_0
+                                else None
+                            )
+                        else:
+                            pred_prob = min(1.0, max(0.0, float(raw_pop_0 or 0) / 100.0))
+                            if int(h0.get("wmo_code", 0)) >= 51:
+                                pred_prob = max(pred_prob, 0.75)
+                            brier_err = (pred_prob - obs_wet) ** 2
 
                         b0, b_sin, b_cos = _harmonic_bias_rls_step(
                             float(st["bias_temp_c"]),
@@ -1095,7 +1296,8 @@ class DatabaseManager:
                         st["bias_sin_c"] = b_sin
                         st["bias_cos_c"] = b_cos
                         st["mae_temp_c"] = max(0.25, 0.90 * float(st["mae_temp_c"]) + 0.10 * abs_err)
-                        st["brier_precip"] = max(0.02, 0.90 * float(st["brier_precip"]) + 0.10 * brier_err)
+                        if brier_err is not None:
+                            st["brier_precip"] = max(0.02, 0.90 * float(st["brier_precip"]) + 0.10 * brier_err)
                         if ground_truth_wind_kmh is not None:
                             w_err = abs(pred_w_now - ground_truth_wind_kmh)
                             st["mae_wind_kmh"] = max(0.5, 0.90 * float(st["mae_wind_kmh"]) + 0.10 * w_err)
@@ -1107,7 +1309,7 @@ class DatabaseManager:
                             bucket_vectors["short"][m_name] = pred_now - eval_diurnal_bias(b0, b_sin, b_cos, now_hour_utc)
                 elif verify_updates_batch:
                     for m_name, hours in model_forecasts.items():
-                        if not hours or m_name not in model_state or m_name in bucket_vectors["short"]:
+                        if not hours or hours[0] is None or m_name not in model_state or m_name in bucket_vectors["short"]:
                             continue
                         st = model_state[m_name]
                         pred_now = float(hours[0]["temp_c"])
@@ -1146,12 +1348,15 @@ class DatabaseManager:
                             for idx, m in enumerate(model_order):
                                 model_state[m]["weight_med"] = new_w_m[idx]
                         else:
-                            # Gently nudge medium weights toward short + inverse-variance skill when waiting for 12-24h snapshots to mature
+                            # Gently nudge medium weights toward short skill when waiting for 12-24h snapshots, preserving simplex sum
                             for m in model_order:
-                                model_state[m]["weight_med"] = round(
-                                    0.85 * float(model_state[m]["weight_med"]) + 0.15 * float(model_state[m]["weight_short"]),
-                                    4,
+                                model_state[m]["weight_med"] = (
+                                    0.85 * float(model_state[m]["weight_med"])
+                                    + 0.15 * float(model_state[m]["weight_short"])
                                 )
+                            med_sum = sum(float(model_state[m]["weight_med"]) for m in model_order) or 1.0
+                            for m in model_order:
+                                model_state[m]["weight_med"] = round(float(model_state[m]["weight_med"]) / med_sum, 4)
 
                         # Extended-range (25h+) RLS update
                         if all(m in bucket_vectors["ext"] for m in model_order):
@@ -1187,23 +1392,32 @@ class DatabaseManager:
                             current_hour,
                         )
 
-                    # Step 4: Combine RLS horizon weights with multi-variable skill penalty (Precip Brier + Wind MAE) & persist
+                    # Step 4: Compute decoupled per-variable weights (Temp composite, Precip Brier, Wind MAE) & persist
                     raw_comp: Dict[str, float] = {}
+                    raw_precip_w: Dict[str, float] = {}
+                    raw_wind_w: Dict[str, float] = {}
                     for m, st in model_state.items():
                         rls_blend = (
                             0.45 * float(st["weight_short"])
                             + 0.35 * float(st["weight_med"])
                             + 0.20 * float(st["weight_ext"])
                         )
-                        # Multi-variable skill modifier (rewards models with low Brier precip error & low wind MAE)
-                        brier_mod = 1.0 / (1.0 + 1.8 * max(0.02, float(st["brier_precip"])))
-                        wind_mod = 1.0 / (1.0 + 0.04 * max(0.5, float(st["mae_wind_kmh"])))
+                        brier_val = max(0.02, float(st["brier_precip"]))
+                        wind_mae_val = max(0.5, float(st["mae_wind_kmh"]))
+                        brier_mod = 1.0 / (1.0 + 1.8 * brier_val)
+                        wind_mod = 1.0 / (1.0 + 0.04 * wind_mae_val)
                         raw_comp[m] = rls_blend * brier_mod * wind_mod
+                        raw_precip_w[m] = 1.0 / ((0.04 + brier_val) ** 1.5)
+                        raw_wind_w[m] = 1.0 / ((1.0 + wind_mae_val) ** 1.5)
 
                     total_comp = sum(raw_comp.values()) or 1.0
+                    total_precip_w = sum(raw_precip_w.values()) or 1.0
+                    total_wind_w = sum(raw_wind_w.values()) or 1.0
                     weight_updates_batch: List[Tuple[Any, ...]] = []
                     for m, st in model_state.items():
                         comp_w = round(raw_comp[m] / total_comp, 4)
+                        prec_w = round(raw_precip_w[m] / total_precip_w, 4)
+                        wind_w = round(raw_wind_w[m] / total_wind_w, 4)
                         acc_pct = round(
                             max(
                                 70.0,
@@ -1234,6 +1448,8 @@ class DatabaseManager:
                                 round(float(st["weight_ext"]), 4),
                                 acc_pct,
                                 int(st["samples_verified"]),
+                                prec_w,
+                                wind_w,
                             )
                         )
                     if weight_updates_batch:
@@ -1253,18 +1469,22 @@ class DatabaseManager:
                                 weight_ext = $13,
                                 accuracy_pct = $14,
                                 samples_verified = $15,
+                                weight_precip = $16,
+                                weight_wind = $17,
                                 updated_at = NOW()
                             WHERE cell_id = $1 AND model_name = $2;
                             """,
                             weight_updates_batch,
                         )
 
-            # Step 5: Store future forecast snapshots across short, med, and ext horizons (1, 3, 6, 12, 24, 48h)
+            # Step 5: Store future forecast snapshots across 1h..168h horizons
+            lead_schedule = (1, 3, 6, 12, 24, 48, 72, 120, 168) if settings.zus_accuracy_v2 else (1, 3, 6, 12, 24, 48)
             snapshot_inserts_batch: List[Tuple[Any, ...]] = []
             for model_name, hours in model_forecasts.items():
-                for lead in (1, 3, 6, 12, 24, 48):
-                    if lead < len(hours):
+                for lead in lead_schedule:
+                    if lead < len(hours) and hours[lead] is not None:
                         h = hours[lead]
+                        pop_snap = h.get("precip_prob")
                         snapshot_inserts_batch.append(
                             (
                                 cell_id,
@@ -1273,7 +1493,25 @@ class DatabaseManager:
                                 h["time"],
                                 lead,
                                 h["temp_c"],
-                                h["precip_prob"],
+                                int(pop_snap) if pop_snap is not None else (-1 if settings.zus_accuracy_v2 else 0),
+                                h["wind_kmh"],
+                                h["wmo_code"],
+                            )
+                        )
+            if consensus_hours:
+                for lead in lead_schedule:
+                    if lead < len(consensus_hours) and consensus_hours[lead] is not None:
+                        h = consensus_hours[lead]
+                        pop_snap = h.get("precip_prob")
+                        snapshot_inserts_batch.append(
+                            (
+                                cell_id,
+                                "ZUS_CONSENSUS",
+                                now,
+                                h["time"],
+                                lead,
+                                h["temp_c"],
+                                int(pop_snap) if pop_snap is not None else -1,
                                 h["wind_kmh"],
                                 h["wmo_code"],
                             )
@@ -1299,6 +1537,46 @@ class DatabaseManager:
                 """,
                 cell_id,
             )
+
+    async def archive_consensus_snapshots(
+        self,
+        cell_id: str,
+        consensus_hours: List[Dict[str, Any]],
+    ) -> None:
+        """Archives final ZUS_CONSENSUS predictions across 1h..168h for live benchmark verification."""
+        if not self.pool or not consensus_hours:
+            return
+        now = datetime.now(timezone.utc)
+        lead_schedule = (1, 3, 6, 12, 24, 48, 72, 120, 168)
+        batch: List[Tuple[Any, ...]] = []
+        for lead in lead_schedule:
+            if lead < len(consensus_hours) and consensus_hours[lead] is not None:
+                h = consensus_hours[lead]
+                pop_snap = h.get("precip_prob")
+                batch.append(
+                    (
+                        cell_id,
+                        "ZUS_CONSENSUS",
+                        now,
+                        h["time"],
+                        lead,
+                        h["temp_c"],
+                        int(pop_snap) if pop_snap is not None else -1,
+                        h["wind_kmh"],
+                        h["wmo_code"],
+                    )
+                )
+        if batch:
+            async with self.pool.acquire() as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO forecast_snapshots
+                        (cell_id, model_name, issued_at, target_hour, lead_hours, predicted_temp_c, predicted_precip_prob, predicted_wind_kmh, wmo_code)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (cell_id, model_name, target_hour, lead_hours) DO NOTHING;
+                    """,
+                    batch,
+                )
 
     async def record_doppler_frame(
         self,
@@ -1357,13 +1635,14 @@ class DatabaseManager:
         self, cell_id: str, past_hourly_temps: Dict[datetime, float]
     ) -> int:
         """
-        Grades unverified forecast_snapshots whose target_hour passed during an offline window.
-        Prioritizes real PostGIS station_observations within 45km of the cell; only falls back to
-        reanalysis with reduced weight (0.04) if no physical station reading exists for that hour.
+        Grades unverified forecast_snapshots whose target_hour has already passed against
+        elevation-adjusted PostGIS station_observations within 45km of the cell.
         """
         if not self.pool:
             return 0
         now = datetime.now(timezone.utc)
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+        cutoff_hour = current_hour if settings.zus_accuracy_v2 else (now - timedelta(hours=3))
         graded_count = 0
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
@@ -1372,24 +1651,32 @@ class DatabaseManager:
                 FROM forecast_snapshots
                 WHERE cell_id = $1
                   AND verified = FALSE
-                  AND target_hour < $2::timestamptz - INTERVAL '3 hours';
+                  AND target_hour < $2::timestamptz;
                 """,
                 cell_id,
-                now,
+                cutoff_hour,
             )
             if not rows:
                 return 0
 
-            # Lookup any real QC-passed station observations within 45km (0.45 deg bbox) for this cell
+            # Lookup QC-passed station observations within 45km, elevation-adjusted to cell altitude
             station_obs_rows = await conn.fetch(
                 """
                 SELECT date_trunc('hour', o.observed_at) AS obs_hour,
-                       AVG(o.temperature_c) AS avg_temp_c
+                       AVG(
+                           o.temperature_c + GREATEST(
+                               -6.0,
+                               LEAST(
+                                   6.0,
+                                   ((CASE WHEN s.elevation_m > 0 AND c.elevation_m > 0 THEN (s.elevation_m - c.elevation_m) ELSE 0.0 END) / 1000.0) * 6.5
+                               )
+                           )
+                       ) AS avg_temp_c
                 FROM station_observations o
                 JOIN weather_stations s ON s.station_id = o.station_id
                 JOIN tracked_cells c ON c.cell_id = $1
                 WHERE o.qc_passed = TRUE
-                  AND o.observed_at >= $2::timestamptz - INTERVAL '48 hours'
+                  AND o.observed_at >= $2::timestamptz - INTERVAL '172 hours'
                   AND ST_DWithin(s.geom::geography, c.geom::geography, 45000)
                 GROUP BY obs_hour;
                 """,
@@ -1402,10 +1689,15 @@ class DatabaseManager:
                 if r["obs_hour"] is not None and r["avg_temp_c"] is not None
             }
 
+            stale_cutoff = now - timedelta(hours=6)
             for row in rows:
                 th = row["target_hour"].replace(minute=0, second=0, microsecond=0)
-                is_real_obs = th in real_station_hourly
-                truth_c = real_station_hourly.get(th) or past_hourly_temps.get(th)
+                truth_c, is_real_obs = resolve_backfill_truth(
+                    th,
+                    real_station_hourly,
+                    past_hourly_temps,
+                    use_v2=settings.zus_accuracy_v2,
+                )
                 if truth_c is not None:
                     pred_c = float(row["predicted_temp_c"])
                     abs_err = abs(pred_c - truth_c)
@@ -1425,22 +1717,28 @@ class DatabaseManager:
                         abs_err,
                         signed_bias,
                     )
-                    await conn.execute(
-                        """
-                        UPDATE model_accuracy_weights
-                        SET mae_temp_c = GREATEST(0.25, (1.0 - $5::double precision) * mae_temp_c + $5::double precision * $3::double precision),
-                            bias_temp_c = (1.0 - $5::double precision) * bias_temp_c + $5::double precision * $4::double precision,
-                            samples_verified = samples_verified + 1,
-                            updated_at = NOW()
-                        WHERE cell_id = $1 AND model_name = $2;
-                        """,
-                        cell_id,
-                        row["model_name"],
-                        abs_err,
-                        signed_bias,
-                        alpha,
-                    )
+                    if is_real_obs or not settings.zus_accuracy_v2:
+                        await conn.execute(
+                            """
+                            UPDATE model_accuracy_weights
+                            SET mae_temp_c = GREATEST(0.25, (1.0 - $5::double precision) * mae_temp_c + $5::double precision * $3::double precision),
+                                bias_temp_c = (1.0 - $5::double precision) * bias_temp_c + $5::double precision * $4::double precision,
+                                samples_verified = samples_verified + 1,
+                                updated_at = NOW()
+                            WHERE cell_id = $1 AND model_name = $2;
+                            """,
+                            cell_id,
+                            row["model_name"],
+                            abs_err,
+                            signed_bias,
+                            alpha,
+                        )
                     graded_count += 1
+                elif settings.zus_accuracy_v2 and th < stale_cutoff:
+                    await conn.execute(
+                        "UPDATE forecast_snapshots SET verified = TRUE WHERE id = $1;",
+                        row["id"],
+                    )
         return graded_count
 
     async def get_database_stats(self) -> Dict[str, Any]:

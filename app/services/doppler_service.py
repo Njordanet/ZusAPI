@@ -89,20 +89,43 @@ def _dbz_from_index(idx: int) -> float:
     return round(-32.5 + (idx * 0.5), 1)
 
 
-def _mmhr_from_dbz(dbz: float) -> float:
+def _mmhr_from_dbz(
+    dbz: float,
+    precip_type: Optional[str] = None,
+    temp_c: Optional[float] = None,
+    cape_jkg: Optional[float] = None,
+) -> float:
     """
-    Standard Marshall-Palmer Z-R relationship (Z = 200 * R^1.6) with a clean
-    15.0 dBZ precipitation floor so clear-air boundary-layer returns and non-precipitating
-    high/mid-level cloud echoes (<15 dBZ) never produce false surface rain.
+    Phase-aware Z-R relationship with a smooth 14.5..18.0 dBZ ramp so clear-air
+    returns (<14.5 dBZ) stay zero without a discontinuous jump at 15.0 dBZ.
     """
-    if dbz < 15.0:
+    if not settings.zus_accuracy_v2:
+        if dbz < 15.0:
+            return 0.0
+        z_linear = 10.0 ** (dbz / 10.0)
+        r = (z_linear / 200.0) ** (1.0 / 1.6)
+        if dbz < 18.0:
+            ramp = (dbz - 14.5) / 3.5
+            r *= max(0.35, min(1.0, ramp))
+        return round(min(100.0, max(0.0, r)), 2)
+
+    if dbz < 14.5:
         return 0.0
+
     z_linear = 10.0 ** (dbz / 10.0)
-    r = (z_linear / 200.0) ** (1.0 / 1.6)
+    if precip_type == "snow":
+        a, b = (75.0, 2.0) if (temp_c is not None and temp_c <= -2.0) else (130.0, 2.0)
+    elif precip_type == "sleet":
+        a, b = 150.0, 1.8
+    elif cape_jkg is not None and cape_jkg >= 1000.0 and dbz >= 35.0:
+        a, b = 300.0, 1.4
+    else:
+        a, b = 200.0, 1.6
+
+    r = (z_linear / a) ** (1.0 / b)
     if dbz < 18.0:
-        # Smooth ramp across 15..18 dBZ to prevent marginal cloud/virga fringes from spiking
         ramp = (dbz - 14.5) / 3.5
-        r *= max(0.35, min(1.0, ramp))
+        r *= max(0.0, min(1.0, ramp))
     return round(min(100.0, max(0.0, r)), 2)
 
 
@@ -386,31 +409,103 @@ class DopplerRadarService:
             fx = np.linspace(0.0, tw - 1.001, self.GRID_W, dtype=np.float32)
             iy = fy.astype(np.int32)
             ix = fx.astype(np.int32)
-            dy = (fy - iy)[:, None]
-            dx = (fx - ix)[None, :]
-            iy0, iy1 = iy[:, None], (iy + 1)[:, None]
-            ix0, ix1 = ix[None, :], (ix + 1)[None, :]
+            dy = (fy - iy)
+            dx = (fx - ix)
 
-            drow_2d = (
-                cum_dr[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
-                + cum_dr[iy0, ix1] * (1.0 - dy) * dx
-                + cum_dr[iy1, ix0] * dy * (1.0 - dx)
-                + cum_dr[iy1, ix1] * dy * dx
-            )
-            dcol_2d = (
-                cum_dc[iy0, ix0] * (1.0 - dy) * (1.0 - dx)
-                + cum_dc[iy0, ix1] * (1.0 - dy) * dx
-                + cum_dc[iy1, ix0] * dy * (1.0 - dx)
-                + cum_dc[iy1, ix1] * dy * dx
-            )
-            rows_2d = np.round(np.arange(self.GRID_H, dtype=np.float32)[:, None] - drow_2d).astype(np.int32)
-            cols_2d = np.round(np.arange(self.GRID_W, dtype=np.float32)[None, :] - dcol_2d).astype(np.int32)
-            valid = (rows_2d >= 0) & (rows_2d < self.GRID_H) & (cols_2d >= 0) & (cols_2d < self.GRID_W)
-            adv_mrms = live_grid[
-                np.clip(rows_2d, 0, self.GRID_H - 1),
-                np.clip(cols_2d, 0, self.GRID_W - 1),
-            ].copy()
-            adv_mrms[~valid] = 0
+            if not settings.zus_accuracy_v2:
+                iy0, iy1 = iy[:, None], (iy + 1)[:, None]
+                ix0, ix1 = ix[None, :], (ix + 1)[None, :]
+                dy2, dx2 = dy[:, None], dx[None, :]
+                drow_2d = (
+                    cum_dr[iy0, ix0] * (1.0 - dy2) * (1.0 - dx2)
+                    + cum_dr[iy0, ix1] * (1.0 - dy2) * dx2
+                    + cum_dr[iy1, ix0] * dy2 * (1.0 - dx2)
+                    + cum_dr[iy1, ix1] * dy2 * dx2
+                )
+                dcol_2d = (
+                    cum_dc[iy0, ix0] * (1.0 - dy2) * (1.0 - dx2)
+                    + cum_dc[iy0, ix1] * (1.0 - dy2) * dx2
+                    + cum_dc[iy1, ix0] * dy2 * (1.0 - dx2)
+                    + cum_dc[iy1, ix1] * dy2 * dx2
+                )
+                rows_2d = np.round(np.arange(self.GRID_H, dtype=np.float32)[:, None] - drow_2d).astype(np.int32)
+                cols_2d = np.round(np.arange(self.GRID_W, dtype=np.float32)[None, :] - dcol_2d).astype(np.int32)
+                valid = (rows_2d >= 0) & (rows_2d < self.GRID_H) & (cols_2d >= 0) & (cols_2d < self.GRID_W)
+                adv_mrms = live_grid[
+                    np.clip(rows_2d, 0, self.GRID_H - 1),
+                    np.clip(cols_2d, 0, self.GRID_W - 1),
+                ].copy()
+                adv_mrms[~valid] = 0
+                if hrrr_1km is None or w_hrrr <= 0.0:
+                    return adv_mrms
+                m_f = np.where(adv_mrms > 0, adv_mrms.astype(np.float32), 80.0)
+                h_f = np.where(hrrr_1km > 0, hrrr_1km.astype(np.float32), 80.0)
+                mix = (1.0 - w_hrrr) * m_f + w_hrrr * h_f
+                return np.where(mix >= 94.0, np.clip(np.round(mix), 0, 254), 0).astype(np.uint8)
+
+            # Row-chunked vectorized bilinear warping (keeps temporary RAM <50 MB on 2700x6100 grids)
+            out_grid = np.zeros((self.GRID_H, self.GRID_W), dtype=np.uint8)
+            cols_base = np.arange(self.GRID_W, dtype=np.float32)[None, :]
+            ix0, ix1 = ix[None, :], (ix + 1)[None, :]
+            dx2 = dx[None, :]
+            chunk_h = 270
+            for r_start in range(0, self.GRID_H, chunk_h):
+                r_end = min(self.GRID_H, r_start + chunk_h)
+                iy_c = iy[r_start:r_end]
+                dy_c = dy[r_start:r_end, None]
+                iy0, iy1 = iy_c[:, None], (iy_c + 1)[:, None]
+
+                drow_c = (
+                    cum_dr[iy0, ix0] * (1.0 - dy_c) * (1.0 - dx2)
+                    + cum_dr[iy0, ix1] * (1.0 - dy_c) * dx2
+                    + cum_dr[iy1, ix0] * dy_c * (1.0 - dx2)
+                    + cum_dr[iy1, ix1] * dy_c * dx2
+                )
+                dcol_c = (
+                    cum_dc[iy0, ix0] * (1.0 - dy_c) * (1.0 - dx2)
+                    + cum_dc[iy0, ix1] * (1.0 - dy_c) * dx2
+                    + cum_dc[iy1, ix0] * dy_c * (1.0 - dx2)
+                    + cum_dc[iy1, ix1] * dy_c * dx2
+                )
+                f_rows = np.arange(r_start, r_end, dtype=np.float32)[:, None] - drow_c
+                f_cols = cols_base - dcol_c
+                valid = (
+                    (f_rows >= 0.0)
+                    & (f_rows <= self.GRID_H - 1.0)
+                    & (f_cols >= 0.0)
+                    & (f_cols <= self.GRID_W - 1.0)
+                )
+                fr_cl = np.clip(f_rows, 0.0, self.GRID_H - 1.001)
+                fc_cl = np.clip(f_cols, 0.0, self.GRID_W - 1.001)
+                r0 = fr_cl.astype(np.int32)
+                c0 = fc_cl.astype(np.int32)
+                r1 = np.minimum(r0 + 1, self.GRID_H - 1)
+                c1 = np.minimum(c0 + 1, self.GRID_W - 1)
+                w_r = fr_cl - r0
+                w_c = fc_cl - c0
+
+                def _b_val(raw_u8: np.ndarray) -> np.ndarray:
+                    return np.where(raw_u8 > 0, raw_u8.astype(np.float32), 79.0)
+
+                adv_f = (
+                    _b_val(live_grid[r0, c0]) * (1.0 - w_r) * (1.0 - w_c)
+                    + _b_val(live_grid[r0, c1]) * (1.0 - w_r) * w_c
+                    + _b_val(live_grid[r1, c0]) * w_r * (1.0 - w_c)
+                    + _b_val(live_grid[r1, c1]) * w_r * w_c
+                )
+                adv_f = np.where(valid & (adv_f >= 94.0), adv_f, 79.0)
+                if hrrr_1km is not None and w_hrrr > 0.0:
+                    h_chunk = hrrr_1km[r_start:r_end]
+                    h_f = np.where(h_chunk > 0, h_chunk.astype(np.float32), 79.0)
+                    mix_c = (1.0 - w_hrrr) * adv_f + w_hrrr * h_f
+                    out_grid[r_start:r_end] = np.where(
+                        mix_c >= 94.0, np.clip(np.round(mix_c), 0, 254), 0
+                    ).astype(np.uint8)
+                else:
+                    out_grid[r_start:r_end] = np.where(
+                        adv_f >= 94.0, np.clip(np.round(adv_f), 0, 254), 0
+                    ).astype(np.uint8)
+            return out_grid
         else:
             adv_mrms = self._advect_grid(
                 live_grid,
@@ -642,20 +737,33 @@ class DopplerRadarService:
             P2 = np.stack(patches2, axis=0)
             N, ph, pw = P1.shape
             scale_15m = (15.0 / max(5.0, minutes_apart)) * eff_km
-            max_sh = min(10, max(4, int(round(24.0 / scale_15m))))
+            if settings.zus_accuracy_v2:
+                max_sh = min(22, max(4, int(math.ceil(30.0 / max(0.25, scale_15m)))))
+                max_vec = 30.0
+            else:
+                max_sh = min(10, max(4, int(round(24.0 / scale_15m))))
+                max_vec = 25.0
 
             best_sc = np.full(N, -1.0, dtype=np.float32)
             best_r = np.zeros(N, dtype=np.float32)
             best_c = np.zeros(N, dtype=np.float32)
+            best_dr_px = np.zeros(N, dtype=np.int32)
+            best_dc_px = np.zeros(N, dtype=np.int32)
 
-            for dr in range(-max_sh, max_sh + 1):
-                for dc in range(-max_sh, max_sh + 1):
-                    if math.hypot(dr * scale_15m, dc * scale_15m) > 25.0:
+            coarse_step = 2 if (settings.zus_accuracy_v2 and max_sh > 10) else 1
+            for dr in range(-max_sh, max_sh + 1, coarse_step):
+                for dc in range(-max_sh, max_sh + 1, coarse_step):
+                    if math.hypot(dr * scale_15m, dc * scale_15m) > max_vec:
                         continue
                     r1s, r1e = max(0, -dr), min(ph, ph - dr)
                     c1s, c1e = max(0, -dc), min(pw, pw - dc)
+                    if r1e <= r1s or c1e <= c1s:
+                        continue
                     sub1 = P1[:, r1s:r1e, c1s:c1e]
                     sub2 = P2[:, r1s + dr : r1e + dr, c1s + dc : c1e + dc]
+                    if settings.zus_accuracy_v2:
+                        sub1 = sub1 - sub1.mean(axis=(1, 2), keepdims=True)
+                        sub2 = sub2 - sub2.mean(axis=(1, 2), keepdims=True)
                     e1 = (sub1 * sub1).sum(axis=(1, 2))
                     e2 = (sub2 * sub2).sum(axis=(1, 2))
                     cross = (sub1 * sub2).sum(axis=(1, 2))
@@ -665,6 +773,48 @@ class DopplerRadarService:
                     best_sc = np.where(better, sc, best_sc)
                     best_r = np.where(better, dr * scale_15m, best_r)
                     best_c = np.where(better, dc * scale_15m, best_c)
+                    best_dr_px = np.where(better, dr, best_dr_px)
+                    best_dc_px = np.where(better, dc, best_dc_px)
+
+            if coarse_step == 2:
+                # Stage 2 fine refinement around coarse winners grouped by (dr, dc)
+                fine_groups: Dict[Tuple[int, int], List[int]] = {}
+                for k in range(N):
+                    if best_sc[k] < 0.05:
+                        continue
+                    cr_0, cc_0 = int(best_dr_px[k]), int(best_dc_px[k])
+                    for off_r in (-1, 0, 1):
+                        for off_c in (-1, 0, 1):
+                            if off_r == 0 and off_c == 0:
+                                continue
+                            dr_f = cr_0 + off_r
+                            dc_f = cc_0 + off_c
+                            if abs(dr_f) > max_sh or abs(dc_f) > max_sh:
+                                continue
+                            if math.hypot(dr_f * scale_15m, dc_f * scale_15m) > max_vec:
+                                continue
+                            fine_groups.setdefault((dr_f, dc_f), []).append(k)
+                for (dr_f, dc_f), k_list in fine_groups.items():
+                    r1s, r1e = max(0, -dr_f), min(ph, ph - dr_f)
+                    c1s, c1e = max(0, -dc_f), min(pw, pw - dc_f)
+                    if r1e <= r1s or c1e <= c1s:
+                        continue
+                    k_idx = np.array(k_list, dtype=np.int32)
+                    sub1 = P1[k_idx, r1s:r1e, c1s:c1e]
+                    sub2 = P2[k_idx, r1s + dr_f : r1e + dr_f, c1s + dc_f : c1e + dc_f]
+                    if settings.zus_accuracy_v2:
+                        sub1 = sub1 - sub1.mean(axis=(1, 2), keepdims=True)
+                        sub2 = sub2 - sub2.mean(axis=(1, 2), keepdims=True)
+                    e1 = (sub1 * sub1).sum(axis=(1, 2))
+                    e2 = (sub2 * sub2).sum(axis=(1, 2))
+                    cross = (sub1 * sub2).sum(axis=(1, 2))
+                    denom = np.sqrt(e1 * e2) + 1e-5
+                    sc = np.where((e1 > 30.0) & (e2 > 30.0), cross / denom, -1.0)
+                    for j, k_val in enumerate(k_list):
+                        if sc[j] > best_sc[k_val]:
+                            best_sc[k_val] = float(sc[j])
+                            best_r[k_val] = float(dr_f * scale_15m)
+                            best_c[k_val] = float(dc_f * scale_15m)
 
             for k, (iy, ix) in enumerate(coords):
                 if best_sc[k] >= 0.15:
@@ -737,18 +887,56 @@ class DopplerRadarService:
         else:
             obs_dr, obs_dc, obs_conf = dr_a, dc_a, conf_a
 
-        # Compute NOAA HRRR forecast flow fields for 0..+60m and +60m..+120m when available
+        # Compute NOAA HRRR forecast flow fields for 0..+30/+60m and +60m..+90/+120m when available
+        def _pad_hrrr_to_conus(h_grid: np.ndarray) -> np.ndarray:
+            # HRRR spans 50.0..23.2°N (1340 rows at 0.02°); pad 10 bottom rows so it aligns with 50.0..23.0°N MRMS
+            if settings.zus_accuracy_v2 and h_grid.shape[0] == 1340:
+                return np.pad(h_grid, ((0, 10), (0, 0)), mode="constant", constant_values=0)
+            return h_grid
+
         hrrr_dr_1, hrrr_dc_1, hrrr_conf_1 = obs_dr, obs_dc, np.zeros_like(obs_conf)
         hrrr_dr_2, hrrr_dc_2, hrrr_conf_2 = obs_dr, obs_dc, np.zeros_like(obs_conf)
-        if 0 in hrrr_grids and 60 in hrrr_grids:
+        if settings.zus_accuracy_v2 and 0 in hrrr_grids and 30 in hrrr_grids:
             hrrr_dr_1, hrrr_dc_1, hrrr_conf_1 = self._compute_mesoscale_flow_grid(
-                hrrr_grids[0], hrrr_grids[60], 60.0, step_dec=2, grid_step_km=2.0, fh=fh, fw=fw
-            )
-        if 60 in hrrr_grids and 120 in hrrr_grids:
-            hrrr_dr_2, hrrr_dc_2, hrrr_conf_2 = self._compute_mesoscale_flow_grid(
-                hrrr_grids[60], hrrr_grids[120], 60.0, step_dec=2, grid_step_km=2.0, fh=fh, fw=fw
+                _pad_hrrr_to_conus(hrrr_grids[0]),
+                _pad_hrrr_to_conus(hrrr_grids[30]),
+                30.0,
+                step_dec=2,
+                grid_step_km=2.0,
+                fh=fh,
+                fw=fw,
             )
         elif 0 in hrrr_grids and 60 in hrrr_grids:
+            hrrr_dr_1, hrrr_dc_1, hrrr_conf_1 = self._compute_mesoscale_flow_grid(
+                _pad_hrrr_to_conus(hrrr_grids[0]),
+                _pad_hrrr_to_conus(hrrr_grids[60]),
+                60.0,
+                step_dec=2,
+                grid_step_km=2.0,
+                fh=fh,
+                fw=fw,
+            )
+        if settings.zus_accuracy_v2 and 60 in hrrr_grids and 90 in hrrr_grids:
+            hrrr_dr_2, hrrr_dc_2, hrrr_conf_2 = self._compute_mesoscale_flow_grid(
+                _pad_hrrr_to_conus(hrrr_grids[60]),
+                _pad_hrrr_to_conus(hrrr_grids[90]),
+                30.0,
+                step_dec=2,
+                grid_step_km=2.0,
+                fh=fh,
+                fw=fw,
+            )
+        elif 60 in hrrr_grids and 120 in hrrr_grids:
+            hrrr_dr_2, hrrr_dc_2, hrrr_conf_2 = self._compute_mesoscale_flow_grid(
+                _pad_hrrr_to_conus(hrrr_grids[60]),
+                _pad_hrrr_to_conus(hrrr_grids[120]),
+                60.0,
+                step_dec=2,
+                grid_step_km=2.0,
+                fh=fh,
+                fw=fw,
+            )
+        elif (0 in hrrr_grids and 30 in hrrr_grids) or (0 in hrrr_grids and 60 in hrrr_grids):
             hrrr_dr_2, hrrr_dc_2, hrrr_conf_2 = hrrr_dr_1, hrrr_dc_1, hrrr_conf_1
 
         lats_row = self.LAT_MAX - (np.arange(fh, dtype=np.float32) / (fh - 1)) * (self.LAT_MAX - self.LAT_MIN)
@@ -769,9 +957,10 @@ class DopplerRadarService:
                 dr_s = (1.0 - w_h) * obs_dr + w_h * hrrr_dr_2
                 dc_s = (1.0 - w_h) * obs_dc + w_h * hrrr_dc_2
             v_dr_steps[step] = dr_s.astype(np.float32)
-            v_dc_steps[step] = (dc_s / cos_lats).astype(np.float32)
+            # _compute_mesoscale_flow_grid already outputs 0.01-deg master grid columns per 15m
+            v_dc_steps[step] = dc_s.astype(np.float32) if settings.zus_accuracy_v2 else (dc_s / cos_lats).astype(np.float32)
 
-        obs_dc_deg = (obs_dc / cos_lats).astype(np.float32)
+        obs_dc_deg = obs_dc.astype(np.float32) if settings.zus_accuracy_v2 else (obs_dc / cos_lats).astype(np.float32)
 
         # Helper to bilinearly sample a (fh, fw) velocity grid at arbitrary (r_grid, c_grid) coordinates
         def _sample_v(v_r_grid: np.ndarray, v_c_grid: np.ndarray, r_pts: np.ndarray, c_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1589,7 +1778,7 @@ class DopplerRadarService:
         base_cols = (lons - self.LON_MIN) / self.STEP_DEG - 0.5
         base_rows = (self.LAT_MAX - lats) / self.STEP_DEG - 0.5
 
-        step_idx = max(1, min(8, int(round(fut_mult)))) if fut_mult > 0.0 else 0
+        step_idx = max(1, min(8, int(round(fut_mult)))) if (0.0 < fut_mult <= (8.5 if settings.zus_accuracy_v2 else 1e9)) else 0
         if (
             step_idx > 0
             and step_idx in self._cum_drow_fields
@@ -1778,7 +1967,25 @@ class DopplerRadarService:
                 )
             elif self._rainviewer_frames and z <= 7:
                 # Global fallback outside CONUS (RainViewer supports z <= 7; z >= 8 returns a 1370-byte error tile)
-                rv_frame = self._rainviewer_frames[-1]
+                target_ts = (
+                    frame.timestamp
+                    if frame is not None
+                    else int(datetime.now(timezone.utc).timestamp())
+                )
+                if settings.zus_accuracy_v2:
+                    rv_candidates = [
+                        rf for rf in self._rainviewer_frames if isinstance(rf, dict) and rf.get("path")
+                    ]
+                    rv_frame = (
+                        min(
+                            rv_candidates,
+                            key=lambda rf: abs(int(rf.get("time") or target_ts) - target_ts),
+                        )
+                        if rv_candidates
+                        else self._rainviewer_frames[-1]
+                    )
+                else:
+                    rv_frame = self._rainviewer_frames[-1]
                 rv_url = f"{self._rainviewer_host}{rv_frame['path']}/256/{z}/{x}/{y}/2/1_1.png"
                 try:
                     async with httpx.AsyncClient(timeout=6.0) as client:
@@ -1810,6 +2017,8 @@ class DopplerRadarService:
         station_checked: bool = False,
         cloud_cover_low: Optional[float] = None,
         nwp_precip_active: bool = True,
+        precip_type: Optional[str] = None,
+        cape_jkg: Optional[float] = None,
     ) -> RadarLocalTelemetry:
         """
         O(1) in-memory radar nowcast alias for get_point_telemetry.
@@ -1824,6 +2033,8 @@ class DopplerRadarService:
             station_checked=station_checked,
             cloud_cover_low=cloud_cover_low,
             nwp_precip_active=nwp_precip_active,
+            precip_type=precip_type,
+            cape_jkg=cape_jkg,
         )
 
     async def get_point_telemetry(
@@ -1837,14 +2048,16 @@ class DopplerRadarService:
         station_checked: bool = False,
         cloud_cover_low: Optional[float] = None,
         nwp_precip_active: bool = True,
+        precip_type: Optional[str] = None,
+        cape_jkg: Optional[float] = None,
     ) -> RadarLocalTelemetry:
         """
         Dark Sky-grade 1-minute sub-pixel Lagrangian CONUS 1km Doppler ray-caster:
         - Traces 61 1-minute steps (0..60m) upstream along the regional optical-flow storm vector
-        - Uses bilinear sub-pixel interpolation + lead-time-widening uncertainty cone
+        - Uses linear-Z bilinear sub-pixel interpolation + Gaussian spatial-cone probability & spread
         - Tracks Lagrangian echo growth/decay (dBZ/10m) between the -10m/-15m frame and LIVE frame
-        - Applies sub-cloud dewpoint depression (LCL) virga evaporation filtering + learned Z-R factor
-        Executes in ~0.09ms directly from numpy RAM.
+        - Applies sub-cloud dewpoint depression (LCL) virga evaporation filtering + phase-aware Z-R factor
+        Executes in ~0.15ms directly from numpy RAM.
         """
         if not self._frames:
             await self.refresh_dataset()
@@ -1865,6 +2078,8 @@ class DopplerRadarService:
                 virgaFactor=1.0,
                 minuteRates60m=[0.0] * 13,
                 minuteByMinuteRates=[0.0] * 61,
+                minuteProbabilities60m=[0.0] * 61,
+                minuteIntensityErrors60m=[0.0] * 61,
             )
 
         live_candidates = [f for f in self._frames.values() if not f.is_future]
@@ -1878,8 +2093,12 @@ class DopplerRadarService:
         grid = live_frame.grid
         ref_grid = ref_frame.grid if (ref_frame and ref_frame is not live_frame) else None
 
-        f_row = (self.LAT_MAX - lat) / self.STEP_DEG
-        f_col = (lon - self.LON_MIN) / self.STEP_DEG
+        if settings.zus_accuracy_v2:
+            f_row = max(0.0, min(float(self.GRID_H - 1), (self.LAT_MAX - lat) / self.STEP_DEG - 0.5))
+            f_col = max(0.0, min(float(self.GRID_W - 1), (lon - self.LON_MIN) / self.STEP_DEG - 0.5))
+        else:
+            f_row = (self.LAT_MAX - lat) / self.STEP_DEG
+            f_col = (lon - self.LON_MIN) / self.STEP_DEG
         row = max(0, min(self.GRID_H - 1, int(round(f_row))))
         col = max(0, min(self.GRID_W - 1, int(round(f_col))))
         cos_lat = math.cos(math.radians(lat))
@@ -1902,30 +2121,54 @@ class DopplerRadarService:
         if dry_ground_truth_gate:
             virga_factor = round(min(virga_factor, 0.30 if (cloud_cover_low is not None and cloud_cover_low < 35.0) else 0.45), 3)
 
+        # Precompute phase-aware Z-R constants for fast spatial patch rate std
+        if precip_type == "snow":
+            zr_a, zr_b = (75.0, 2.0) if (temp_c is not None and temp_c <= -2.0) else (130.0, 2.0)
+        elif precip_type == "sleet":
+            zr_a, zr_b = 150.0, 1.8
+        elif cape_jkg is not None and cape_jkg >= 1000.0:
+            zr_a, zr_b = 300.0, 1.4
+        else:
+            zr_a, zr_b = 200.0, 1.6
+        log10_a_10 = 10.0 * math.log10(zr_a)
+
         # 1. Local distance-attenuated 9x9 neighborhood (~4.5km wind-drift & beam-overshoot kernel)
         k_rad = 4
         yy, xx = np.mgrid[-k_rad : k_rad + 1, -k_rad : k_rad + 1]
         k_dist_km = np.hypot(yy * 1.11, xx * 1.11 * cos_lat)
         idx_penalty = np.where(k_dist_km <= 1.2, 0, np.round((k_dist_km - 0.8) * 3.6)).astype(np.int32)
 
-        def _sample_cone_dbz(target_grid: np.ndarray, r_flt: float, c_flt: float, lead_min: int = 0) -> float:
+        def _sample_cone_stats(target_grid: np.ndarray, r_flt: float, c_flt: float, lead_min: int = 0) -> Tuple[float, float, float]:
             r0 = int(math.floor(r_flt))
             c0 = int(math.floor(c_flt))
             if not (0 <= r0 < self.GRID_H - 1 and 0 <= c0 < self.GRID_W - 1):
-                return 0.0
+                return (0.0, 0.0, 0.0)
             dr = r_flt - r0
             dc = c_flt - c0
-            # Bilinear sub-pixel interpolation of raw reflectivity index (converted to dBZ)
             d00 = _dbz_from_index(int(target_grid[r0, c0]))
             d01 = _dbz_from_index(int(target_grid[r0, c0 + 1]))
             d10 = _dbz_from_index(int(target_grid[r0 + 1, c0]))
             d11 = _dbz_from_index(int(target_grid[r0 + 1, c0 + 1]))
-            bilin_dbz = (
-                d00 * (1.0 - dr) * (1.0 - dc)
-                + d01 * (1.0 - dr) * dc
-                + d10 * dr * (1.0 - dc)
-                + d11 * dr * dc
-            )
+            if settings.zus_accuracy_v2:
+                # Bilinear interpolation in linear reflectivity Z before converting back to dBZ
+                z00 = (10.0 ** (d00 / 10.0)) if d00 >= 13.5 else 0.0
+                z01 = (10.0 ** (d01 / 10.0)) if d01 >= 13.5 else 0.0
+                z10 = (10.0 ** (d10 / 10.0)) if d10 >= 13.5 else 0.0
+                z11 = (10.0 ** (d11 / 10.0)) if d11 >= 13.5 else 0.0
+                z_bilin = (
+                    z00 * (1.0 - dr) * (1.0 - dc)
+                    + z01 * (1.0 - dr) * dc
+                    + z10 * dr * (1.0 - dc)
+                    + z11 * dr * dc
+                )
+                bilin_dbz = max(0.0, 10.0 * math.log10(z_bilin)) if z_bilin > 1.0 else 0.0
+            else:
+                bilin_dbz = (
+                    d00 * (1.0 - dr) * (1.0 - dc)
+                    + d01 * (1.0 - dr) * dc
+                    + d10 * dr * (1.0 - dc)
+                    + d11 * dr * dc
+                )
             cr = int(round(r_flt))
             cc = int(round(c_flt))
             if k_rad <= cr < self.GRID_H - k_rad and k_rad <= cc < self.GRID_W - k_rad:
@@ -1933,7 +2176,25 @@ class DopplerRadarService:
                 active_patch_px = int((patch >= 92).sum())
                 # Reject isolated urban/tower AP clutter islands (<14 active pixels out of 81 in 9x9km patch)
                 if active_patch_px < 14:
-                    return 0.0
+                    return (0.0, 0.0, 0.0)
+
+                sigma_km = 1.5 + 0.045 * lead_min
+                g_w = np.exp(-0.5 * (k_dist_km / sigma_km) ** 2)
+                g_w_sum = float(g_w.sum()) or 1.0
+                wet_mask = patch >= 94
+                wet_frac = float(g_w[wet_mask].sum()) / g_w_sum
+                rate_std = 0.0
+                if np.any(wet_mask):
+                    patch_dbz = np.where(wet_mask, -32.5 + patch.astype(np.float32) * 0.5, 0.0)
+                    p_rates = np.where(
+                        wet_mask,
+                        np.power(10.0, (patch_dbz - log10_a_10) / (10.0 * zr_b)),
+                        0.0,
+                    )
+                    mu_r = float((g_w * p_rates).sum() / g_w_sum)
+                    var_r = float((g_w * (p_rates - mu_r) ** 2).sum() / g_w_sum)
+                    rate_std = math.sqrt(max(0.0, var_r))
+
                 # Cone widens gently with lead_min (reduces distance penalty slightly at 30-60m so narrow bands don't alias)
                 cone_relax = min(1.4, lead_min * 0.025)
                 eff_idx = int(np.where(patch >= 92, patch - np.maximum(0, idx_penalty - int(round(cone_relax * 2))), 0).max())
@@ -1941,16 +2202,18 @@ class DopplerRadarService:
                 # Blend razor-sharp bilinear center (65% at t=0 -> 40% at t=60m) with uncertainty cone envelope
                 alpha_bilin = max(0.40, 0.65 - (lead_min / 60.0) * 0.25)
                 if bilin_dbz >= 13.5:
-                    return round(alpha_bilin * bilin_dbz + (1.0 - alpha_bilin) * cone_max_dbz, 1)
-                if active_patch_px >= 24 and (lead_min >= 10 or cone_max_dbz >= 26.0):
-                    return round(cone_max_dbz * 0.85, 1)
-                return 0.0
-            return round(bilin_dbz, 1)
+                    out_dbz = round(alpha_bilin * bilin_dbz + (1.0 - alpha_bilin) * cone_max_dbz, 1)
+                elif active_patch_px >= 24 and (lead_min >= 10 or cone_max_dbz >= 26.0):
+                    out_dbz = round(cone_max_dbz * 0.85, 1)
+                else:
+                    out_dbz = 0.0
+                return (out_dbz, wet_frac, rate_std)
+            return (round(bilin_dbz, 1), 1.0 if bilin_dbz >= 14.5 else 0.0, 0.0)
 
-        current_dbz = _sample_cone_dbz(grid, f_row, f_col, lead_min=0)
+        current_dbz, _, _ = _sample_cone_stats(grid, f_row, f_col, lead_min=0)
         if dry_ground_truth_gate and current_dbz < 26.0:
             current_dbz = 0.0
-        raw_curr_mmhr = _mmhr_from_dbz(current_dbz)
+        raw_curr_mmhr = _mmhr_from_dbz(current_dbz, precip_type=precip_type, temp_c=temp_c, cape_jkg=cape_jkg)
         current_mmhr = round(raw_curr_mmhr * (virga_factor if current_dbz < 26.0 else max(0.75, virga_factor)), 2)
 
         # 2. Regional 35km radius box (35 pixels in each direction) with 5x5 clutter rejection
@@ -2047,6 +2310,10 @@ class DopplerRadarService:
 
         # 5. Cast 61 1-minute curved sub-pixel steps (0..60m) upstream + Lagrangian Trend
         minute_by_minute: List[float] = []
+        step_wet_fracs: List[float] = []
+        step_proj_dbzs: List[float] = []
+        step_rate_stds: List[float] = []
+        step_eff_vfs: List[float] = []
         trend_samples: List[float] = []
         tan_step_r_1m = tan_dr_15m / 15.0
         tan_step_c_1m = tan_dc_15m / 15.0
@@ -2063,37 +2330,51 @@ class DopplerRadarService:
             up_r = f_row - dr_t
             up_c = f_col - dc_t
             if 0.0 <= up_r < (self.GRID_H - 1) and 0.0 <= up_c < (self.GRID_W - 1):
-                live_dbz = _sample_cone_dbz(grid, up_r, up_c, lead_min=t_min)
+                live_dbz, wet_frac, rate_std = _sample_cone_stats(grid, up_r, up_c, lead_min=t_min)
                 proj_dbz = live_dbz
                 # Compute Lagrangian growth/decay rate by checking where this parcel was in ref_frame
                 if ref_grid is not None and live_dbz >= 7.5:
                     prev_r = up_r - tan_step_r_1m * ref_dt_mins
                     prev_c = up_c - tan_step_c_1m * ref_dt_mins
                     if 0.0 <= prev_r < (self.GRID_H - 1) and 0.0 <= prev_c < (self.GRID_W - 1):
-                        prev_dbz = _sample_cone_dbz(ref_grid, prev_r, prev_c, lead_min=t_min)
-                        # Rate of change in dBZ per minute (clamped to [-0.45, +0.45] dBZ/min)
-                        rate_per_min = max(-0.45, min(0.45, (live_dbz - prev_dbz) / ref_dt_mins))
+                        prev_dbz, _, _ = _sample_cone_stats(ref_grid, prev_r, prev_c, lead_min=t_min)
+                        # Cap spike when prev_dbz was below echo threshold (<13.5 dBZ)
+                        max_pos_rate = 0.15 if (settings.zus_accuracy_v2 and prev_dbz < 13.5) else 0.45
+                        rate_per_min = max(-0.45, min(max_pos_rate, (live_dbz - prev_dbz) / ref_dt_mins))
                         trend_samples.append(rate_per_min * 10.0)
                         # Exponentially damped trend projection (tau = 20 min)
                         tau = 20.0
                         delta_dbz = rate_per_min * tau * (1.0 - math.exp(-t_min / tau))
                         proj_dbz = max(0.0, min(65.0, live_dbz + delta_dbz))
 
-                # Apply HRRR reflectivity trend (with distance dampening) on active echoes before Z-R conversion
+                dist_km = math.hypot(-dr_t * 1.11, dc_t * 1.11 * cos_lat)
+                damp_factor = 1.0 / (1.0 + (dist_km / 60.0))
+
+                # Apply HRRR reflectivity trend (and convective initiation past 20m when HRRR signals strong growth)
                 if proj_dbz >= 13.5 and abs(trend_t) > 1e-4:
-                    dist_km = math.hypot(-dr_t * 1.11, dc_t * 1.11 * cos_lat)
-                    damp_factor = 1.0 / (1.0 + (dist_km / 60.0))
                     eff_hrrr_dbz = (trend_t * 0.5) * damp_factor
                     proj_dbz = max(0.0, min(65.0, proj_dbz + eff_hrrr_dbz))
+                elif settings.zus_accuracy_v2 and proj_dbz < 13.5 and t_min >= 20 and trend_t >= 3.0:
+                    proj_dbz = min(35.0, 14.5 + (trend_t - 2.0) * 1.2 * damp_factor)
+                    wet_frac = max(wet_frac, min(0.65, 0.25 + (trend_t - 3.0) * 0.1))
 
                 if dry_ground_truth_gate and proj_dbz < 26.0:
                     proj_dbz = 0.0
+                    wet_frac = 0.0
 
-                raw_rate = _mmhr_from_dbz(proj_dbz)
+                raw_rate = _mmhr_from_dbz(proj_dbz, precip_type=precip_type, temp_c=temp_c, cape_jkg=cape_jkg)
                 eff_vf = virga_factor if proj_dbz < 26.0 else max(0.75, virga_factor)
                 minute_by_minute.append(round(raw_rate * eff_vf, 2))
+                step_wet_fracs.append(wet_frac)
+                step_proj_dbzs.append(proj_dbz)
+                step_rate_stds.append(rate_std)
+                step_eff_vfs.append(eff_vf)
             else:
                 minute_by_minute.append(0.0)
+                step_wet_fracs.append(0.0)
+                step_proj_dbzs.append(0.0)
+                step_rate_stds.append(0.0)
+                step_eff_vfs.append(1.0)
 
         # Apply a light 3-point [0.25, 0.50, 0.25] temporal filter across 1-min steps to remove pixel-boundary stairsteps
         smoothed_61: List[float] = []
@@ -2103,6 +2384,31 @@ class DopplerRadarService:
             else:
                 v = 0.25 * minute_by_minute[i - 1] + 0.50 * minute_by_minute[i] + 0.25 * minute_by_minute[i + 1]
                 smoothed_61.append(round(v, 2) if v >= 0.04 else 0.0)
+
+        minute_probs_61: List[float] = []
+        minute_errs_61: List[float] = []
+        for t_min in range(61):
+            f_rate = smoothed_61[t_min]
+            w_frac = step_wet_fracs[t_min]
+            p_dbz = step_proj_dbzs[t_min]
+            r_std = step_rate_stds[t_min]
+            e_vf = step_eff_vfs[t_min]
+
+            int_conf = min(1.0, max(0.0, (p_dbz - 14.0) / 14.0))
+            raw_prob = (0.65 * w_frac + 0.35 * int_conf) if (w_frac > 0.0 or int_conf > 0.0) else 0.0
+            if dry_ground_truth_gate:
+                raw_prob *= min(1.0, virga_factor)
+            if f_rate < 0.04 and w_frac < 0.08:
+                raw_prob = 0.0
+            prob_val = round(max(0.0, min(1.0, raw_prob)), 2)
+
+            if f_rate == 0.0 and prob_val == 0.0:
+                err_val = 0.0
+            else:
+                err_val = round(max(r_std * e_vf, f_rate * (0.10 + 0.0035 * t_min)), 3)
+
+            minute_probs_61.append(prob_val)
+            minute_errs_61.append(err_val)
 
         # Extract 13 5-minute checkpoints (0, 5, 10, ..., 60m) for backward compatibility
         minute_rates_13 = [smoothed_61[t] for t in range(0, 61, 5)]
@@ -2124,6 +2430,8 @@ class DopplerRadarService:
             virgaFactor=virga_factor,
             minuteRates60m=minute_rates_13,
             minuteByMinuteRates=smoothed_61,
+            minuteProbabilities60m=minute_probs_61,
+            minuteIntensityErrors60m=minute_errs_61,
         )
 
     async def _prewarm_viewport_tiles(self, lat: float, lon: float, z: int = 8) -> None:
@@ -2206,7 +2514,7 @@ class DopplerRadarService:
                 if f.is_prebaked
                 else ((f.offset_minutes / 15.0) if (f.is_future and f.offset_minutes > 0) else 0.0)
             )
-            step_idx = max(1, min(8, int(round(fut_mult)))) if fut_mult > 0.0 else 0
+            step_idx = max(1, min(8, int(round(fut_mult)))) if (0.0 < fut_mult <= (8.5 if settings.zus_accuracy_v2 else 1e9)) else 0
 
             if (
                 step_idx > 0

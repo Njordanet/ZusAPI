@@ -42,6 +42,23 @@ PRECIP_DBZ_THRESHOLDS = {
 }
 
 
+def _find_persistent_onset(rates_60m: List[float], threshold: float = 0.25) -> Optional[int]:
+    """
+    Requires persistent radar echo (>= 3 of 5 consecutive minutes >= threshold)
+    when zus_accuracy_v2 is enabled so single-minute spurious blips do not fire notifications.
+    """
+    n = len(rates_60m)
+    for m_idx in range(1, n):
+        if rates_60m[m_idx] < threshold:
+            continue
+        if not settings.zus_accuracy_v2:
+            return m_idx
+        win_end = min(n, m_idx + 5)
+        if sum(1 for r in rates_60m[m_idx:win_end] if r >= threshold) >= 3:
+            return m_idx
+    return None
+
+
 def _is_valid_expo_token(tok: Any) -> bool:
     return bool(
         tok
@@ -825,6 +842,7 @@ class PushWorker:
                 if telemetry is not None:
                     new_state = current_cell_state
                     trigger_precip_onset = False
+                    escalation_only = False
                     onset_minute: Optional[int] = None
                     max_upcoming_rate = 0.0
 
@@ -844,22 +862,27 @@ class PushWorker:
                                 new_state = "COOLDOWN"
 
                         if new_state == "IDLE":
-                            # Scan 1..60 minutes for rain onset
-                            for m_idx in range(1, len(rates_60m)):
-                                if rates_60m[m_idx] >= 0.25:
-                                    onset_minute = m_idx
-                                    max_upcoming_rate = max(rates_60m[m_idx:])
-                                    break
-
+                            onset_minute = _find_persistent_onset(rates_60m, 0.25)
                             if onset_minute is not None:
+                                max_upcoming_rate = max(rates_60m[onset_minute:])
                                 new_state = "APPROACHING"
                                 trigger_precip_onset = True
 
                         elif new_state == "APPROACHING":
-                            # If storm has dissipated completely, revert to IDLE
-                            any_upcoming = any(r >= 0.25 for r in rates_60m[1:])
-                            if not any_upcoming:
-                                new_state = "IDLE"
+                            if settings.zus_accuracy_v2:
+                                onset_minute = _find_persistent_onset(rates_60m, 0.25)
+                                if onset_minute is None:
+                                    new_state = "IDLE"
+                                else:
+                                    max_upcoming_rate = max(rates_60m[onset_minute:])
+                                    if max_upcoming_rate >= PRECIP_SENSITIVITY_THRESHOLDS["moderate"]:
+                                        trigger_precip_onset = True
+                                        escalation_only = True
+                            else:
+                                # If storm has dissipated completely, revert to IDLE
+                                any_upcoming = any(r >= 0.25 for r in rates_60m[1:])
+                                if not any_upcoming:
+                                    new_state = "IDLE"
 
                     # Persist updated cell state
                     rain_stopped_str = rain_stopped_dt.isoformat() if rain_stopped_dt else None
@@ -891,6 +914,8 @@ class PushWorker:
 
                             # Check subscriber sensitivity threshold
                             sens = sub.get("precip_sensitivity", "any")
+                            if escalation_only and sens == "any":
+                                continue
                             req_rate = PRECIP_SENSITIVITY_THRESHOLDS.get(sens, 0.25)
                             if max_upcoming_rate < req_rate:
                                 continue
